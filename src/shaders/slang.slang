@@ -1,6 +1,6 @@
 struct InstanceData
 {
-    float3 worldPos;
+    uint packedPositionNormal;
     uint colorIndex;
 };
 
@@ -35,6 +35,30 @@ static const float3 Normals[6] = {
     float3(0.0, 0.0, 1.0),
     float3(0.0, 0.0, -1.0),
 };
+static const float3 FaceOrigins[6] = {
+    float3(1.0, 0.0, 1.0),
+    float3(0.0, 0.0, 0.0),
+    float3(0.0, 1.0, 1.0),
+    float3(0.0, 0.0, 0.0),
+    float3(0.0, 0.0, 1.0),
+    float3(1.0, 0.0, 0.0),
+};
+static const float3 FaceU[6] = {
+    float3(0.0, 0.0, -1.0),
+    float3(0.0, 0.0, 1.0),
+    float3(1.0, 0.0, 0.0),
+    float3(1.0, 0.0, 0.0),
+    float3(1.0, 0.0, 0.0),
+    float3(-1.0, 0.0, 0.0),
+};
+static const float3 FaceV[6] = {
+    float3(0.0, 1.0, 0.0),
+    float3(0.0, 1.0, 0.0),
+    float3(0.0, 0.0, -1.0),
+    float3(0.0, 0.0, 1.0),
+    float3(0.0, 1.0, 0.0),
+    float3(0.0, 1.0, 0.0),
+};
 static const float3 ColorLUT[2] = {
     float3(1.0, 1.0, 1.0),
     float3(0.133, 0.545, 0.133),
@@ -55,12 +79,20 @@ void meshMain(
 
     uint instanceIndex = dispatchThreadID.x;
     InstanceData instance = instanceData[instanceIndex];
+    uint packed = instance.packedPositionNormal;
+    uint3 subchunkPos = uint3(packed & 0x1fu,
+                              (packed >> 5u) & 0x1fu,
+                              (packed >> 10u) & 0x1fu);
+    uint normalIndex = (packed >> 15u) & 0x7u;
+    float3 blockPos = float3(subchunkPos);
+    float3 faceOrigin = blockPos + FaceOrigins[normalIndex];
 
     [unroll]
     for (uint i = 0; i < 4; ++i)
     {
-        float3 localPos = float3(QuadOffsets[i], 0.0);
-        float3 worldPos = instance.worldPos + localPos;
+        float3 worldPos = faceOrigin +
+                          FaceU[normalIndex] * QuadOffsets[i].x +
+                          FaceV[normalIndex] * QuadOffsets[i].y;
         verts[i].pos = mul(ubo.proj, mul(ubo.view, float4(worldPos, 1.0)));
         verts[i].uv = QuadOffsets[i];
         verts[i].colorIndex = instance.colorIndex;

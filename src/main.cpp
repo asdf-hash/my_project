@@ -46,8 +46,8 @@ struct UniformBufferObject {
   glm::mat4 proj;
 };
 
-struct QuadInstanceData {
-  glm::vec3 worldPos;
+struct PackedInstanceData {
+  uint32_t packedPositionNormal;
   uint32_t colorIndex;
 };
 
@@ -93,7 +93,7 @@ private:
   std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
   std::vector<void *> uniformBuffersMapped;
 
-  static constexpr uint32_t QUAD_INSTANCE_COUNT = 9u;
+  static constexpr uint32_t QUAD_INSTANCE_COUNT = 6u;
 
   vk::raii::Buffer quadInstanceBuffer = nullptr;
   vk::raii::DeviceMemory quadInstanceBufferMemory = nullptr;
@@ -519,7 +519,7 @@ private:
         .depthClampEnable = vk::False,
         .rasterizerDiscardEnable = vk::False,
         .polygonMode = vk::PolygonMode::eFill,
-        .cullMode = vk::CullModeFlagBits::eBack,
+        .cullMode = vk::CullModeFlagBits::eNone,
         .frontFace = vk::FrontFace::eCounterClockwise,
         .depthBiasEnable = vk::False,
         .lineWidth = 1.0f};
@@ -819,7 +819,8 @@ private:
   }
 
   void createInstanceBuffer() {
-    vk::DeviceSize bufferSize = sizeof(QuadInstanceData) * QUAD_INSTANCE_COUNT;
+    vk::DeviceSize bufferSize =
+        sizeof(PackedInstanceData) * QUAD_INSTANCE_COUNT;
     auto [buffer, bufferMem] =
         createBuffer(bufferSize, vk::BufferUsageFlagBits::eStorageBuffer,
                      vk::MemoryPropertyFlagBits::eHostVisible |
@@ -830,14 +831,16 @@ private:
         quadInstanceBufferMemory.mapMemory(0, bufferSize);
 
     //*MARK: Quad Data
-    std::array<QuadInstanceData, QUAD_INSTANCE_COUNT> instances{};
+    std::array<PackedInstanceData, QUAD_INSTANCE_COUNT> instances{};
     for (uint32_t i = 0; i < QUAD_INSTANCE_COUNT; ++i) {
-      const uint32_t xIndex = i % 3u;
-      const uint32_t yIndex = i / 3u;
-      instances[i].worldPos =
-          glm::vec3(static_cast<float>(xIndex) * 1.5f,
-                    static_cast<float>(yIndex) * 1.5f, 0.0f);
-      instances[i].colorIndex = ((xIndex + yIndex) % 2u);
+      const uint32_t x = 0u;
+      const uint32_t y = 0u;
+      const uint32_t z = 0u;
+      const uint32_t normalIndex = i;
+      instances[i].packedPositionNormal = (x & 0x1fu) | ((y & 0x1fu) << 5u) |
+                                          ((z & 0x1fu) << 10u) |
+                                          ((normalIndex & 0x7u) << 15u);
+      instances[i].colorIndex = i % 2u;
     }
 
     memcpy(quadInstanceBufferMapped, instances.data(), bufferSize);
@@ -880,7 +883,7 @@ private:
       vk::DescriptorBufferInfo instanceBufferInfo{
           .buffer = quadInstanceBuffer,
           .offset = 0,
-          .range = sizeof(QuadInstanceData) * QUAD_INSTANCE_COUNT};
+          .range = sizeof(PackedInstanceData) * QUAD_INSTANCE_COUNT};
       vk::DescriptorImageInfo sampledImageInfo{
           .sampler = nullptr,
           .imageView = textureImageView,
