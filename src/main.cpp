@@ -5,17 +5,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <glm/detail/qualifier.hpp>
+#include <glm/ext/matrix_float4x4.hpp>
+#include <glm/ext/matrix_transform.hpp>
+#include <glm/ext/vector_float3.hpp>
 #include <iostream>
 #include <limits>
-#include <memory>
 #include <stdexcept>
 #include <vector>
 
-#if defined(__INTELLISENSE__) || !defined(USE_CPP20_MODULES)
 #include <vulkan/vulkan_raii.hpp>
-#else
-import vulkan_hpp;
-#endif
 
 #define GLFW_INCLUDE_VULKAN // REQUIRED only for GLFW CreateWindowSurface.
 #include <GLFW/glfw3.h>
@@ -41,52 +40,16 @@ constexpr bool enableValidationLayers = false;
 constexpr bool enableValidationLayers = true;
 #endif
 
-struct Vertex {
-  glm::vec3 pos;
-  glm::vec3 color;
-  glm::vec2 texCoord;
-
-  static vk::VertexInputBindingDescription getBindingDescription() {
-    return {.binding = 0,
-            .stride = sizeof(Vertex),
-            .inputRate = vk::VertexInputRate::eVertex};
-  }
-
-  static std::array<vk::VertexInputAttributeDescription, 3>
-  getAttributeDescriptions() {
-    return {{{.location = 0,
-              .binding = 0,
-              .format = vk::Format::eR32G32B32Sfloat,
-              .offset = offsetof(Vertex, pos)},
-             {.location = 1,
-              .binding = 0,
-              .format = vk::Format::eR32G32B32Sfloat,
-              .offset = offsetof(Vertex, color)},
-             {.location = 2,
-              .binding = 0,
-              .format = vk::Format::eR32G32Sfloat,
-              .offset = offsetof(Vertex, texCoord)}}};
-  }
-};
-
 struct UniformBufferObject {
   glm::mat4 model;
   glm::mat4 view;
   glm::mat4 proj;
 };
 
-const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}},
-
-    {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}};
-
-const std::vector<uint16_t> indices = {0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4};
+struct QuadInstanceData {
+  glm::vec3 worldPos;
+  uint32_t colorIndex;
+};
 
 class HelloTriangleApplication {
 public:
@@ -126,14 +89,15 @@ private:
   vk::raii::ImageView textureImageView = nullptr;
   vk::raii::Sampler textureSampler = nullptr;
 
-  vk::raii::Buffer vertexBuffer = nullptr;
-  vk::raii::DeviceMemory vertexBufferMemory = nullptr;
-  vk::raii::Buffer indexBuffer = nullptr;
-  vk::raii::DeviceMemory indexBufferMemory = nullptr;
-
   std::vector<vk::raii::Buffer> uniformBuffers;
   std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
   std::vector<void *> uniformBuffersMapped;
+
+  static constexpr uint32_t QUAD_INSTANCE_COUNT = 9u;
+
+  vk::raii::Buffer quadInstanceBuffer = nullptr;
+  vk::raii::DeviceMemory quadInstanceBufferMemory = nullptr;
+  void *quadInstanceBufferMapped = nullptr;
 
   vk::raii::DescriptorPool descriptorPool = nullptr;
   std::vector<vk::raii::DescriptorSet> descriptorSets;
@@ -148,9 +112,21 @@ private:
 
   bool framebufferResized = false;
 
+  glm::vec3 cameraPos{0.5f, 0.5f, 2.5f};
+  glm::vec3 cameraFront =
+      glm::normalize(glm::vec3(0.5f, 0.5f, 0.0f) - cameraPos);
+  glm::vec3 cameraUp{0.0f, 1.0f, 0.0f};
+  float cameraYaw = -90.0f;
+  float cameraPitch = 0.0f;
+  float cameraSpeed = 2.5f;
+  float mouseSensitivity = 0.15f;
+  bool firstMouse = true;
+  double lastMouseX = WIDTH * 0.5;
+  double lastMouseY = HEIGHT * 0.5;
+
   std::vector<const char *> requiredDeviceExtension = {
       vk::KHRSwapchainExtensionName, vk::KHRSpirv14ExtensionName,
-      vk::KHRSynchronization2ExtensionName};
+      vk::KHRSynchronization2ExtensionName, vk::EXTMeshShaderExtensionName};
 
   void initWindow() {
     glfwInit();
@@ -161,6 +137,12 @@ private:
     window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
     glfwSetWindowUserPointer(window, this);
     glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+
+    if (glfwRawMouseMotionSupported()) {
+      glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
+    }
   }
 
   static void framebufferResizeCallback(GLFWwindow *window, int width,
@@ -185,9 +167,8 @@ private:
     createTextureImage();
     createTextureImageView();
     createTextureSampler();
-    createVertexBuffer();
-    createIndexBuffer();
     createUniformBuffers();
+    createInstanceBuffer();
     createDescriptorPool();
     createDescriptorSets();
     createCommandBuffers();
@@ -358,7 +339,8 @@ private:
     // Check if the physicalDevice supports the required features
     auto features = physicalDevice.template getFeatures2<
         vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features,
-        vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+        vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT,
+        vk::PhysicalDeviceMeshShaderFeaturesEXT>();
     bool supportsRequiredFeatures =
         features.template get<vk::PhysicalDeviceFeatures2>()
             .features.samplerAnisotropy &&
@@ -366,7 +348,9 @@ private:
             .dynamicRendering &&
         features
             .template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>()
-            .extendedDynamicState;
+            .extendedDynamicState &&
+        features.template get<vk::PhysicalDeviceMeshShaderFeaturesEXT>()
+            .meshShader;
 
     // Return true if the physicalDevice meets all the criteria
     return supportsVulkan1_3 && supportsGraphicsAndPresent &&
@@ -410,14 +394,17 @@ private:
     // query for Vulkan 1.3 features
     vk::StructureChain<vk::PhysicalDeviceFeatures2,
                        vk::PhysicalDeviceVulkan13Features,
-                       vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>
+                       vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT,
+                       vk::PhysicalDeviceMeshShaderFeaturesEXT>
         featureChain = {
             {.features = {.samplerAnisotropy =
                               true}}, // vk::PhysicalDeviceFeatures2
             {.synchronization2 = true,
              .dynamicRendering = true}, // vk::PhysicalDeviceVulkan13Features
             {.extendedDynamicState =
-                 true} // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
+                 true}, // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
+            {.taskShader = true,
+             .meshShader = true} // vk::PhysicalDeviceMeshShaderFeaturesEXT
         };
 
     // create a Device
@@ -483,13 +470,21 @@ private:
   }
 
   void createDescriptorSetLayout() {
-    std::array<vk::DescriptorSetLayoutBinding, 2> bindings{
+    std::array<vk::DescriptorSetLayoutBinding, 4> bindings{
         {{.binding = 0,
+          .descriptorType = vk::DescriptorType::eStorageBuffer,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eMeshEXT},
+         {.binding = 1,
           .descriptorType = vk::DescriptorType::eUniformBuffer,
           .descriptorCount = 1,
-          .stageFlags = vk::ShaderStageFlagBits::eVertex},
-         {.binding = 1,
-          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .stageFlags = vk::ShaderStageFlagBits::eMeshEXT},
+         {.binding = 2,
+          .descriptorType = vk::DescriptorType::eSampledImage,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment},
+         {.binding = 3,
+          .descriptorType = vk::DescriptorType::eSampler,
           .descriptorCount = 1,
           .stageFlags = vk::ShaderStageFlagBits::eFragment}}};
 
@@ -503,25 +498,18 @@ private:
     vk::raii::ShaderModule shaderModule =
         createShaderModule(readFile("shaders/slang.spv"));
 
-    vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
-        .stage = vk::ShaderStageFlagBits::eVertex,
+    vk::PipelineShaderStageCreateInfo meshShaderStageInfo{
+        .stage = vk::ShaderStageFlagBits::eMeshEXT,
         .module = shaderModule,
-        .pName = "vertMain"};
+        .pName = "meshMain"};
     vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
         .stage = vk::ShaderStageFlagBits::eFragment,
         .module = shaderModule,
         .pName = "fragMain"};
-    vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo,
+    vk::PipelineShaderStageCreateInfo shaderStages[] = {meshShaderStageInfo,
                                                         fragShaderStageInfo};
 
-    auto bindingDescription = Vertex::getBindingDescription();
-    auto attributeDescriptions = Vertex::getAttributeDescriptions();
-    vk::PipelineVertexInputStateCreateInfo vertexInputInfo{
-        .vertexBindingDescriptionCount = 1,
-        .pVertexBindingDescriptions = &bindingDescription,
-        .vertexAttributeDescriptionCount =
-            static_cast<uint32_t>(attributeDescriptions.size()),
-        .pVertexAttributeDescriptions = attributeDescriptions.data()};
+    vk::PipelineVertexInputStateCreateInfo vertexInputInfo{};
     vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
         .topology = vk::PrimitiveTopology::eTriangleList};
     vk::PipelineViewportStateCreateInfo viewportState{.viewportCount = 1,
@@ -798,27 +786,6 @@ private:
         buffer, image, vk::ImageLayout::eTransferDstOptimal, region);
   }
 
-  void createVertexBuffer() {
-    vk::DeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
-
-    auto [stagingBuffer, stagingBufferMemory] =
-        createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc,
-                     vk::MemoryPropertyFlagBits::eHostVisible |
-                         vk::MemoryPropertyFlagBits::eHostCoherent);
-
-    void *dataStaging = stagingBufferMemory.mapMemory(0, bufferSize);
-    memcpy(dataStaging, vertices.data(), bufferSize);
-    stagingBufferMemory.unmapMemory();
-
-    std::tie(vertexBuffer, vertexBufferMemory) =
-        createBuffer(bufferSize,
-                     vk::BufferUsageFlagBits::eVertexBuffer |
-                         vk::BufferUsageFlagBits::eTransferDst,
-                     vk::MemoryPropertyFlagBits::eDeviceLocal);
-
-    copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
-  }
-
   std::pair<vk::raii::Buffer, vk::raii::DeviceMemory>
   createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,
                vk::MemoryPropertyFlags properties) {
@@ -837,27 +804,6 @@ private:
     return {std::move(buffer), std::move(bufferMemory)};
   }
 
-  void createIndexBuffer() {
-    vk::DeviceSize bufferSize = sizeof(indices[0]) * indices.size();
-
-    auto [stagingBuffer, stagingBufferMemory] =
-        createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc,
-                     vk::MemoryPropertyFlagBits::eHostVisible |
-                         vk::MemoryPropertyFlagBits::eHostCoherent);
-
-    void *data = stagingBufferMemory.mapMemory(0, bufferSize);
-    memcpy(data, indices.data(), (size_t)bufferSize);
-    stagingBufferMemory.unmapMemory();
-
-    std::tie(indexBuffer, indexBufferMemory) =
-        createBuffer(bufferSize,
-                     vk::BufferUsageFlagBits::eIndexBuffer |
-                         vk::BufferUsageFlagBits::eTransferDst,
-                     vk::MemoryPropertyFlagBits::eDeviceLocal);
-
-    copyBuffer(stagingBuffer, indexBuffer, bufferSize);
-  }
-
   void createUniformBuffers() {
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
       vk::DeviceSize bufferSize = sizeof(UniformBufferObject);
@@ -872,11 +818,40 @@ private:
     }
   }
 
+  void createInstanceBuffer() {
+    vk::DeviceSize bufferSize = sizeof(QuadInstanceData) * QUAD_INSTANCE_COUNT;
+    auto [buffer, bufferMem] =
+        createBuffer(bufferSize, vk::BufferUsageFlagBits::eStorageBuffer,
+                     vk::MemoryPropertyFlagBits::eHostVisible |
+                         vk::MemoryPropertyFlagBits::eHostCoherent);
+    quadInstanceBuffer = std::move(buffer);
+    quadInstanceBufferMemory = std::move(bufferMem);
+    quadInstanceBufferMapped =
+        quadInstanceBufferMemory.mapMemory(0, bufferSize);
+
+    //*MARK: Quad Data
+    std::array<QuadInstanceData, QUAD_INSTANCE_COUNT> instances{};
+    for (uint32_t i = 0; i < QUAD_INSTANCE_COUNT; ++i) {
+      const uint32_t xIndex = i % 3u;
+      const uint32_t yIndex = i / 3u;
+      instances[i].worldPos =
+          glm::vec3(static_cast<float>(xIndex) * 1.5f,
+                    static_cast<float>(yIndex) * 1.5f, 0.0f);
+      instances[i].colorIndex = ((xIndex + yIndex) % 2u);
+    }
+
+    memcpy(quadInstanceBufferMapped, instances.data(), bufferSize);
+  }
+
   void createDescriptorPool() {
-    std::array<vk::DescriptorPoolSize, 2> poolSize{
-        {{.type = vk::DescriptorType::eUniformBuffer,
+    std::array<vk::DescriptorPoolSize, 4> poolSize{
+        {{.type = vk::DescriptorType::eStorageBuffer,
           .descriptorCount = MAX_FRAMES_IN_FLIGHT},
-         {.type = vk::DescriptorType::eCombinedImageSampler,
+         {.type = vk::DescriptorType::eUniformBuffer,
+          .descriptorCount = MAX_FRAMES_IN_FLIGHT},
+         {.type = vk::DescriptorType::eSampledImage,
+          .descriptorCount = MAX_FRAMES_IN_FLIGHT},
+         {.type = vk::DescriptorType::eSampler,
           .descriptorCount = MAX_FRAMES_IN_FLIGHT}}};
     vk::DescriptorPoolCreateInfo poolInfo{
         .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
@@ -898,27 +873,48 @@ private:
     descriptorSets = device.allocateDescriptorSets(allocInfo);
 
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-      vk::DescriptorBufferInfo bufferInfo{.buffer = uniformBuffers[i],
-                                          .offset = 0,
-                                          .range = sizeof(UniformBufferObject)};
-      vk::DescriptorImageInfo imageInfo{
-          .sampler = textureSampler,
+      vk::DescriptorBufferInfo uniformBufferInfo{
+          .buffer = uniformBuffers[i],
+          .offset = 0,
+          .range = sizeof(UniformBufferObject)};
+      vk::DescriptorBufferInfo instanceBufferInfo{
+          .buffer = quadInstanceBuffer,
+          .offset = 0,
+          .range = sizeof(QuadInstanceData) * QUAD_INSTANCE_COUNT};
+      vk::DescriptorImageInfo sampledImageInfo{
+          .sampler = nullptr,
           .imageView = textureImageView,
           .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+      vk::DescriptorImageInfo samplerInfo{
+          .sampler = textureSampler,
+          .imageView = nullptr,
+          .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
 
-      std::array<vk::WriteDescriptorSet, 2> descriptorWrites{
+      std::array<vk::WriteDescriptorSet, 4> descriptorWrites{
           {{.dstSet = descriptorSets[i],
             .dstBinding = 0,
             .dstArrayElement = 0,
             .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eUniformBuffer,
-            .pBufferInfo = &bufferInfo},
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &instanceBufferInfo},
            {.dstSet = descriptorSets[i],
             .dstBinding = 1,
             .dstArrayElement = 0,
             .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-            .pImageInfo = &imageInfo}}};
+            .descriptorType = vk::DescriptorType::eUniformBuffer,
+            .pBufferInfo = &uniformBufferInfo},
+           {.dstSet = descriptorSets[i],
+            .dstBinding = 2,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .pImageInfo = &sampledImageInfo},
+           {.dstSet = descriptorSets[i],
+            .dstBinding = 3,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eSampler,
+            .pImageInfo = &samplerInfo}}};
       device.updateDescriptorSets(descriptorWrites, {});
     }
   }
@@ -1041,15 +1037,10 @@ private:
                      -static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
     commandBuffer.setScissor(0,
                              vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
-    commandBuffer.bindVertexBuffers(0, *vertexBuffer, {0});
-    commandBuffer.bindIndexBuffer(
-        *indexBuffer, 0,
-        vk::IndexTypeValue<decltype(indices)::value_type>::value);
     commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
                                      pipelineLayout, 0,
                                      *descriptorSets[frameIndex], nullptr);
-    commandBuffer.drawIndexed(static_cast<uint32_t>(indices.size()), 1, 0, 0,
-                              0);
+    commandBuffer.drawMeshTasksEXT(QUAD_INSTANCE_COUNT, 1, 1);
     commandBuffer.endRendering();
 
     // After rendering, transition the swapchain image to
@@ -1109,17 +1100,87 @@ private:
     }
   }
 
+  void UpdateCamera(const float &dt, glm::mat4 &view) {
+    double xpos, ypos;
+    glfwGetCursorPos(window, &xpos, &ypos);
+
+    if (firstMouse) {
+      lastMouseX = xpos;
+      lastMouseY = ypos;
+      firstMouse = false;
+    }
+
+    double xoffset = xpos - lastMouseX;
+    double yoffset = lastMouseY - ypos;
+    lastMouseX = xpos;
+    lastMouseY = ypos;
+
+    xoffset *= mouseSensitivity;
+    yoffset *= mouseSensitivity;
+
+    cameraYaw += static_cast<float>(xoffset);
+    cameraPitch += static_cast<float>(yoffset);
+
+    if (cameraPitch > 89.0f) {
+      cameraPitch = 89.0f;
+    }
+    if (cameraPitch < -89.0f) {
+      cameraPitch = -89.0f;
+    }
+
+    glm::vec3 direction;
+    direction.x =
+        std::cos(glm::radians(cameraYaw)) * std::cos(glm::radians(cameraPitch));
+    direction.y = std::sin(glm::radians(cameraPitch));
+    direction.z =
+        std::sin(glm::radians(cameraYaw)) * std::cos(glm::radians(cameraPitch));
+    cameraFront = glm::normalize(direction);
+
+    const glm::vec3 right = glm::normalize(glm::cross(cameraFront, cameraUp));
+    const glm::vec3 worldUp{0.0f, 1.0f, 0.0f};
+    const glm::vec3 forward = glm::normalize(glm::cross(right, worldUp));
+
+    const float velocity = cameraSpeed * dt;
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
+      cameraPos += cameraFront * velocity;
+    }
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
+      cameraPos -= cameraFront * velocity;
+    }
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
+      cameraPos -= right * velocity;
+    }
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
+      cameraPos += right * velocity;
+    }
+    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
+      cameraPos += worldUp * velocity;
+    }
+    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) {
+      cameraPos -= worldUp * velocity;
+    }
+
+    glfwSetCursorPos(window, WIDTH / 2.0, HEIGHT / 2.0);
+    lastMouseX = WIDTH / 2.0;
+    lastMouseY = HEIGHT / 2.0;
+
+    view = glm::lookAt(cameraPos, cameraPos + cameraFront, worldUp);
+  }
+
   void updateUniformBuffer(uint32_t currentImage) {
-    static auto startTime = std::chrono::high_resolution_clock::now();
+    static auto lastTime = std::chrono::high_resolution_clock::now();
 
     auto currentTime = std::chrono::high_resolution_clock::now();
-    float time = std::chrono::duration<float>(currentTime - startTime).count();
+    float deltaTime =
+        std::chrono::duration<float>(currentTime - lastTime).count();
+
+    lastTime = currentTime;
 
     UniformBufferObject ubo{};
-    ubo.model = rotate(glm::mat4(1.0f), time * glm::radians(90.0f),
-                       glm::vec3(0.0f, 0.0f, 1.0f));
-    ubo.view = lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f),
-                      glm::vec3(0.0f, 0.0f, 1.0f));
+    UpdateCamera(deltaTime, ubo.view);
+
+    ubo.model = glm::mat4(1.0f);
+
     ubo.proj = glm::perspective(glm::radians(45.0f),
                                 static_cast<float>(swapChainExtent.width) /
                                     static_cast<float>(swapChainExtent.height),

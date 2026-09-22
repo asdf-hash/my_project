@@ -1,0 +1,10 @@
+{
+        "cmake.debugConfig": {
+                "environment": [
+                        {
+                                "name": "MANGOHUD",
+                                "value": "1"
+                        }
+                ]
+        }
+}
