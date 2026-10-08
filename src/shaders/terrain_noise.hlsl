@@ -28,9 +28,8 @@ float peaksAndValleysSpline(float pv) {
 // Low Erosion (0.0)  = Extreme height, jagged peaks, mesa plateaus
 // High Erosion (1.0) = Flat, smooth, heavily eroded lowlands
 // -----------------------------------------------------------------------------
-float erosionSpline(float e, float pv) {
+float erosionSpline(float e, float pvFactor) {
   e = saturate(e);
-  const float pvFactor = peaksAndValleysSpline(pv);
 
   if (e < 0.15f) {
     // Un-eroded high mountains (up to +600 blocks)
@@ -80,7 +79,7 @@ float erosionSpline(float e, float pv) {
 // MAIN BLUE GRAPH: Continentalness Spline
 // Controls macro landmasses: Ocean Trenches -> Coastal Shelf -> Inland Highlands
 // -----------------------------------------------------------------------------
-float continentalnessSpline(float c, float e, float pv, float oceanFloorHeight) {
+float continentalnessSpline(float c, float e, float pvFactor, float oceanFloorHeight) {
   c = saturate(c);
 
   // Deep Ocean (-400 to -250 range): Driven by smooth single-octave ocean noise
@@ -103,11 +102,102 @@ float continentalnessSpline(float c, float e, float pv, float oceanFloorHeight) 
 
   // High Inland / Mountain Zones: Pass control to Erosion & Peaks/Valleys Splines
   const float inlandBase = terrainSplineSegment(c, 0.65f, 0.78f, 150.0f, 200.0f);
-  const float mountainHeight = erosionSpline(e, pv);
+  const float mountainHeight = erosionSpline(e, pvFactor);
 
   const float mountainBlend = smoothstep(0.65f, 0.80f, c);
   return lerp(inlandBase, mountainHeight, mountainBlend);
 }
+
+static const fnl_state WARP_STATE = { 7777,
+                                      0.0006f,
+                                      FNL_NOISE_OPENSIMPLEX2,
+                                      FNL_ROTATION_NONE,
+                                      FNL_FRACTAL_NONE,
+                                      2,
+                                      2.0f,
+                                      0.5f,
+                                      0.0f,
+                                      2.0f,
+                                      FNL_CELLULAR_DISTANCE_EUCLIDEANSQ,
+                                      FNL_CELLULAR_RETURN_TYPE_DISTANCE,
+                                      1.0f,
+                                      FNL_DOMAIN_WARP_OPENSIMPLEX2,
+                                      30.0f };
+static const fnl_state CONTINENTALNESS_STATE = { 1337,
+                                                 0.00025f,
+                                                 FNL_NOISE_OPENSIMPLEX2,
+                                                 FNL_ROTATION_NONE,
+                                                 FNL_FRACTAL_FBM,
+                                                 5,
+                                                 2.0f,
+                                                 0.5f,
+                                                 0.0f,
+                                                 2.0f,
+                                                 FNL_CELLULAR_DISTANCE_EUCLIDEANSQ,
+                                                 FNL_CELLULAR_RETURN_TYPE_DISTANCE,
+                                                 1.0f,
+                                                 FNL_DOMAIN_WARP_OPENSIMPLEX2,
+                                                 30.0f };
+static const fnl_state OCEAN_STATE = { 54321,
+                                       0.0005f,
+                                       FNL_NOISE_OPENSIMPLEX2,
+                                       FNL_ROTATION_NONE,
+                                       FNL_FRACTAL_NONE,
+                                       1,
+                                       2.0f,
+                                       0.5f,
+                                       0.0f,
+                                       2.0f,
+                                       FNL_CELLULAR_DISTANCE_EUCLIDEANSQ,
+                                       FNL_CELLULAR_RETURN_TYPE_DISTANCE,
+                                       1.0f,
+                                       FNL_DOMAIN_WARP_OPENSIMPLEX2,
+                                       30.0f };
+static const fnl_state EROSION_STATE = { 2468,
+                                         0.0005f,
+                                         FNL_NOISE_OPENSIMPLEX2,
+                                         FNL_ROTATION_NONE,
+                                         FNL_FRACTAL_FBM,
+                                         4,
+                                         2.0f,
+                                         0.5f,
+                                         0.0f,
+                                         2.0f,
+                                         FNL_CELLULAR_DISTANCE_EUCLIDEANSQ,
+                                         FNL_CELLULAR_RETURN_TYPE_DISTANCE,
+                                         1.0f,
+                                         FNL_DOMAIN_WARP_OPENSIMPLEX2,
+                                         30.0f };
+static const fnl_state PEAKS_AND_VALLEYS_STATE = { 97531,
+                                                   0.0010f,
+                                                   FNL_NOISE_OPENSIMPLEX2,
+                                                   FNL_ROTATION_NONE,
+                                                   FNL_FRACTAL_RIDGED,
+                                                   5,
+                                                   2.0f,
+                                                   0.5f,
+                                                   0.0f,
+                                                   2.0f,
+                                                   FNL_CELLULAR_DISTANCE_EUCLIDEANSQ,
+                                                   FNL_CELLULAR_RETURN_TYPE_DISTANCE,
+                                                   1.0f,
+                                                   FNL_DOMAIN_WARP_OPENSIMPLEX2,
+                                                   30.0f };
+static const fnl_state DETAIL_STATE = { 9999,
+                                        0.0035f,
+                                        FNL_NOISE_OPENSIMPLEX2,
+                                        FNL_ROTATION_NONE,
+                                        FNL_FRACTAL_FBM,
+                                        4,
+                                        2.0f,
+                                        0.5f,
+                                        0.0f,
+                                        2.0f,
+                                        FNL_CELLULAR_DISTANCE_EUCLIDEANSQ,
+                                        FNL_CELLULAR_RETURN_TYPE_DISTANCE,
+                                        1.0f,
+                                        FNL_DOMAIN_WARP_OPENSIMPLEX2,
+                                        30.0f };
 
 // -----------------------------------------------------------------------------
 // MAIN SAMPLING FUNCTION
@@ -117,7 +207,7 @@ float sampleTerrainHeight(int worldX, int worldZ, uint lodLevel) {
   const float z = float(worldZ);
 
   // 1. Domain Warping (Adds organic, non-linear distortion to biome borders)
-  fnl_state warpState = fnlCreateState(7777);
+  fnl_state warpState = WARP_STATE;
   warpState.noise_type = FNL_NOISE_OPENSIMPLEX2;
   warpState.octaves = 2;
   warpState.frequency = 0.0006f;
@@ -128,7 +218,7 @@ float sampleTerrainHeight(int worldX, int worldZ, uint lodLevel) {
   const float wz = z + warpZ;
 
   // 2. Continentalness Noise (Macro scale landscape / landmass placement)
-  fnl_state continentalnessState = fnlCreateState(1337);
+  fnl_state continentalnessState = CONTINENTALNESS_STATE;
   continentalnessState.noise_type = FNL_NOISE_OPENSIMPLEX2;
   continentalnessState.fractal_type = FNL_FRACTAL_FBM;
   continentalnessState.octaves = 5;
@@ -136,16 +226,19 @@ float sampleTerrainHeight(int worldX, int worldZ, uint lodLevel) {
   const float continentalnessNoise = fnlGetNoise2D(continentalnessState, wx, wz);
   const float continentalness = saturate((continentalnessNoise + 1.0f) * 0.5f);
 
-  // 3. Smooth single-octave ocean-floor noise
-  fnl_state oceanState = fnlCreateState(54321);
-  oceanState.noise_type = FNL_NOISE_OPENSIMPLEX2;
-  oceanState.octaves = 1; // Single octave ensures silky smooth seabed without micro-roughness
-  oceanState.frequency = 0.0005f;
-  const float oceanNoise = fnlGetNoise2D(oceanState, x, z); // Unwarped for natural large swells
-  const float oceanFloorHeight = lerp(-380.0f, -180.0f, (oceanNoise + 1.0f) * 0.5f);
+  float oceanFloorHeight = 0.0f;
+  if (continentalness < 0.28f) {
+    // 3. Smooth single-octave ocean-floor noise, only used on the ocean/coastal transition.
+    fnl_state oceanState = OCEAN_STATE;
+    oceanState.noise_type = FNL_NOISE_OPENSIMPLEX2;
+    oceanState.octaves = 1;
+    oceanState.frequency = 0.0005f;
+    const float oceanNoise = fnlGetNoise2D(oceanState, x, z);
+    oceanFloorHeight = lerp(-380.0f, -180.0f, (oceanNoise + 1.0f) * 0.5f);
+  }
 
   // 4. Erosion Noise (Regional terrain sharpness and plateau formation)
-  fnl_state erosionState = fnlCreateState(2468);
+  fnl_state erosionState = EROSION_STATE;
   erosionState.noise_type = FNL_NOISE_OPENSIMPLEX2;
   erosionState.fractal_type = FNL_FRACTAL_FBM;
   erosionState.octaves = 4;
@@ -154,20 +247,21 @@ float sampleTerrainHeight(int worldX, int worldZ, uint lodLevel) {
   const float erosion = saturate((erosionNoise + 1.0f) * 0.5f);
 
   // 5. Peaks & Valleys Noise (Local ridge density and valley carving)
-  fnl_state peaksAndValleysState = fnlCreateState(97531);
+  fnl_state peaksAndValleysState = PEAKS_AND_VALLEYS_STATE;
   peaksAndValleysState.noise_type = FNL_NOISE_OPENSIMPLEX2;
   peaksAndValleysState.fractal_type = FNL_FRACTAL_RIDGED;
   peaksAndValleysState.octaves = 5;
   peaksAndValleysState.frequency = 0.0010f;
   const float pvNoise = fnlGetNoise2D(peaksAndValleysState, wx, wz);
   const float peaksAndValleys = (pvNoise + 1.0f) * 0.5f;
+  const float pvFactor = peaksAndValleysSpline(peaksAndValleys);
 
   // 6. Primary Spline Evaluation
-  float terrainHeight = continentalnessSpline(continentalness, erosion, peaksAndValleys, oceanFloorHeight);
+  float terrainHeight = continentalnessSpline(continentalness, erosion, pvFactor, oceanFloorHeight);
 
   // 7. Surface High-Frequency Detail Noise (Applies ONLY on land, higher on un-eroded peaks)
   if (terrainHeight > -10.0f) {
-    fnl_state detailState = fnlCreateState(9999);
+    fnl_state detailState = DETAIL_STATE;
     detailState.noise_type = FNL_NOISE_OPENSIMPLEX2;
     detailState.fractal_type = FNL_FRACTAL_FBM;
     detailState.octaves = 4;
@@ -176,7 +270,7 @@ float sampleTerrainHeight(int worldX, int worldZ, uint lodLevel) {
     const float detailNoise = fnlGetNoise2D(detailState, x, z);
 
     // Scale micro-detail strength: low erosion & high PV get dramatic rocky roughness
-    const float detailMask = (1.0f - erosion) * peaksAndValleysSpline(peaksAndValleys);
+    const float detailMask = (1.0f - erosion) * pvFactor;
     const float landFactor = smoothstep(-10.0f, 15.0f, terrainHeight);
 
     const float detailAmplitude = lerp(4.0f, 45.0f, detailMask) * landFactor;

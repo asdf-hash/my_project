@@ -181,6 +181,8 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
   const uint x = groupID.x * 8u + groupThreadID.x;
   const uint z = groupID.y * 8u + groupThreadID.y;
   const uint lane = groupThreadID.y * 8u + groupThreadID.x;
+  const uint waveIndex = lane >> 5u;
+  const uint laneInWave = lane & 31u;
   const int height = sampleHeight(columnIndex, int(x), int(z));
   const int negXHeight = sampleHeight(columnIndex, int(x) - 1, int(z));
   const int posXHeight = sampleHeight(columnIndex, int(x) + 1, int(z));
@@ -194,23 +196,20 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
   const uint posZCount = faceQuadCount(height, posZHeight, chunkY);
   const uint columnFaceCount = topCount + negXCount + posXCount + negZCount + posZCount;
 
-  scanValues[lane] = columnFaceCount;
+  const uint lanePrefix = WavePrefixSum(columnFaceCount);
+  if (laneInWave == 31u) {
+    scanValues[waveIndex] = lanePrefix + columnFaceCount;
+  }
   GroupMemoryBarrierWithGroupSync();
 
-  for (uint stride = 1u; stride < 64u; stride <<= 1u) {
-    const uint addend = lane >= stride ? scanValues[lane - stride] : 0u;
-    GroupMemoryBarrierWithGroupSync();
-    scanValues[lane] += addend;
-    GroupMemoryBarrierWithGroupSync();
-  }
+  const uint previousWaveTotal = waveIndex == 0u ? 0u : scanValues[0];
+  const uint laneStart = previousWaveTotal + lanePrefix;
+  uint faceOffset = laneStart;
 
   if (lane == 63u) {
-    InterlockedAdd(QuadCount[0], scanValues[lane], groupOutputBase);
+    InterlockedAdd(QuadCount[0], scanValues[0] + (waveIndex == 1u ? scanValues[1] : 0u), groupOutputBase);
   }
   GroupMemoryBarrierWithGroupSync();
-
-  const uint laneStart = scanValues[lane] - columnFaceCount;
-  uint faceOffset = laneStart;
   const int4 chunkCoord = ChunkCoords[columnIndex];
   const uint chunkBase = groupOutputBase;
 

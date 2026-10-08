@@ -177,8 +177,11 @@ private:
 
   static constexpr uint32_t MAX_QUAD_COUNT = 1u << 22u;
   // Capacity is largest at the narrowest supported FOV, not the widest FOV.
-  static constexpr uint32_t MAX_HORIZONTAL_CHUNK_COUNT = calculateClipmapCapacity(
-      TARGET_SCREEN_PERCENTAGE, MIN_SUPPORTED_TAN_HALF_FOV, CHUNK_SIZE, world::kRenderDistance);
+  static constexpr uint32_t CLIPMAP_KEEP_ALIVE_MULTIPLIER = 4u;
+  static constexpr uint32_t MAX_HORIZONTAL_CHUNK_COUNT =
+      calculateClipmapCapacity(TARGET_SCREEN_PERCENTAGE, MIN_SUPPORTED_TAN_HALF_FOV, CHUNK_SIZE,
+                               world::kRenderDistance) *
+      CLIPMAP_KEEP_ALIVE_MULTIPLIER;
   static constexpr uint32_t VERTICAL_CHUNK_COUNT = 2u * static_cast<uint32_t>(world::kVerticalRenderDistance) + 1u;
   std::vector<world::ChunkLod> visibleChunkSet;
   std::vector<std::array<int32_t, 2>> visibleChunkWork;
