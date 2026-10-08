@@ -12,7 +12,6 @@ endif()
 
 find_package (glfw3 REQUIRED)
 find_package (Vulkan 1.4.335 REQUIRED)
-
 if(ENABLE_CPP20_MODULE)
   add_library(VulkanCppModule)
   add_library(Vulkan::cppm ALIAS VulkanCppModule)
@@ -69,7 +68,7 @@ else()
 endif()
 
 # Find all Slang and HLSL files meant for compilation
-file (GLOB SLANG_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/*.slang" "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/*.hlsl")
+file (GLOB SLANG_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/*.slang")
 
 # Include path where legacy libraries (e.g., FastNoiseLite.hlsl) live
 set (SHADER_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders")
@@ -90,7 +89,8 @@ foreach (SHADER_FILE ${SLANG_FILES})
             -target spirv
             -I ${SHADER_INCLUDE_DIR}
             -o ${COMPILED_SPV}
-    DEPENDS ${SHADER_FILE}
+    DEPENDS ${SHADER_FILE} "${SHADER_INCLUDE_DIR}/FastNoiseLite.hlsl"
+          "${SHADER_INCLUDE_DIR}/terrain_noise.hlsl"
     VERBATIM
   )
 
@@ -102,11 +102,13 @@ if (ALL_SPV_TARGETS)
   add_dependencies (engine_shaders engine_shader_build)
 endif ()
 
-add_executable (engine src/main.cpp)
+add_executable (engine src/main.cpp src/renderer.cpp src/camera.cpp)
 
 set_target_properties (engine PROPERTIES CXX_STANDARD 20)
 target_link_libraries (engine Vulkan::cppm glfw)
-target_include_directories (engine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories (engine PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
 
 if(ENABLE_CPP20_MODULE)
   target_compile_definitions(engine PRIVATE USE_CPP20_MODULES=1)
@@ -123,7 +125,10 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_CURRENT_SOURCE_DIR}/src/textures
         $<TARGET_FILE_DIR:engine>/textures
-    COMMENT "Copying texture folder to build directory"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/blocks
+        $<TARGET_FILE_DIR:engine>/blocks
+    COMMENT "Copying texture and block definition folders to build directory"
 )
 
 add_dependencies (engine engine_shaders)

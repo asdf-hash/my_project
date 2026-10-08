@@ -1,3 +1,27 @@
 Vertex Pulling planing:
 
 per quad:
+15 xyz
+3(18) normal
+8(26) AO
+5(31) 1d greedy meshing length
+1(32) ill use this for smth ig
+10 blocktype
+4(14) skylight 
+12(26) colored light
+6 (32) random data
+
+per chunk:
+24 x chunkcord
+24(48) z chunkcord
+13(61) y axis
+
+
+unloading:
+when more than 8 chunks below unrender.
+when more than 8 chunks above, always unrender.
+
+mesh shader setup:
+first use task shader to loop through the chunk and takes out meshlets of 32 quads
+then run the mesh shader for each meshlet(128,1,1—as its a flat array)
+ - check for remainder meshlets, left over threads can just be skipped.

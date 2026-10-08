@@ -1,0 +1,6 @@
+positive_x=grass_side.png
+negative_x=grass_side.png
+positive_y=grass_top.png
+negative_y=dirt.png
+positive_z=grass_side.png
+negative_z=grass_side.png
