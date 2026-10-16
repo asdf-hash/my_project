@@ -77,7 +77,8 @@ float erosionSpline(float e, float pvFactor) {
 
 // -----------------------------------------------------------------------------
 // MAIN BLUE GRAPH: Continentalness Spline
-// Controls macro landmasses: Ocean Trenches -> Coastal Shelf -> Inland Highlands
+// Controls macro landmasses: Ocean Trenches -> Coastal Shelf -> Inland Highlands.
+// The broad ocean band keeps the large-scale field from producing island chains.
 // -----------------------------------------------------------------------------
 float continentalnessSpline(float c, float e, float pvFactor, float oceanFloorHeight) {
   c = saturate(c);
@@ -87,17 +88,17 @@ float continentalnessSpline(float c, float e, float pvFactor, float oceanFloorHe
     return oceanFloorHeight;
   }
   // Transition from ocean floor up to continental shelf
-  if (c < 0.28f) {
-    const float shelfBase = lerp(-120.0f, 2.0f, smoothstep(0.18f, 0.28f, c));
-    return lerp(oceanFloorHeight, shelfBase, smoothstep(0.18f, 0.25f, c));
+  if (c < 0.34f) {
+    const float shelfBase = lerp(-120.0f, 2.0f, smoothstep(0.18f, 0.34f, c));
+    return lerp(oceanFloorHeight, shelfBase, smoothstep(0.18f, 0.31f, c));
   }
   // Coastal Plains & Lowland Interior
-  if (c < 0.50f) {
-    return terrainSplineSegment(c, 0.28f, 0.50f, 2.0f, 50.0f);
+  if (c < 0.52f) {
+    return terrainSplineSegment(c, 0.34f, 0.52f, 2.0f, 50.0f);
   }
   // Inland Step up to Mountainous Plateau Bases
   if (c < 0.65f) {
-    return terrainSplineSegment(c, 0.50f, 0.65f, 50.0f, 150.0f);
+    return terrainSplineSegment(c, 0.52f, 0.65f, 50.0f, 150.0f);
   }
 
   // High Inland / Mountain Zones: Pass control to Erosion & Peaks/Valleys Splines
@@ -211,8 +212,8 @@ float sampleTerrainHeight(int worldX, int worldZ, uint lodLevel) {
   warpState.noise_type = FNL_NOISE_OPENSIMPLEX2;
   warpState.octaves = 2;
   warpState.frequency = 0.0006f;
-  const float warpX = fnlGetNoise2D(warpState, x + 400.0f, z - 400.0f) * 150.0f;
-  const float warpZ = fnlGetNoise2D(warpState, x - 200.0f, z + 200.0f) * 150.0f;
+  const float warpX = fnlGetNoise2D(warpState, x + 400.0f, z - 400.0f) * 100.0f;
+  const float warpZ = fnlGetNoise2D(warpState, x - 200.0f, z + 200.0f) * 100.0f;
 
   const float wx = x + warpX;
   const float wz = z + warpZ;
@@ -221,18 +222,20 @@ float sampleTerrainHeight(int worldX, int worldZ, uint lodLevel) {
   fnl_state continentalnessState = CONTINENTALNESS_STATE;
   continentalnessState.noise_type = FNL_NOISE_OPENSIMPLEX2;
   continentalnessState.fractal_type = FNL_FRACTAL_FBM;
-  continentalnessState.octaves = 5;
-  continentalnessState.frequency = 0.00025f;
+  // Keep continentalness much broader than terrain detail so continents are
+  // separated by genuinely large ocean basins instead of frequent islands.
+  continentalnessState.octaves = 4;
+  continentalnessState.frequency = 0.00012f;
   const float continentalnessNoise = fnlGetNoise2D(continentalnessState, wx, wz);
   const float continentalness = saturate((continentalnessNoise + 1.0f) * 0.5f);
 
   float oceanFloorHeight = 0.0f;
-  if (continentalness < 0.28f) {
+  if (continentalness < 0.34f) {
     // 3. Smooth single-octave ocean-floor noise, only used on the ocean/coastal transition.
     fnl_state oceanState = OCEAN_STATE;
     oceanState.noise_type = FNL_NOISE_OPENSIMPLEX2;
     oceanState.octaves = 1;
-    oceanState.frequency = 0.0005f;
+    oceanState.frequency = 0.00025f;
     const float oceanNoise = fnlGetNoise2D(oceanState, x, z);
     oceanFloorHeight = lerp(-380.0f, -180.0f, (oceanNoise + 1.0f) * 0.5f);
   }
@@ -275,6 +278,12 @@ float sampleTerrainHeight(int worldX, int worldZ, uint lodLevel) {
 
     const float detailAmplitude = lerp(4.0f, 45.0f, detailMask) * landFactor;
     terrainHeight += detailNoise * detailAmplitude;
+  }
+
+  // Keep coastal land above sea level after detail is applied. Without this
+  // seal, small detail dips near the shoreline become isolated inland ponds.
+  if (continentalness >= 0.34f) {
+    terrainHeight = max(terrainHeight, 2.0f);
   }
 
   return clamp(terrainHeight, -400.0f, 600.0f);
