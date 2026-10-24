@@ -121,7 +121,7 @@ void writeQuad(uint outputIndex, uint columnIndex, uint x, uint y, uint z, int w
   const int worldCellX = chunkCoord.x * int(CHUNK_SIZE) + int(x) * scale;
   const int worldCellZ = chunkCoord.y * int(CHUNK_SIZE) + int(z) * scale;
   const int blockWorldY = worldY * scale + scale - 1;
-  const bool nearLayerTransition = normalIndex == 2u && isNearLayerTransition(blockWorldY, scale);
+  const bool nearLayerTransition = isNearLayerTransition(blockWorldY, scale);
   const int materialWorldY = nearLayerTransition
                                  ? int(floor(sampleTerrainHeight(worldCellX + scale / 2, worldCellZ + scale / 2, 0u)))
                                  : blockWorldY;
