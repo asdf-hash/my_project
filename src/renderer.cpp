@@ -311,7 +311,7 @@ private:
 #pragma region Main Loop
   void mainLoop() {
     using Clock = std::chrono::steady_clock;
-    constexpr auto frameDuration =
+    constexpr auto frameDuration = // FPS CONFIG
         std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / 90.0));
     auto nextFrame = Clock::now();
 
