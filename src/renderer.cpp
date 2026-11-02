@@ -1063,8 +1063,14 @@ private:
 
   void createTextureImages() {
     constexpr std::array<const char *, MAX_BLOCK_TYPES> blockDefinitionPaths = {
+<<<<<<< HEAD
         "blocks/grass.block", "blocks/dirt.block",  "blocks/stone.block", "blocks/sand.block",  "blocks/snow.block",
         "blocks/stone.block", "blocks/stone.block", "blocks/stone.block", "blocks/stone.block", "blocks/stone.block"};
+=======
+        "blocks/grass.block", "blocks/dirt.block",     "blocks/stone.block", "blocks/sand.block",
+        "blocks/snow.block",  "blocks/gravel.block",   "blocks/stone.block", "blocks/stone.block",
+        "blocks/stone.block", "blocks/deepslate.block"};
+>>>>>>> a2baaa3b1b2b3ac2e9cea20c5f97a8c336887dda
     constexpr std::array<const char *, 6> normalNames = {"positive_x", "negative_x", "positive_y",
                                                          "negative_y", "positive_z", "negative_z"};
     std::vector<std::string> texturePaths;

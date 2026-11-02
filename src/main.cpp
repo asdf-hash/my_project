@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <exception>
+<<<<<<< HEAD
 #include <filesystem>
 #include <iostream>
 
@@ -12,6 +13,12 @@ int main(int argc, char **argv) {
       std::filesystem::current_path(executablePath.parent_path());
     }
 
+=======
+#include <iostream>
+
+int main() {
+  try {
+>>>>>>> a2baaa3b1b2b3ac2e9cea20c5f97a8c336887dda
     Renderer renderer;
     renderer.run();
   } catch (const std::exception &e) {
