@@ -3,13 +3,13 @@ Vertex Pulling planing:
 per quad:
 15 xyz
 3(18) normal
-8(26) AO
-5(31) 1d greedy meshing length
-1(32) ill use this for smth ig
-10 blocktype
-4(14) skylight 
-12(26) colored light
-6 (32) random data
+5(23) greedy w
+5(28) greedy h
+4(32) skylight
+8(40) AO
+10(50) blocktype
+12(62) colored light
+2(64) animated flag?/other flags
 
 per chunk:
 24 x chunkcord

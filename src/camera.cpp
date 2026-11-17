@@ -3,7 +3,6 @@
 #include <GLFW/glfw3.h>
 
 #include <cmath>
-#include <cstddef>
 #include <glm/gtc/matrix_transform.hpp>
 
 void Camera::initialize(GLFWwindow *window) {
@@ -64,7 +63,6 @@ glm::mat4 Camera::update(GLFWwindow *window, float deltaTime) {
 
   const glm::vec3 right = glm::normalize(glm::cross(cameraFront, cameraUp));
   const glm::vec3 worldUp{0.0f, 1.0f, 0.0f};
-  const glm::vec3 forward = glm::normalize(glm::cross(right, worldUp));
   const float velocity = cameraSpeed * deltaTime;
 
   if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
@@ -86,16 +84,12 @@ glm::mat4 Camera::update(GLFWwindow *window, float deltaTime) {
     cameraPos -= worldUp * velocity;
   }
 
-  static bool eWasPressed = false;
-  bool eIsPressed = (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS);
-
-  if (!eIsPressed && eWasPressed) {
-    static size_t index = 1;
-    index++;
-    cameraSpeed = cameraSpeeds[index % 3];
+  const bool speedKeyIsPressed = glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS;
+  if (!speedKeyIsPressed && speedKeyWasPressed) {
+    cameraSpeedIndex = (cameraSpeedIndex + 1) % cameraSpeeds.size();
+    cameraSpeed = cameraSpeeds[cameraSpeedIndex];
   }
-
-  eWasPressed = eIsPressed;
+  speedKeyWasPressed = speedKeyIsPressed;
 
   return glm::lookAt(cameraPos, cameraPos + cameraFront, worldUp);
 }

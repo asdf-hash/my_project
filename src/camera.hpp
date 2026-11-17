@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <glm/glm.hpp>
 
 struct GLFWwindow;
@@ -18,6 +19,7 @@ public:
 
 private:
   bool cursorCaptured = true;
+  bool speedKeyWasPressed = false;
   glm::vec3 cameraPos{0.5f, 0.5f, 2.5f};
   glm::vec3 cameraFront = glm::normalize(glm::vec3(0.5f, 0.5f, 0.0f) - cameraPos);
   glm::vec3 cameraUp{0.0f, 1.0f, 0.0f};
@@ -25,6 +27,7 @@ private:
   float cameraPitch = 0.0f;
   float cameraSpeed = 100.0f;
   float mouseSensitivity = 0.15f;
+  std::size_t cameraSpeedIndex = 1;
   bool firstMouse = true;
   double lastMouseX = 400.0;
   double lastMouseY = 300.0;

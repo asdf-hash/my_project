@@ -1,6 +1,7 @@
 #pragma once
 
 #include "lod.hpp"
+#include "profile.hpp"
 #include "renderer.hpp"
 #include "world.hpp"
 
@@ -39,7 +40,6 @@ struct ClipmapResult {
 inline ClipmapResult buildVisibleClipmap(const ClipmapView &view) {
   constexpr std::uint32_t CLIPMAP_KEEP_ALIVE_MULTIPLIER = 4u;
   const int32_t cameraChunkX = static_cast<int32_t>(std::floor(view.position[0] / CHUNK_SIZE));
-  const int32_t cameraChunkY = static_cast<int32_t>(std::floor(view.position[1] / CHUNK_SIZE));
   const int32_t cameraChunkZ = static_cast<int32_t>(std::floor(view.position[2] / CHUNK_SIZE));
   const int32_t verticalChunkCount = 2 * world::kVerticalRenderDistance + 1;
   const std::uint32_t maxChunkCount = calculateClipmapCapacity(TARGET_SCREEN_PERCENTAGE, MIN_SUPPORTED_TAN_HALF_FOV,
@@ -205,6 +205,7 @@ private:
       }
 
       try {
+        Profiler::Scope profile(Profiler::Metric::ClipmapBuild);
         ClipmapResult result = buildVisibleClipmap(job.second);
         std::lock_guard lock(mutex_);
         if (!completion_ || completion_->sequence < job.first) {

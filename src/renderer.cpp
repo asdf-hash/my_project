@@ -2,6 +2,7 @@
 #include "camera.hpp"
 #include "clipmap_culler.hpp"
 #include "lod.hpp"
+#include "profile.hpp"
 #include "world.hpp"
 
 #include <algorithm>
@@ -47,6 +48,7 @@ constexpr vk::SampleCountFlagBits RENDER_SAMPLE_COUNT = vk::SampleCountFlagBits:
 constexpr float BASE_FOV_RADIANS = glm::radians(70.0f);
 constexpr vk::Format TAA_HISTORY_FORMAT = vk::Format::eR16G16B16A16Sfloat;
 constexpr uint32_t MAX_BLOCK_TYPES = 10;
+constexpr uint32_t GPU_TIMESTAMP_COUNT = 6;
 static_assert(sizeof(world::ChunkLod) == sizeof(int32_t) * 4);
 
 const std::vector<char const *> validationLayers = {"VK_LAYER_KHRONOS_validation"};
@@ -115,6 +117,8 @@ private:
   vk::raii::PhysicalDevice physicalDevice = nullptr;
   vk::raii::Device device = nullptr;
   uint32_t queueIndex = ~0;
+  uint32_t timestampValidBits = 0;
+  float timestampPeriod = 0.0f;
   vk::raii::Queue queue = nullptr;
 #pragma endregion
 
@@ -231,6 +235,10 @@ private:
   std::vector<vk::raii::Semaphore> presentCompleteSemaphores;
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
   std::vector<vk::raii::Fence> inFlightFences;
+  vk::raii::QueryPool timestampQueryPool = nullptr;
+  std::array<bool, MAX_FRAMES_IN_FLIGHT> timestampQueriesPending{};
+  std::array<bool, MAX_FRAMES_IN_FLIGHT> timestampQueriesHadChunkUpdates{};
+  bool gpuTimestampsEnabled = false;
   uint32_t frameIndex = 0;
   uint32_t taaHistoryWriteIndex = 0;
   uint32_t taaJitterIndex = 0;
@@ -242,6 +250,7 @@ private:
 
 #pragma region Input State
   bool framebufferResized = false;
+  bool fpsLimitEnabled = true;
   Camera camera;
 #pragma endregion
 
@@ -255,12 +264,18 @@ private:
 #pragma region Application Lifecycle
 #pragma region Window Setup
   void initWindow() {
-    glfwInit();
+    if (glfwInit() != GLFW_TRUE) {
+      throw std::runtime_error("failed to initialize GLFW");
+    }
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
     window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+    if (window == nullptr) {
+      glfwTerminate();
+      throw std::runtime_error("failed to create GLFW window");
+    }
     glfwSetWindowUserPointer(window, this);
     glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
     glfwSetKeyCallback(window, keyCallback);
@@ -275,6 +290,18 @@ private:
   static void keyCallback(GLFWwindow *window, int key, int scancode, int action, int mods) {
     auto app = reinterpret_cast<HelloTriangleApplication *>(glfwGetWindowUserPointer(window));
     app->camera.handleKey(window, key, action);
+    if (action != GLFW_PRESS) {
+      return;
+    }
+
+    if (key == GLFW_KEY_G) {
+      app->fpsLimitEnabled = !app->fpsLimitEnabled;
+      std::clog << "FPS limit " << (app->fpsLimitEnabled ? "enabled" : "disabled") << '\n';
+    } else if (key == GLFW_KEY_F) {
+      auto &profiler = Profiler::instance();
+      profiler.setEnabled(!profiler.enabled());
+      std::clog << "Profiling " << (profiler.enabled() ? "enabled" : "disabled") << '\n';
+    }
   }
 #pragma endregion
 
@@ -305,26 +332,31 @@ private:
     createTaaDescriptorSets();
     createCommandBuffers();
     createSyncObjects();
+    createTimestampQueryPool();
   }
 #pragma endregion
 
 #pragma region Main Loop
   void mainLoop() {
     using Clock = std::chrono::steady_clock;
-    constexpr auto frameDuration = // FPS CONFIG
+    constexpr auto frameDuration =
         std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / 90.0));
     auto nextFrame = Clock::now();
 
     while (!glfwWindowShouldClose(window)) {
-      // Fps Limit
-      nextFrame += frameDuration;
       glfwPollEvents();
       drawFrame();
-      std::this_thread::sleep_until(nextFrame);
+      Profiler::instance().reportIfDue();
+      if (fpsLimitEnabled) {
+        nextFrame += frameDuration;
+        std::this_thread::sleep_until(nextFrame);
 
-      const auto now = Clock::now();
-      if (now > nextFrame + frameDuration) {
-        nextFrame = now;
+        const auto now = Clock::now();
+        if (now > nextFrame + frameDuration) {
+          nextFrame = now;
+        }
+      } else {
+        nextFrame = Clock::now();
       }
     }
 
@@ -371,11 +403,8 @@ private:
 
   void cleanup() {
     cleanupSwapChain();
-    surface = nullptr; // god knows why linux throws a seg fault, same thing
-                       // happened on the wgpu project too, always gotta force
-                       // release furface before glfw windows.
+    surface = nullptr;
     glfwDestroyWindow(window);
-
     glfwTerminate();
   }
 #pragma endregion
@@ -393,8 +422,10 @@ private:
 
     device.waitIdle();
 
+    renderFinishedSemaphores.clear();
     cleanupSwapChain();
     createSwapChain();
+    createRenderFinishedSemaphores();
     createImageViews();
     createGraphicsPipeline();
     createTaaPipeline();
@@ -564,7 +595,8 @@ private:
           physicalDevice.getSurfaceSupportKHR(qfpIndex, *surface)) {
         // found a queue family that supports both graphics and present
         queueIndex = qfpIndex;
-        break;
+        timestampValidBits = queueFamilyProperties[qfpIndex].timestampValidBits;
+            break;
       }
     }
     if (queueIndex == ~0) {
@@ -600,6 +632,7 @@ private:
 
     device = vk::raii::Device(physicalDevice, deviceCreateInfo);
     queue = vk::raii::Queue(device, queueIndex, 0);
+    timestampPeriod = physicalDevice.getProperties().limits.timestampPeriod;
   }
 #pragma endregion
 #pragma endregion
@@ -1372,7 +1405,8 @@ private:
   }
 
   void updateVisibleClipmap(const ClipmapView &view) {
-    if (!lastSubmittedClipmapView || *lastSubmittedClipmapView != view) {
+    Profiler::Scope profile(Profiler::Metric::ClipmapUpdate);
+    if (!lastSubmittedClipmapView || !clipmapViewCanCover(*lastSubmittedClipmapView, view)) {
       latestSubmittedClipmapSequence = clipmapCuller.submit(view);
       lastSubmittedClipmapView = view;
     }
@@ -1389,6 +1423,7 @@ private:
       }
     }
     if (!lastAppliedClipmapView || !clipmapViewCanCover(*lastAppliedClipmapView, view)) {
+      Profiler::Scope fallbackProfile(Profiler::Metric::ClipmapFallback);
       ClipmapResult result = buildVisibleClipmap(view);
       lastAppliedClipmapSequence = latestSubmittedClipmapSequence;
       lastAppliedClipmapView = view;
@@ -1402,7 +1437,7 @@ private:
   }
 
   static bool clipmapViewCanCover(const ClipmapView &builtView, const ClipmapView &currentView) {
-    constexpr float maxPositionDelta = static_cast<float>(CHUNK_SIZE) * 0.5f;
+    constexpr float maxPositionDelta = static_cast<float>(CHUNK_SIZE) * 2.0f;
     constexpr float minForwardDot = 0.9961947f;
     const float dx = builtView.position[0] - currentView.position[0];
     const float dy = builtView.position[1] - currentView.position[1];
@@ -1604,7 +1639,7 @@ private:
     vk::PhysicalDeviceMemoryProperties memProperties = physicalDevice.getMemoryProperties();
 
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
-      if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+      if ((typeFilter & (1u << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
         return i;
       }
     }
@@ -1625,8 +1660,14 @@ private:
 
 #pragma region Command Recording
   void recordCommandBuffer(uint32_t imageIndex) {
+    Profiler::Scope profile(Profiler::Metric::CommandRecording);
     auto &commandBuffer = commandBuffers[frameIndex];
     commandBuffer.begin({});
+    const uint32_t firstQuery = frameIndex * GPU_TIMESTAMP_COUNT;
+    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
+      commandBuffer.resetQueryPool(*timestampQueryPool, firstQuery, GPU_TIMESTAMP_COUNT);
+      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery);
+    }
     recordChunkCompute(commandBuffer);
 
     const auto colorOutputStage = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
@@ -1709,6 +1750,10 @@ private:
                                      nullptr);
     commandBuffer.drawMeshTasksIndirectEXT(*meshDrawArgumentsBuffer, 0, 1, sizeof(vk::DrawMeshTasksIndirectCommandEXT));
     commandBuffer.endRendering();
+    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
+      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool,
+                                    firstQuery + 4u);
+    }
 
     const auto fragmentStage = vk::PipelineStageFlagBits2::eFragmentShader;
     transition_image_layout(*sceneColorImages[imageIndex], vk::ImageLayout::eColorAttachmentOptimal,
@@ -1747,6 +1792,10 @@ private:
                                 &taaParams);
     commandBuffer.draw(3, 1, 0, 0);
     commandBuffer.endRendering();
+    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
+      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool,
+                                    firstQuery + 5u);
+    }
 
     transition_image_layout(*taaHistoryImages[taaHistoryWriteIndex], vk::ImageLayout::eColorAttachmentOptimal,
                             vk::ImageLayout::eShaderReadOnlyOptimal, colorWrite, vk::AccessFlagBits2::eShaderRead,
@@ -1761,7 +1810,13 @@ private:
   }
 
   void recordChunkCompute(vk::raii::CommandBuffer &commandBuffer) {
+    const uint32_t firstQuery = frameIndex * GPU_TIMESTAMP_COUNT;
     if (!chunkBuffersDirty) {
+      if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
+        commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 1u);
+        commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 2u);
+        commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 3u);
+      }
       return;
     }
 
@@ -1800,10 +1855,16 @@ private:
       commandBuffer.pipelineBarrier2(
           vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &heightReadyBarrier});
     }
+    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
+      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 1u);
+    }
 
     if (chunkComputeCount != 0u) {
       commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *meshColumnsPipeline);
       commandBuffer.dispatch(4, 4, chunkComputeCount);
+    }
+    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
+      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 2u);
     }
 
     vk::MemoryBarrier2 counterReadyBarrier{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -1815,6 +1876,9 @@ private:
 
     commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *finalizeMeshPipeline);
     commandBuffer.dispatch(1, 1, 1);
+    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
+      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 3u);
+    }
 
     vk::MemoryBarrier2 meshReadyBarrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -1853,14 +1917,65 @@ private:
   void createSyncObjects() {
     assert(presentCompleteSemaphores.empty() && renderFinishedSemaphores.empty() && inFlightFences.empty());
 
-    for (size_t i = 0; i < swapChainImages.size(); i++) {
-      renderFinishedSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
-    }
+    createRenderFinishedSemaphores();
 
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
       presentCompleteSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
       inFlightFences.emplace_back(device, vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
     }
+  }
+
+  void createRenderFinishedSemaphores() {
+    for (size_t i = 0; i < swapChainImages.size(); i++) {
+      renderFinishedSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
+    }
+  }
+
+  void createTimestampQueryPool() {
+    if (timestampValidBits == 0) {
+      return;
+    }
+
+    timestampQueryPool = vk::raii::QueryPool(
+        device, vk::QueryPoolCreateInfo{.queryType = vk::QueryType::eTimestamp,
+                                        .queryCount = GPU_TIMESTAMP_COUNT * MAX_FRAMES_IN_FLIGHT});
+    gpuTimestampsEnabled = true;
+  }
+
+  void collectGpuTimestamps(uint32_t frame) {
+    if (!gpuTimestampsEnabled || !timestampQueriesPending[frame]) {
+      return;
+    }
+    if (!Profiler::instance().enabled()) {
+      timestampQueriesPending[frame] = false;
+      return;
+    }
+
+    const uint32_t firstQuery = frame * GPU_TIMESTAMP_COUNT;
+    auto [result, timestamps] = timestampQueryPool.getResults<std::uint64_t>(
+        firstQuery, GPU_TIMESTAMP_COUNT, sizeof(std::uint64_t) * GPU_TIMESTAMP_COUNT, sizeof(std::uint64_t),
+        vk::QueryResultFlagBits::e64);
+    if (result != vk::Result::eSuccess) {
+      throw std::runtime_error("failed to read GPU timestamp queries");
+    }
+
+    const std::uint64_t validMask =
+        timestampValidBits == 64 ? std::numeric_limits<std::uint64_t>::max() : (1ull << timestampValidBits) - 1ull;
+    const auto recordElapsed = [&](uint32_t start, uint32_t end, Profiler::Metric metric) {
+      const auto elapsedTicks = (timestamps[end] - timestamps[start]) & validMask;
+      const auto elapsedNanoseconds = static_cast<std::uint64_t>(elapsedTicks * timestampPeriod);
+      Profiler::instance().recordNanoseconds(metric, elapsedNanoseconds);
+    };
+    recordElapsed(0, 3, Profiler::Metric::GpuCompute);
+    if (timestampQueriesHadChunkUpdates[frame]) {
+      recordElapsed(0, 3, Profiler::Metric::GpuComputeUpdate);
+      recordElapsed(0, 1, Profiler::Metric::GpuHeightGeneration);
+      recordElapsed(1, 2, Profiler::Metric::GpuMeshGeneration);
+      recordElapsed(2, 3, Profiler::Metric::GpuFinalize);
+    }
+    recordElapsed(3, 4, Profiler::Metric::GpuScene);
+    recordElapsed(4, 5, Profiler::Metric::GpuTaa);
+    timestampQueriesPending[frame] = false;
   }
 #pragma endregion
 #pragma endregion
@@ -1881,9 +1996,10 @@ private:
 
 #pragma region Uniform Update
   void updateUniformBuffer(uint32_t currentImage) {
-    static auto lastTime = std::chrono::high_resolution_clock::now();
+    Profiler::Scope profile(Profiler::Metric::UniformUpdate);
+    static auto lastTime = std::chrono::steady_clock::now();
 
-    auto currentTime = std::chrono::high_resolution_clock::now();
+    const auto currentTime = std::chrono::steady_clock::now();
     float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
     lastTime = currentTime;
 
@@ -1947,28 +2063,33 @@ private:
 
 #pragma region Frame Submit
   void drawFrame() {
+    Profiler::Scope frameProfile(Profiler::Metric::Frame);
     // Note: inFlightFences, presentCompleteSemaphores, and commandBuffers are
     // indexed by frameIndex,
     //       while renderFinishedSemaphores is indexed by imageIndex
-    auto fenceResult = device.waitForFences(*inFlightFences[frameIndex], vk::True, UINT64_MAX);
-    if (fenceResult != vk::Result::eSuccess) {
-      throw std::runtime_error("failed to wait for fence!");
-    }
+    vk::Result result;
+    uint32_t imageIndex;
+    {
+      Profiler::Scope profile(Profiler::Metric::SyncAndAcquire);
+      const auto fenceResult = device.waitForFences(*inFlightFences[frameIndex], vk::True, UINT64_MAX);
+      if (fenceResult != vk::Result::eSuccess) {
+        throw std::runtime_error("failed to wait for fence!");
+      }
+      collectGpuTimestamps(frameIndex);
 
-    auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
+      auto [acquireResult, acquiredImageIndex] =
+          swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
+      result = acquireResult;
+      imageIndex = acquiredImageIndex;
 
-    // Due to VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS being defined,
-    // eErrorOutOfDateKHR can be checked as a result here and does not need to
-    // be caught by an exception.
-    if (result == vk::Result::eErrorOutOfDateKHR) {
-      recreateSwapChain();
-      return;
-    }
-    // On other success codes than eSuccess and eSuboptimalKHR we just throw an
-    // exception. On any error code, aquireNextImage already threw an exception.
-    if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
-      assert(result == vk::Result::eTimeout || result == vk::Result::eNotReady);
-      throw std::runtime_error("failed to acquire swap chain image!");
+      if (result == vk::Result::eErrorOutOfDateKHR) {
+        recreateSwapChain();
+        return;
+      }
+      if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
+        assert(result == vk::Result::eTimeout || result == vk::Result::eNotReady);
+        throw std::runtime_error("failed to acquire swap chain image!");
+      }
     }
     updateUniformBuffer(frameIndex);
     updateTaaDescriptorSet(frameIndex, imageIndex);
@@ -1977,6 +2098,7 @@ private:
     device.resetFences(*inFlightFences[frameIndex]);
 
     commandBuffers[frameIndex].reset();
+    timestampQueriesHadChunkUpdates[frameIndex] = chunkBuffersDirty;
     recordCommandBuffer(imageIndex);
 
     vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
@@ -1987,14 +2109,18 @@ private:
                                     .pCommandBuffers = &*commandBuffers[frameIndex],
                                     .signalSemaphoreCount = 1,
                                     .pSignalSemaphores = &*renderFinishedSemaphores[imageIndex]};
-    queue.submit(submitInfo, *inFlightFences[frameIndex]);
+    {
+      Profiler::Scope profile(Profiler::Metric::SubmitAndPresent);
+      queue.submit(submitInfo, *inFlightFences[frameIndex]);
+      timestampQueriesPending[frameIndex] = gpuTimestampsEnabled && Profiler::instance().enabled();
 
-    const vk::PresentInfoKHR presentInfoKHR{.waitSemaphoreCount = 1,
-                                            .pWaitSemaphores = &*renderFinishedSemaphores[imageIndex],
-                                            .swapchainCount = 1,
-                                            .pSwapchains = &*swapChain,
-                                            .pImageIndices = &imageIndex};
-    result = queue.presentKHR(presentInfoKHR);
+      const vk::PresentInfoKHR presentInfoKHR{.waitSemaphoreCount = 1,
+                                              .pWaitSemaphores = &*renderFinishedSemaphores[imageIndex],
+                                              .swapchainCount = 1,
+                                              .pSwapchains = &*swapChain,
+                                              .pImageIndices = &imageIndex};
+      result = queue.presentKHR(presentInfoKHR);
+    }
     // Due to VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS being defined,
     // eErrorOutOfDateKHR can be checked as a result here and does not need to
     // be caught by an exception.
@@ -2064,6 +2190,9 @@ private:
   std::vector<const char *> getRequiredInstanceExtensions() {
     uint32_t glfwExtensionCount = 0;
     auto glfwExtensions = glfwGetRequiredInstanceExtensions(&glfwExtensionCount);
+    if (glfwExtensions == nullptr || glfwExtensionCount == 0) {
+      throw std::runtime_error("failed to get required GLFW Vulkan extensions");
+    }
 
     std::vector extensions(glfwExtensions, glfwExtensions + glfwExtensionCount);
     if (enableValidationLayers) {
@@ -2092,12 +2221,18 @@ private:
   static std::vector<char> readFile(const std::string &filename) {
     std::ifstream file(filename, std::ios::ate | std::ios::binary);
     if (!file.is_open()) {
-      throw std::runtime_error("failed to open file!");
+      throw std::runtime_error("failed to open file: " + filename);
     }
-    std::vector<char> buffer(file.tellg());
+
+    const auto fileSize = file.tellg();
+    if (fileSize <= 0) {
+      throw std::runtime_error("file is empty or could not be sized: " + filename);
+    }
+    std::vector<char> buffer(static_cast<size_t>(fileSize));
     file.seekg(0, std::ios::beg);
-    file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-    file.close();
+    if (!file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()))) {
+      throw std::runtime_error("failed to read file: " + filename);
+    }
     return buffer;
   }
 #pragma endregion

@@ -5,11 +5,10 @@ static const uint HEIGHT_STRIDE = 34u;
 static const uint HEIGHTS_PER_CHUNK = HEIGHT_STRIDE * HEIGHT_STRIDE;
 static const uint MAX_QUAD_COUNT = 1u << 22u;
 static const int MIN_TERRAIN_HEIGHT = -400;
-static const int DITHER_RADIUS = 3;
 
-const static int TRANSISTION_HEIGHTS[3] = { 0, 160, 250 };
+static const int TRANSITION_HEIGHTS[3] = { 0, 160, 250 };
 const static uint LAYER_TYPES[4] = { 3u, 0u, 2u, 4u };
-const static int heightCount = TRANSISTION_HEIGHTS.getCount();
+static const int heightCount = TRANSITION_HEIGHTS.getCount();
 
 struct DispatchParams {
   uint chunkCount;
@@ -70,11 +69,11 @@ uint vertexAo(bool sideA, bool sideB, bool corner) {
   return sideA && sideB ? 3u : uint(sideA) + uint(sideB) + uint(corner);
 }
 
-uint selectBlockType(int worldY, int worldX, int worldZ) {
+uint selectBlockType(int worldY) {
   uint layerId = 0;
   [unroll]
   for (uint i = 0u; i < uint(heightCount); i++) {
-    layerId += int(worldY >= TRANSISTION_HEIGHTS[i]); // layerId ends up being [0,1,2,3...]
+    layerId += int(worldY >= TRANSITION_HEIGHTS[i]);
   }
 
   return LAYER_TYPES[min(heightCount, layerId)];
@@ -84,7 +83,7 @@ bool isNearLayerTransition(int blockWorldY, int scale) {
   bool nearTransition = false;
   [unroll]
   for (uint i = 0u; i < uint(heightCount); ++i) {
-    const int transition = TRANSISTION_HEIGHTS[i];
+    const int transition = TRANSITION_HEIGHTS[i];
     nearTransition |= blockWorldY >= transition - scale && blockWorldY < transition + scale;
   }
   return nearTransition;
@@ -115,17 +114,17 @@ uint calculateAo(uint columnIndex, int x, int y, int z, int chunkY, uint normalI
          (vertexAo(sideU1, sideV1, corner2) << 4u) | (vertexAo(sideU0, sideV1, corner3) << 6u);
 }
 
-void writeQuad(uint outputIndex, uint columnIndex, uint x, uint y, uint z, int worldY, uint normalIndex,
-               int columnHeight, int chunkY, int4 chunkCoord) {
+void writeQuad(uint outputIndex, uint columnIndex, uint x, uint y, uint z, int worldY, uint normalIndex, int chunkY,
+               int4 chunkCoord) {
   const int scale = chunkCoord.w;
   const int worldCellX = chunkCoord.x * int(CHUNK_SIZE) + int(x) * scale;
   const int worldCellZ = chunkCoord.y * int(CHUNK_SIZE) + int(z) * scale;
   const int blockWorldY = worldY * scale + scale - 1;
   const bool nearLayerTransition = isNearLayerTransition(blockWorldY, scale);
   const int materialWorldY = nearLayerTransition
-                                 ? int(floor(sampleTerrainHeight(worldCellX + scale / 2, worldCellZ + scale / 2, 0u)))
+                                 ? int(floor(sampleTerrainHeight(worldCellX + scale / 2, worldCellZ + scale / 2)))
                                  : blockWorldY;
-  const uint actualBlockType = selectBlockType(materialWorldY, worldCellX + scale / 2, worldCellZ + scale / 2);
+  const uint actualBlockType = selectBlockType(materialWorldY);
   uint packed = (x & 0x1fu) | ((y & 0x1fu) << 5u) | ((z & 0x1fu) << 10u) | ((normalIndex & 0x7u) << 15u);
   packed |= calculateAo(columnIndex, int(x), int(y), int(z), chunkY, normalIndex) << 18u;
   const uint rotationGroupIndex = (normalIndex >> 1u) == 1u ? 1u : 0u;
@@ -159,7 +158,7 @@ void generateHeights(uint3 dispatchThreadID: SV_DispatchThreadID, uint3 groupID:
   const int scale = chunkCoord.w;
   const int worldX = chunkCoord.x * int(CHUNK_SIZE) + (int(localX) - 1) * scale;
   const int worldZ = chunkCoord.y * int(CHUNK_SIZE) + (int(localZ) - 1) * scale;
-  const float height = sampleTerrainHeight(worldX, worldZ, uint(chunkCoord.z));
+  const float height = sampleTerrainHeight(worldX, worldZ);
   const int minimumHeight = int(floor(float(MIN_TERRAIN_HEIGHT) / float(chunkCoord.w)));
   const float scaledHeight = height / float(chunkCoord.w);
   HeightBuffer[heightIndex(columnIndex, localX, localZ)] = max(int(floor(scaledHeight)), minimumHeight);
@@ -227,8 +226,7 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
     for (int worldY = faceStart; worldY < faceEnd; ++worldY) {
       const uint outputIndex = chunkBase + faceOffset++;
       if (outputIndex < MAX_QUAD_COUNT)
-        writeQuad(outputIndex, columnIndex, x, uint(worldY - chunkBottom), z, worldY, faceNormal, height, chunkY,
-                  chunkCoord);
+        writeQuad(outputIndex, columnIndex, x, uint(worldY - chunkBottom), z, worldY, faceNormal, chunkY, chunkCoord);
     }
   }
 }

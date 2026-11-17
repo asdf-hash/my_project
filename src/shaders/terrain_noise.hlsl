@@ -203,7 +203,7 @@ static const fnl_state DETAIL_STATE = { 9999,
 // -----------------------------------------------------------------------------
 // MAIN SAMPLING FUNCTION
 // -----------------------------------------------------------------------------
-float sampleTerrainHeight(int worldX, int worldZ, uint lodLevel) {
+float sampleTerrainHeight(int worldX, int worldZ) {
   const float x = float(worldX);
   const float z = float(worldZ);
 
@@ -219,11 +219,11 @@ float sampleTerrainHeight(int worldX, int worldZ, uint lodLevel) {
   const float wz = z + warpZ;
 
   // 2. Continentalness Noise (Macro scale landscape / landmass placement)
+  // Keep continentalness much broader than terrain detail so continents are
+  // separated by genuinely large ocean basins instead of frequent islands.
   fnl_state continentalnessState = CONTINENTALNESS_STATE;
   continentalnessState.noise_type = FNL_NOISE_OPENSIMPLEX2;
   continentalnessState.fractal_type = FNL_FRACTAL_FBM;
-  // Keep continentalness much broader than terrain detail so continents are
-  // separated by genuinely large ocean basins instead of frequent islands.
   continentalnessState.octaves = 4;
   continentalnessState.frequency = 0.00012f;
   const float continentalnessNoise = fnlGetNoise2D(continentalnessState, wx, wz);
