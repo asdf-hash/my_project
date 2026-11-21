@@ -5,7 +5,16 @@
 #include <cmath>
 #include <glm/gtc/matrix_transform.hpp>
 
+void Camera::updateFront() {
+  glm::vec3 direction;
+  direction.x = std::cos(glm::radians(cameraYaw)) * std::cos(glm::radians(cameraPitch));
+  direction.y = std::sin(glm::radians(cameraPitch));
+  direction.z = std::sin(glm::radians(cameraYaw)) * std::cos(glm::radians(cameraPitch));
+  cameraFront = glm::normalize(direction);
+}
+
 void Camera::initialize(GLFWwindow *window) {
+  updateFront(); // start looking where yaw/pitch say, so the first mouse update can't snap the view
   glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
   if (glfwRawMouseMotionSupported()) {
     glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
@@ -17,85 +26,42 @@ void Camera::handleKey(GLFWwindow *window, int key, int action) {
     return;
   }
 
-  cursorCaptured = !cursorCaptured;
-  glfwSetInputMode(window, GLFW_CURSOR, cursorCaptured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+  captured = !captured;
+  glfwSetInputMode(window, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
   if (glfwRawMouseMotionSupported()) {
-    glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, cursorCaptured ? GLFW_TRUE : GLFW_FALSE);
+    glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, captured ? GLFW_TRUE : GLFW_FALSE);
   }
-  if (cursorCaptured) {
+  if (captured) {
     firstMouse = true;
   }
 }
 
-glm::mat4 Camera::update(GLFWwindow *window, float deltaTime) {
-  if (cursorCaptured) {
-    double xpos, ypos;
-    glfwGetCursorPos(window, &xpos, &ypos);
+void Camera::updateLook(GLFWwindow *window) {
+  if (!captured) {
+    return;
+  }
+  double xpos, ypos;
+  glfwGetCursorPos(window, &xpos, &ypos);
 
-    if (firstMouse) {
-      lastMouseX = xpos;
-      lastMouseY = ypos;
-      firstMouse = false;
-    }
-
-    const double xoffset = (xpos - lastMouseX) * mouseSensitivity;
-    const double yoffset = (lastMouseY - ypos) * mouseSensitivity;
+  if (firstMouse) {
     lastMouseX = xpos;
     lastMouseY = ypos;
-
-    cameraYaw += static_cast<float>(xoffset);
-    cameraPitch = glm::clamp(cameraPitch + static_cast<float>(yoffset), -89.0f, 89.0f);
-
-    glm::vec3 direction;
-    direction.x = std::cos(glm::radians(cameraYaw)) * std::cos(glm::radians(cameraPitch));
-    direction.y = std::sin(glm::radians(cameraPitch));
-    direction.z = std::sin(glm::radians(cameraYaw)) * std::cos(glm::radians(cameraPitch));
-    cameraFront = glm::normalize(direction);
-
-    int windowWidth, windowHeight;
-    glfwGetWindowSize(window, &windowWidth, &windowHeight);
-    const double centerX = windowWidth / 2.0;
-    const double centerY = windowHeight / 2.0;
-    glfwSetCursorPos(window, centerX, centerY);
-    lastMouseX = centerX;
-    lastMouseY = centerY;
+    firstMouse = false;
   }
 
-  const glm::vec3 right = glm::normalize(glm::cross(cameraFront, cameraUp));
-  const glm::vec3 worldUp{0.0f, 1.0f, 0.0f};
-  const float velocity = cameraSpeed * deltaTime;
+  const double xoffset = (xpos - lastMouseX) * mouseSensitivity;
+  const double yoffset = (lastMouseY - ypos) * mouseSensitivity;
+  lastMouseX = xpos;
+  lastMouseY = ypos;
 
-  if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) {
-    cameraPos += cameraFront * velocity;
-  }
-  if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) {
-    cameraPos -= cameraFront * velocity;
-  }
-  if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) {
-    cameraPos -= right * velocity;
-  }
-  if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) {
-    cameraPos += right * velocity;
-  }
-  if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
-    cameraPos += worldUp * velocity;
-  }
-  if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) {
-    cameraPos -= worldUp * velocity;
-  }
+  cameraYaw += static_cast<float>(xoffset);
+  cameraPitch = glm::clamp(cameraPitch + static_cast<float>(yoffset), -89.f, 89.f);
 
-  const bool speedKeyIsPressed = glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS;
-  if (!speedKeyIsPressed && speedKeyWasPressed) {
-    cameraSpeedIndex = (cameraSpeedIndex + 1) % cameraSpeeds.size();
-    cameraSpeed = cameraSpeeds[cameraSpeedIndex];
-  }
-  speedKeyWasPressed = speedKeyIsPressed;
-
-  return glm::lookAt(cameraPos, cameraPos + cameraFront, worldUp);
+  updateFront();
+  // No recentering: GLFW_CURSOR_DISABLED already gives an unbounded virtual cursor, and on Wayland
+  // glfwSetCursorPos can't warp, so assuming the cursor moved to the center produced a huge first delta.
 }
 
-const glm::vec3 &Camera::position() const { return cameraPos; }
-
-const glm::vec3 &Camera::front() const { return cameraFront; }
-
-const glm::vec3 &Camera::up() const { return cameraUp; }
+glm::mat4 Camera::view(const glm::vec3 &eye) const {
+  return glm::lookAt(eye, eye + cameraFront, glm::vec3{0.0f, 1.0f, 0.0f});
+}

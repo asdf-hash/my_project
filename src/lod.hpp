@@ -61,5 +61,5 @@ inline constexpr std::uint32_t calculateClipmapCapacity(float screenPercentage, 
     const std::uint64_t cellsPerAxis = wholeCells + (static_cast<double>(wholeCells) < cellsAcross ? 1u : 0u) + 2u;
     capacity += cellsPerAxis * cellsPerAxis;
   }
-  return static_cast<std::uint32_t>(capacity);
+  return static_cast<std::uint32_t>(capacity) + 100u;
 }

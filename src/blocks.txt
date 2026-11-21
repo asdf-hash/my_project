@@ -1,0 +1,30 @@
+# Block definitions. Each [name] section is one block; its ID is its position in this file.
+#
+# Face textures (file names in textures/); later lines override earlier ones:
+#   all, side (the four horizontal faces), top, bottom,
+#   positive_x, negative_x, positive_y, negative_y, positive_z, negative_z
+# Optional:
+#   random_rotation = <faces...>   rotate these faces' textures by a per-face hash to break up tiling
+#   lod_<faces> = <texture>        texture used instead on coarse LOD chunks
+#   lod_tint = <r> <g> <b>         color multiplier applied with the lod_ texture
+
+[grass]
+side = grass_side.png
+top = grass_top.png
+bottom = dirt.png
+random_rotation = top bottom
+# Distant grass sides read as a thin green line; show dirt instead, tinted toward the grass color.
+lod_side = dirt.png
+lod_tint = 0.658 0.8305 0.64
+
+[dirt]
+all = dirt.png
+
+[stone]
+all = stone.png
+
+[sand]
+all = sand.png
+
+[snow]
+all = snow.png

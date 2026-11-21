@@ -3,13 +3,14 @@
         "configurations": [
                 {
                         "name": "Launch",
-                        "type": "cppdbg", // or "cppdbg" for GDB
+                        "type": "cppdbg",
                         "request": "launch",
-                        "program": "${workspaceFolder}/build/bin/VulkanApp", // Update with your executable path
+                        "preLaunchTask": "xmake build",
+                        "program": "${workspaceFolder}/build/linux/x86_64/debug/engine",
                         "args": [],
                         "stopAtEntry": false,
-                        "cwd": "${workspaceFolder}",
-                        "environment": [],
+                        "cwd": "${workspaceFolder}/build/linux/x86_64/debug",
+                        "environment": [{ "name": "MANGOHUD", "value": "1" }],
                         "externalConsole": true // This line enables the external terminal
                 }
         ]

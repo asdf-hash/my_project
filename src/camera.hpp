@@ -1,35 +1,34 @@
 #pragma once
 
-#include <array>
-#include <cmath>
-#include <cstddef>
 #include <glm/glm.hpp>
 
 struct GLFWwindow;
 
+// Mouse look (yaw / pitch) and the view matrix. Position comes from the player (player.hpp).
 class Camera {
 public:
   void initialize(GLFWwindow *window);
   void handleKey(GLFWwindow *window, int key, int action);
-  glm::mat4 update(GLFWwindow *window, float deltaTime);
+  // Applies this frame's mouse movement.
+  void updateLook(GLFWwindow *window);
+  glm::mat4 view(const glm::vec3 &eye) const;
 
-  const glm::vec3 &position() const;
-  const glm::vec3 &front() const;
-  const glm::vec3 &up() const;
+  const glm::vec3 &front() const { return cameraFront; }
+  const glm::vec3 &up() const { return cameraUp; }
+  // Degrees; yaw -90 looks toward -z.
+  float yaw() const { return cameraYaw; }
+  bool cursorCaptured() const { return captured; }
 
 private:
-  bool cursorCaptured = true;
-  bool speedKeyWasPressed = false;
-  glm::vec3 cameraPos{0.5f, 0.5f, 2.5f};
-  glm::vec3 cameraFront = glm::normalize(glm::vec3(0.5f, 0.5f, 0.0f) - cameraPos);
+  void updateFront();
+
+  bool captured = true;
+  glm::vec3 cameraFront{0.0f, 0.0f, -1.0f}; // set from cameraYaw/cameraPitch by updateFront()
   glm::vec3 cameraUp{0.0f, 1.0f, 0.0f};
   float cameraYaw = -90.0f;
-  float cameraPitch = 0.0f;
-  float cameraSpeed = 100.0f;
+  float cameraPitch = -20.0f;
   float mouseSensitivity = 0.15f;
-  std::size_t cameraSpeedIndex = 1;
   bool firstMouse = true;
   double lastMouseX = 400.0;
   double lastMouseY = 300.0;
-  std::array<float, 3> cameraSpeeds{10.f, 100.f, 1000.f};
 };

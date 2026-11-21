@@ -1,8 +1,12 @@
 #include "renderer.hpp"
+#include "block_registry.hpp"
 #include "camera.hpp"
+#include "chunk_slots.hpp"
 #include "clipmap_culler.hpp"
+#include "cpu_world.hpp"
 #include "lod.hpp"
-#include "profile.hpp"
+#include "player.hpp"
+#include "terrain_cpu.hpp"
 #include "world.hpp"
 
 #include <algorithm>
@@ -14,18 +18,23 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <glm/detail/qualifier.hpp>
 #include <glm/ext/matrix_float4x4.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/ext/vector_float3.hpp>
+#include <bit>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <vulkan/vulkan_raii.hpp>
@@ -38,8 +47,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
-#define STB_IMAGE_IMPLEMENTATION
-#include <stb/stb_image.h>
+#include <stb/stb_image.h> // implementation in stb_image_impl.cpp
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
@@ -47,8 +55,6 @@ constexpr int MAX_FRAMES_IN_FLIGHT = 2;
 constexpr vk::SampleCountFlagBits RENDER_SAMPLE_COUNT = vk::SampleCountFlagBits::e2;
 constexpr float BASE_FOV_RADIANS = glm::radians(70.0f);
 constexpr vk::Format TAA_HISTORY_FORMAT = vk::Format::eR16G16B16A16Sfloat;
-constexpr uint32_t MAX_BLOCK_TYPES = 10;
-constexpr uint32_t GPU_TIMESTAMP_COUNT = 6;
 static_assert(sizeof(world::ChunkLod) == sizeof(int32_t) * 4);
 
 const std::vector<char const *> validationLayers = {"VK_LAYER_KHRONOS_validation"};
@@ -63,25 +69,68 @@ struct alignas(16) UniformBufferObject {
   glm::mat4 mvp;
   glm::mat4 previousMvp;
   glm::vec2 renderSize;
-  uint32_t quadCount;
+  uint32_t clusterCount; // QuadClusters the task shader walks: 16 per meshed chunk
   uint32_t historyValid;
   float lodAoLighteningPerLevel;
   alignas(16) glm::vec4 cameraPosition;
-  alignas(16) std::array<std::array<uint32_t, 4>, MAX_BLOCK_TYPES * 2> blockFaceTextures{};
+  glm::vec4 viewRayScale; // xy: 1 / proj[0][0], 1 / proj[1][1]; view ray per NDC unit, for fog distance
+  glm::vec4 hzbParams;    // xy: Hi-Z mip 0 size, z: mip count, w: 1 when it holds last frame's depth
 };
 static_assert(offsetof(UniformBufferObject, previousMvp) == 64);
 static_assert(offsetof(UniformBufferObject, renderSize) == 128);
-static_assert(offsetof(UniformBufferObject, quadCount) == 136);
+static_assert(offsetof(UniformBufferObject, clusterCount) == 136);
 static_assert(offsetof(UniformBufferObject, historyValid) == 140);
 static_assert(offsetof(UniformBufferObject, lodAoLighteningPerLevel) == 144);
 static_assert(offsetof(UniformBufferObject, cameraPosition) == 160);
-static_assert(offsetof(UniformBufferObject, blockFaceTextures) == 176);
-static_assert(sizeof(UniformBufferObject) == 496);
+static_assert(offsetof(UniformBufferObject, viewRayScale) == 176);
+static_assert(offsetof(UniformBufferObject, hzbParams) == 192);
+static_assert(sizeof(UniformBufferObject) == 208);
 
 struct ChunkComputeParams {
-  uint32_t chunkCount;
-  uint32_t horizontalChunkCount;
+  uint32_t horizontalChunkCount; // new columns this remesh (ColumnList entries)
+  uint32_t retireCount;          // retired column slots (RetireList entries)
+  uint32_t workPoolCapacity;     // work slots on the GPU (initWorkPool)
+  uint32_t unused;
+  // Block ID per terrain height layer (world::kTerrainLayerBlocks) and below the top block (kTerrainLayerFillerBlocks).
+  std::array<uint32_t, world::kTerrainLayerBlocks.size()> layerBlocks;
+  std::array<uint32_t, world::kTerrainLayerBlocks.size()> layerFillerBlocks;
+  std::array<uint32_t, world::kTerrainLayerBlocks.size()> layerDeepBlocks; // kTerrainLayerDeepBlocks
+  // First item of a batched dispatch (see dispatchBatchedZ): item = groupID.z + zBase.
+  uint32_t zBase;
 };
+static_assert(offsetof(ChunkComputeParams, layerBlocks) == 16);
+static_assert(offsetof(ChunkComputeParams, layerFillerBlocks) == 32);
+static_assert(offsetof(ChunkComputeParams, layerDeepBlocks) == 48);
+static_assert(offsetof(ChunkComputeParams, zBase) == 64);
+
+// One entry per (block, face), indexed blockId * 6 + normalIndex. Matches BlockFace in slang.slang.
+struct GpuBlockFace {
+  uint32_t texture;
+  uint32_t lodTexture;
+  uint32_t flags; // BLOCK_FACE_* bits
+  uint32_t padding;
+  std::array<float, 4> lodTint;
+};
+static_assert(sizeof(GpuBlockFace) == 32);
+constexpr uint32_t BLOCK_FACE_RANDOM_ROTATION = 1u << 0;
+constexpr uint32_t BLOCK_FACE_HAS_LOD_TEXTURE = 1u << 1;
+
+// Push constant of the scene pipelines (geometry_shared.hlsl drawParams): which cluster set the task shader walks,
+// and the debug view's tint (DEBUG_TINT_*).
+struct GeometryPushConstants {
+  uint32_t clusterCount;
+  uint32_t debugTint;
+  uint32_t quadBase;  // vertex path: first quad of this draw
+  uint32_t quadCount; // vertex path: quads in this draw (0: up to QuadCount[0])
+};
+constexpr uint32_t DEBUG_TINT_OFF = 0u;
+constexpr uint32_t DEBUG_TINT_LOD = 1u;
+constexpr uint32_t DEBUG_TINT_CPU = 2u;
+constexpr vk::ShaderStageFlags GEOMETRY_PUSH_STAGES =
+    vk::ShaderStageFlagBits::eTaskEXT | vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+
+// What the scene pass draws; X cycles through them.
+enum class TerrainView { Both, LodOnly, RealOnly, Debug };
 
 struct TaaParams {
   glm::vec2 inverseRenderSize;
@@ -117,8 +166,6 @@ private:
   vk::raii::PhysicalDevice physicalDevice = nullptr;
   vk::raii::Device device = nullptr;
   uint32_t queueIndex = ~0;
-  uint32_t timestampValidBits = 0;
-  float timestampPeriod = 0.0f;
   vk::raii::Queue queue = nullptr;
 #pragma endregion
 
@@ -134,14 +181,63 @@ private:
   vk::raii::DescriptorSetLayout descriptorSetLayout = nullptr;
   vk::raii::PipelineLayout pipelineLayout = nullptr;
   vk::raii::Pipeline graphicsPipeline = nullptr;
+  // Same packed quads, unpacked in a vertex shader via SV_VertexID instead of the mesh shader. Toggle with V.
+  vk::raii::Pipeline vertexPullingPipeline = nullptr;
+  bool useVertexPulling = false;
+  // Line-mode copies of the two pipelines above. Toggle with T.
+  vk::raii::Pipeline wireframePipeline = nullptr;
+  vk::raii::Pipeline wireframeVertexPullingPipeline = nullptr;
+  bool wireframeEnabled = false;
+  TerrainView terrainView = TerrainView::Both;
   vk::raii::DescriptorSetLayout taaDescriptorSetLayout = nullptr;
   vk::raii::PipelineLayout taaPipelineLayout = nullptr;
   vk::raii::Pipeline taaPipeline = nullptr;
   vk::raii::DescriptorSetLayout chunkComputeDescriptorSetLayout = nullptr;
   vk::raii::PipelineLayout chunkComputePipelineLayout = nullptr;
   vk::raii::Pipeline generateHeightsPipeline = nullptr;
+  vk::raii::Pipeline retireWorkPipeline = nullptr;
+  vk::raii::Pipeline allocateWorkPipeline = nullptr;
+  vk::raii::Pipeline finalizeWorkPipeline = nullptr;
+  vk::raii::Pipeline initWorkPoolPipeline = nullptr;
+  vk::raii::Pipeline collectRelocationsPipeline = nullptr;
+  vk::raii::Pipeline relocateSlotsPipeline = nullptr;
+  vk::raii::Pipeline rebuildFreeStackPipeline = nullptr;
   vk::raii::Pipeline meshColumnsPipeline = nullptr;
-  vk::raii::Pipeline finalizeMeshPipeline = nullptr;
+  vk::raii::Pipeline finalizeVertexDrawPipeline = nullptr;
+  vk::raii::Pipeline compactQuadsPipeline = nullptr;
+  vk::raii::Pipeline copyCompactedQuadsPipeline = nullptr;
+  vk::raii::PipelineLayout overlayPipelineLayout = nullptr;
+  vk::raii::Pipeline overlayPipeline = nullptr;
+  vk::raii::Pipeline crosshairPipeline = nullptr; // overlayPipelineLayout, inverting blend
+  vk::raii::PipelineLayout outlinePipelineLayout = nullptr;
+  vk::raii::Pipeline outlinePipeline = nullptr;
+  // Hi-Z occlusion (mesh path): farthest-depth pyramid of last frame's depth, read by taskMain (hzb.slang).
+  vk::raii::DescriptorSetLayout hzbSetLayout = nullptr;
+  vk::raii::PipelineLayout hzbPipelineLayout = nullptr;
+  vk::raii::Pipeline hzbBuildLowPipeline = nullptr;     // resolved depth -> mips 0..4
+  vk::raii::Pipeline hzbBuildHighPipeline = nullptr;    // mip 4 -> mips 5..last
+  vk::raii::DescriptorPool hzbDescriptorPool = nullptr; // own pool: rebuilt with the swapchain-sized resources
+  std::vector<vk::raii::DescriptorSet> hzbSets;         // per swapchain image: its depth + every mip
+  vk::raii::Image hzbImage = nullptr;
+  vk::raii::DeviceMemory hzbImageMemory = nullptr;
+  vk::raii::ImageView hzbView = nullptr; // all mips, for taskMain
+  std::vector<vk::raii::ImageView> hzbMipViews;
+  vk::Extent2D hzbSize{};
+  uint32_t hzbMipCount = 0;
+  bool hzbImageInitialized = false;
+  bool hzbValid = false; // holds the previous frame's depth, matching ubo.previousMvp
+  // Toggle with R. Cost on an RTX 3070 at 1000x750: ~20 us for the depth resolve plus ~18 us for the two-dispatch
+  // pyramid build (hzb.slang). Reading the MSAA depth directly cost ~53 us. Ground-level views saved 20-110 us
+  // net; the top-down spawn view, with nothing occluded, lost ~40 us.
+  bool hzbOcclusionEnabled = true;
+  static constexpr uint32_t MAX_HZB_MIPS = 16u;        // MAX_HZB_MIPS in hzb.slang
+  static constexpr uint32_t HZB_LOW_MIPS = 5u;         // mips written by hzbBuildLow (LOW_MIPS)
+  static constexpr uint32_t HZB_MAX_MIP0_SIDE = 2048u; // hzbBuildHigh holds mip 5 (<= 64x64) in shared memory
+  struct HzbPushParams {
+    std::array<uint32_t, 2> mip0Size;
+    std::array<uint32_t, 2> depthSize;
+    uint32_t mipCount;
+  };
 #pragma endregion
 
 #pragma region Image State
@@ -163,13 +259,23 @@ private:
   std::vector<vk::raii::Image> depthImages;
   std::vector<vk::raii::DeviceMemory> depthImageMemories;
   std::vector<vk::raii::ImageView> depthImageViews;
+  // Single-sample MAX resolve of depthImages (farthest sample per pixel), written by the scene pass while Hi-Z is
+  // on; recordHzb builds the pyramid from it. Reading the MSAA depth directly forced a ~40 us decompression.
+  std::vector<vk::raii::Image> resolvedDepthImages;
+  std::vector<vk::raii::DeviceMemory> resolvedDepthImageMemories;
+  std::vector<vk::raii::ImageView> resolvedDepthImageViews;
 
   static constexpr uint32_t MAX_TEXTURE_COUNT = 1024;
   uint32_t textureDescriptorCapacity = 0;
   std::vector<vk::raii::Image> textureImages;
   std::vector<vk::raii::DeviceMemory> textureImageMemories;
   std::vector<vk::raii::ImageView> textureImageViews;
-  std::array<std::array<uint32_t, 6>, MAX_BLOCK_TYPES> blockTextureIndices{};
+  blocks::Registry blockRegistry;
+  std::array<uint32_t, world::kTerrainLayerBlocks.size()> terrainLayerBlocks{};
+  std::array<uint32_t, world::kTerrainLayerBlocks.size()> terrainLayerFillerBlocks{};
+  std::array<uint32_t, world::kTerrainLayerBlocks.size()> terrainLayerDeepBlocks{};
+  vk::raii::Buffer blockFaceBuffer = nullptr;
+  vk::raii::DeviceMemory blockFaceBufferMemory = nullptr;
   vk::raii::Sampler textureSampler = nullptr;
   vk::raii::Sampler taaSampler = nullptr;
 #pragma endregion
@@ -179,7 +285,30 @@ private:
   std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
   std::vector<void *> uniformBuffersMapped;
 
-  static constexpr uint32_t MAX_QUAD_COUNT = 1u << 22u;
+  static constexpr uint32_t MAX_QUAD_COUNT = 1u << 23u;
+  // Quads covered by one instance of the vertex-pulling draw. 4 vertices per quad must fit a uint16 index.
+  // Must match VERTEX_QUADS_PER_INSTANCE in slang.slang and chunk_compute.slang.
+  static constexpr uint32_t VERTEX_QUADS_PER_INSTANCE = 16384u;
+  static_assert(VERTEX_QUADS_PER_INSTANCE * 4u - 1u <= UINT16_MAX);
+  // Debug text overlay; must match overlay.slang.
+  static constexpr uint32_t OVERLAY_LINES = 4u;
+  static constexpr uint32_t OVERLAY_COLUMNS = 28u;
+  struct OverlayParams {
+    glm::vec2 screenSize;
+    float scale;
+    uint32_t columns;
+    std::array<uint32_t, OVERLAY_LINES * OVERLAY_COLUMNS / 4u> text; // glyph indices, one byte each
+  };
+  static_assert(sizeof(OverlayParams) == 128); // Vulkan's guaranteed maxPushConstantsSize
+  // Targeted block outline; must match outline.slang.
+  struct OutlineParams {
+    glm::vec4 boxMin; // world space; w = line width in pixels
+    glm::vec4 boxMax;
+  };
+  static_assert(sizeof(OutlineParams) == 32);
+  // QuadCluster in chunk_compute.slang / slang.slang: one per meshColumns group, 16 groups per chunk.
+  static constexpr vk::DeviceSize QUAD_CLUSTER_SIZE = 48u;
+  static constexpr uint32_t QUAD_CLUSTERS_PER_CHUNK = 16u;
   // Capacity is largest at the narrowest supported FOV, not the widest FOV.
   static constexpr uint32_t CLIPMAP_KEEP_ALIVE_MULTIPLIER = 4u;
   static constexpr uint32_t MAX_HORIZONTAL_CHUNK_COUNT =
@@ -187,41 +316,170 @@ private:
                                world::kRenderDistance) *
       CLIPMAP_KEEP_ALIVE_MULTIPLIER;
   static constexpr uint32_t VERTICAL_CHUNK_COUNT = 2u * static_cast<uint32_t>(world::kVerticalRenderDistance) + 1u;
+  // Work slots (one per meshed vertical chunk, 16 QuadClusters each), handed out on the GPU by allocateWork. Columns
+  // only mesh the chunks their heights reach (plus one each way), a few on average. The pool starts at
+  // WORK_POOL_INITIAL_CAPACITY and doubles (growWorkPool) whenever allocateWork runs dry, up to the most the clipmap
+  // could ever need.
+  static constexpr uint32_t WORK_POOL_INITIAL_CAPACITY = 1u << 15u;
+  static constexpr uint32_t WORK_POOL_MAX_CAPACITY =
+      MAX_HORIZONTAL_CHUNK_COUNT * static_cast<uint32_t>(world::kMaxColumnChunks);
+  uint32_t workPoolCapacity = WORK_POOL_INITIAL_CAPACITY;
+  // WorkPool (compute binding 12) layout in ints; must match WORK_POOL_* in chunk_compute.slang.
+  static constexpr uint32_t WORK_POOL_INTS = 16u;
+  static constexpr vk::DeviceSize WORK_POOL_MESH_ARGS_OFFSET = 4u * sizeof(int32_t);
+  static constexpr vk::DeviceSize WORK_POOL_COMPACT_ARGS_OFFSET = 8u * sizeof(int32_t);
+  static constexpr vk::DeviceSize WORK_POOL_TASK_ARGS_OFFSET = 12u * sizeof(int32_t);
+  static constexpr uint32_t HEIGHT_GROUPS_PER_COLUMN = 19u; // generateHeights groups, each with a height range
   std::vector<world::ChunkLod> visibleChunkSet;
-  std::vector<std::array<int32_t, 2>> visibleChunkWork;
+  std::vector<uint32_t> visibleChunkNeighborLods; // parallel to visibleChunkSet
   ClipmapCuller clipmapCuller;
   std::optional<ClipmapView> lastSubmittedClipmapView;
   std::optional<ClipmapView> lastAppliedClipmapView;
   std::uint64_t latestSubmittedClipmapSequence = 0;
   std::uint64_t lastAppliedClipmapSequence = 0;
-  uint32_t chunkComputeCount = 0;
+  // CPU square centers of clipmap jobs submitted after the applied one (sequence, center). Their squares stay pinned
+  // in cpuWorld so whichever job finishes can be applied without a hole; dropped once a newer result is applied.
+
+  //! ONLY HAPPENS IN -O0:
+  //! KNOWN ISSUE: flying at full freecam speed (1000 blocks/s), the drawn CPU square still lags behind the player and
+  //! GPU LOD terrain shows under them (red in the X debug view). CPU generation itself keeps up (a headless test
+  //! stays ~1 chunk behind even in debug); the lag is in the clipmap hand-over (applied clipmap vs advertised square).
+  std::deque<std::pair<std::uint64_t, cpuworld::ChunkXZ>> inFlightCpuCenters;
   bool chunkBuffersDirty = true;
+  // Incremental remeshing: persistent GPU slots for the visible columns and their vertical chunks. A clipmap change
+  // only meshes what is new and retires what left; dead quads pile up in QuadBuffer until compactQuads packs them out.
+  ChunkSlotTable chunkSlots;
+  ChunkRemeshPlan remeshPlan; // built in updateUniformBuffer, recorded by recordChunkCompute in the same frame
+  bool forceFullRebuild = true;
+  // Pack QuadBuffer (compactQuads) at the start of the next recordChunkCompute. Bumping quadCountEpoch invalidates
+  // readbacks recorded before the compaction, so a stale count can't trigger a second one.
+  bool compactQuadsPending = false;
+  uint32_t quadCountEpoch = 0;
+  std::array<uint32_t, 8> quadCountReadbackEpoch{};
+
+  // Compact once dead quads pass a share of the live ones, or once the buffer is three-quarters used while compacting
+  // would actually free space. The vertex path still pays its fixed per-vertex cost for dead quads (it draws every
+  // quad in the buffer), so it compacts at 1/4; the mesh path never draws them, so it waits for 1/1. Compaction only
+  // copies the live quads (no remeshing), so it costs a fraction of the full rebuild it replaces; a full rebuild is
+  // left for an overflowed QuadBuffer, whose clusters lost quads that only remeshing can restore.
+  static constexpr uint32_t REBUILD_MIN_DEAD_QUADS = 1u << 18u;
+  static constexpr uint32_t COPY_COMPACTED_GROUPS = 1024u; // must match copyCompactedQuads in chunk_compute.slang
+  // Copied back after each remesh, per frame in flight: QuadCount ({appended, live}), then WorkPool[0..3] (free-stack
+  // top, high water, new work, overflow).
+  static constexpr uint32_t READBACK_UINTS = 6u;
+  std::vector<vk::raii::Buffer> quadCountReadbackBuffers;
+  std::vector<vk::raii::DeviceMemory> quadCountReadbackMemories;
+  std::vector<const uint32_t *> quadCountReadbackMapped;
+  std::array<bool, 8> quadCountReadbackPending{};
+  // Per frame: this remesh's new column slots (binding 9) and retired column slots (binding 10).
+  std::vector<vk::raii::Buffer> columnListBuffers;
+  std::vector<vk::raii::DeviceMemory> columnListBufferMemories;
+  std::vector<void *> columnListBuffersMapped;
+  std::vector<vk::raii::Buffer> retireListBuffers;
+  std::vector<vk::raii::DeviceMemory> retireListBufferMemories;
+  std::vector<void *> retireListBuffersMapped;
   std::array<float, MAX_LOD> lodDistanceSquared =
       initializeLodDistanceSquared(TARGET_SCREEN_PERCENTAGE, BASE_FOV_RADIANS, {WIDTH, HEIGHT});
   float cachedLodFov = BASE_FOV_RADIANS;
   vk::Extent2D cachedLodExtent{WIDTH, HEIGHT};
 
+  // CPU-meshed near chunks (cpu_world.hpp): same packed formats as the GPU-meshed buffers, drawn with a second
+  // descriptor set. Chunks get a cluster slot (16 clusters) and a quad range.
+  //
+  // Loaded is not drawn: a column is drawn only inside the square the applied clipmap leaves out
+  // (lastAppliedClipmapView->cpuRegionCenter), so CPU and GPU terrain never overlap or leave a gap, even while the
+  // CPU holds several squares during a hand-over. Hidden chunks keep their quads but have zeroed clusters (mesh
+  // path); the vertex path draws visible chunks one by one.
+  static constexpr uint32_t CPU_MAX_QUADS = 1u << 22u;
+  static constexpr uint32_t CPU_MAX_CHUNK_SLOTS = 8192u;
+  static constexpr vk::DeviceSize CPU_STAGING_BYTES = 16ull << 20u; // per frame in flight
+  std::unique_ptr<cpuworld::CpuWorld> cpuWorld;
+  Player player;
+  vk::raii::Buffer cpuQuadBuffer = nullptr;
+  vk::raii::DeviceMemory cpuQuadBufferMemory = nullptr;
+  vk::raii::Buffer cpuChunkOffsetBuffer = nullptr;
+  vk::raii::DeviceMemory cpuChunkOffsetBufferMemory = nullptr;
+  vk::raii::Buffer cpuClusterBuffer = nullptr;
+  vk::raii::DeviceMemory cpuClusterBufferMemory = nullptr;
+  vk::raii::Buffer cpuQuadCountBuffer = nullptr; // binding 4 of the CPU set: quad high water, for vertMain
+  vk::raii::DeviceMemory cpuQuadCountBufferMemory = nullptr;
+  std::vector<vk::raii::Buffer> cpuStagingBuffers;
+  std::vector<vk::raii::DeviceMemory> cpuStagingMemories;
+  std::vector<std::byte *> cpuStagingMapped;
+  struct CpuChunkAllocation {
+    int32_t cy;
+    uint32_t slot;
+    uint32_t quadOffset;
+    uint32_t quadCount;
+    std::array<cpuworld::QuadCluster, cpuworld::kClustersPerChunk> clusters; // rebased onto quadOffset
+  };
+  struct CpuColumnGpu {
+    int32_t cx;
+    int32_t cz;
+    bool visible;
+    std::vector<CpuChunkAllocation> chunks;
+  };
+  std::unordered_map<uint64_t, CpuColumnGpu> cpuColumns;
+  SlotAllocator cpuChunkSlots;
+  RangeAllocator cpuQuadRanges{CPU_MAX_QUADS};
+  std::deque<cpuworld::ColumnMeshEvent> cpuPendingEvents; // waiting for staging space
+  // Center offered to the clipmap: the CPU's ready center, once all of its geometry is uploaded.
+  std::optional<cpuworld::ChunkXZ> cpuAdvertisedCenter;
+  // This frame's CPU geometry transfers, recorded by recordCpuUploads.
+  std::vector<vk::BufferCopy> cpuQuadCopies;
+  std::vector<vk::BufferCopy> cpuOffsetCopies;
+  std::vector<vk::BufferCopy> cpuClusterCopies;
+  std::vector<uint32_t> cpuClearedSlots;
+  vk::DeviceSize cpuStagingUsed = 0;
+  bool cpuQuadCountDirty = false;
+  bool cpuCapacityWarned = false;
+
   vk::raii::Buffer quadBuffer = nullptr;
   vk::raii::DeviceMemory quadBufferMemory = nullptr;
   vk::raii::Buffer chunkOffsetBuffer = nullptr;
+  vk::raii::Buffer quadCompactBuffer = nullptr; // compute binding 11, see compactQuads
+  vk::raii::DeviceMemory quadCompactBufferMemory = nullptr;
   vk::raii::DeviceMemory chunkOffsetBufferMemory = nullptr;
   vk::raii::Buffer chunkHeightBuffer = nullptr;
   vk::raii::DeviceMemory chunkHeightBufferMemory = nullptr;
   vk::raii::Buffer quadCountBuffer = nullptr;
   vk::raii::DeviceMemory quadCountBufferMemory = nullptr;
-  vk::raii::Buffer meshDrawArgumentsBuffer = nullptr;
-  vk::raii::DeviceMemory meshDrawArgumentsBufferMemory = nullptr;
+  vk::raii::Buffer quadIndexBuffer = nullptr;
+  vk::raii::DeviceMemory quadIndexBufferMemory = nullptr;
+  vk::raii::Buffer quadClusterBuffer = nullptr;
+  vk::raii::DeviceMemory quadClusterBufferMemory = nullptr;
+  vk::raii::Buffer vertexDrawArgumentsBuffer = nullptr; // vertMain's indexed indirect args (finalizeVertexDraw)
+  vk::raii::DeviceMemory vertexDrawArgumentsBufferMemory = nullptr;
   std::vector<vk::raii::Buffer> chunkCoordinateBuffers;
   std::vector<vk::raii::DeviceMemory> chunkCoordinateBufferMemories;
   std::vector<void *> chunkCoordinateBuffersMapped;
-  std::vector<vk::raii::Buffer> chunkWorkBuffers;
-  std::vector<vk::raii::DeviceMemory> chunkWorkBufferMemories;
-  std::vector<void *> chunkWorkBuffersMapped;
+  // GPU-side work slot allocation (allocateWork / retireWork): bindings 5 and 12-15.
+  vk::raii::Buffer chunkWorkBuffer = nullptr;
+  vk::raii::DeviceMemory chunkWorkBufferMemory = nullptr;
+  vk::raii::Buffer workPoolBuffer = nullptr;
+  vk::raii::DeviceMemory workPoolBufferMemory = nullptr;
+  vk::raii::Buffer freeWorkSlotBuffer = nullptr;
+  vk::raii::DeviceMemory freeWorkSlotBufferMemory = nullptr;
+  vk::raii::Buffer columnWorkSlotBuffer = nullptr;
+  vk::raii::DeviceMemory columnWorkSlotBufferMemory = nullptr;
+  vk::raii::Buffer columnHeightRangeBuffer = nullptr;
+  vk::raii::DeviceMemory columnHeightRangeBufferMemory = nullptr;
+  vk::raii::Buffer slotOwnerBuffer = nullptr; // binding 16
+  vk::raii::DeviceMemory slotOwnerBufferMemory = nullptr;
+  vk::raii::Buffer relocationScratchBuffer = nullptr; // binding 17
+  vk::raii::DeviceMemory relocationScratchBufferMemory = nullptr;
+  // Per frame: ClipmapResult::neighborLods for visibleChunkSet (compute binding 8).
+  std::vector<vk::raii::Buffer> chunkNeighborLodBuffers;
+  std::vector<vk::raii::DeviceMemory> chunkNeighborLodBufferMemories;
+  std::vector<void *> chunkNeighborLodBuffersMapped;
 #pragma endregion
 
 #pragma region Descriptor State
+  // RAII: members are destroyed in reverse declaration order, so every set allocated from
+  // descriptorPool must be declared after it (sets are then freed before the pool is destroyed).
   vk::raii::DescriptorPool descriptorPool = nullptr;
   std::vector<vk::raii::DescriptorSet> descriptorSets;
+  std::vector<vk::raii::DescriptorSet> cpuDescriptorSets;
   std::vector<vk::raii::DescriptorSet> taaDescriptorSets;
   std::vector<vk::raii::DescriptorSet> chunkComputeDescriptorSets;
 #pragma endregion
@@ -235,10 +493,6 @@ private:
   std::vector<vk::raii::Semaphore> presentCompleteSemaphores;
   std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
   std::vector<vk::raii::Fence> inFlightFences;
-  vk::raii::QueryPool timestampQueryPool = nullptr;
-  std::array<bool, MAX_FRAMES_IN_FLIGHT> timestampQueriesPending{};
-  std::array<bool, MAX_FRAMES_IN_FLIGHT> timestampQueriesHadChunkUpdates{};
-  bool gpuTimestampsEnabled = false;
   uint32_t frameIndex = 0;
   uint32_t taaHistoryWriteIndex = 0;
   uint32_t taaJitterIndex = 0;
@@ -251,7 +505,17 @@ private:
 #pragma region Input State
   bool framebufferResized = false;
   bool fpsLimitEnabled = true;
+  // Debug overlay (top right): frames counted over a short window, shown as FPS.
+  std::chrono::steady_clock::time_point fpsWindowStart = std::chrono::steady_clock::now();
+  uint32_t fpsWindowFrames = 0;
+  float displayedFps = 0.0f;
   Camera camera;
+  // Block breaking (left mouse): once per click, then every BLOCK_BREAK_REPEAT_SECONDS while held (creative-style).
+  static constexpr float BLOCK_REACH = 5.0f;
+  static constexpr double BLOCK_BREAK_REPEAT_SECONDS = 0.25;
+  bool breakClickPending = false;
+  double nextBreakTime = 0.0;
+  std::optional<cpuworld::BlockXYZ> outlineTarget; // block under the crosshair, outlined by recordOutline
 #pragma endregion
 
 #pragma region Device Extensions
@@ -279,6 +543,7 @@ private:
     glfwSetWindowUserPointer(window, this);
     glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
     glfwSetKeyCallback(window, keyCallback);
+    glfwSetMouseButtonCallback(window, mouseButtonCallback);
     camera.initialize(window);
   }
 
@@ -287,20 +552,53 @@ private:
     app->framebufferResized = true;
   }
 
+  static const char *terrainViewName(TerrainView view) {
+    switch (view) {
+    case TerrainView::LodOnly:
+      return "LOD ONLY";
+    case TerrainView::RealOnly:
+      return "REAL ONLY";
+    case TerrainView::Debug:
+      return "DEBUG";
+    default:
+      return "LOD + REAL";
+    }
+  }
+
+  static void mouseButtonCallback(GLFWwindow *window, int button, int action, int mods) {
+    auto app = reinterpret_cast<HelloTriangleApplication *>(glfwGetWindowUserPointer(window));
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
+      app->breakClickPending = true; // a click shorter than a frame still breaks
+    }
+  }
+
   static void keyCallback(GLFWwindow *window, int key, int scancode, int action, int mods) {
     auto app = reinterpret_cast<HelloTriangleApplication *>(glfwGetWindowUserPointer(window));
     app->camera.handleKey(window, key, action);
+    app->player.handleKey(key, action);
     if (action != GLFW_PRESS) {
       return;
     }
 
-    if (key == GLFW_KEY_G) {
+    if (key == GLFW_KEY_F) {
       app->fpsLimitEnabled = !app->fpsLimitEnabled;
       std::clog << "FPS limit " << (app->fpsLimitEnabled ? "enabled" : "disabled") << '\n';
-    } else if (key == GLFW_KEY_F) {
-      auto &profiler = Profiler::instance();
-      profiler.setEnabled(!profiler.enabled());
-      std::clog << "Profiling " << (profiler.enabled() ? "enabled" : "disabled") << '\n';
+    }
+    if (key == GLFW_KEY_R) {
+      app->hzbOcclusionEnabled = !app->hzbOcclusionEnabled;
+      std::clog << "Hi-Z occlusion culling " << (app->hzbOcclusionEnabled ? "enabled" : "disabled") << '\n';
+    }
+    if (key == GLFW_KEY_T) {
+      app->wireframeEnabled = !app->wireframeEnabled;
+      std::clog << "Wireframe " << (app->wireframeEnabled ? "enabled" : "disabled") << '\n';
+    }
+    if (key == GLFW_KEY_X) {
+      app->terrainView = static_cast<TerrainView>((static_cast<int>(app->terrainView) + 1) % 4);
+      std::clog << "Terrain view: " << terrainViewName(app->terrainView) << '\n';
+    }
+    if (key == GLFW_KEY_V) {
+      app->useVertexPulling = !app->useVertexPulling;
+      std::clog << "Quad path: " << (app->useVertexPulling ? "vertex shader (vertex pulling)" : "mesh shader") << '\n';
     }
   }
 #pragma endregion
@@ -318,6 +616,7 @@ private:
     createTaaDescriptorSetLayout();
     createGraphicsPipeline();
     createTaaPipeline();
+    createOverlayPipeline();
     createChunkComputePipeline();
     createCommandPool();
     createDepthResources();
@@ -325,14 +624,17 @@ private:
     createTextureImageViews();
     createTextureSampler();
     createTaaSampler();
+    createBlockFaceBuffer();
     createUniformBuffers();
     createChunkBuffers();
+    createCpuChunkBuffers();
+    createCpuWorld();
     createDescriptorPool();
     createDescriptorSets();
     createTaaDescriptorSets();
+    createHzbResources();
     createCommandBuffers();
     createSyncObjects();
-    createTimestampQueryPool();
   }
 #pragma endregion
 
@@ -340,13 +642,20 @@ private:
   void mainLoop() {
     using Clock = std::chrono::steady_clock;
     constexpr auto frameDuration =
-        std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / 90.0));
+        std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / 144.0));
     auto nextFrame = Clock::now();
 
     while (!glfwWindowShouldClose(window)) {
       glfwPollEvents();
       drawFrame();
-      Profiler::instance().reportIfDue();
+      ++fpsWindowFrames;
+      const auto fpsNow = std::chrono::steady_clock::now();
+      const float fpsWindowSeconds = std::chrono::duration<float>(fpsNow - fpsWindowStart).count();
+      if (fpsWindowSeconds >= 0.5f) {
+        displayedFps = static_cast<float>(fpsWindowFrames) / fpsWindowSeconds;
+        fpsWindowFrames = 0;
+        fpsWindowStart = fpsNow;
+      }
       if (fpsLimitEnabled) {
         nextFrame += frameDuration;
         std::this_thread::sleep_until(nextFrame);
@@ -367,7 +676,13 @@ private:
 #pragma region Cleanup
   void cleanupSwapChain() {
     graphicsPipeline = nullptr;
+    vertexPullingPipeline = nullptr;
+    wireframePipeline = nullptr;
+    wireframeVertexPullingPipeline = nullptr;
     taaPipeline = nullptr;
+    overlayPipeline = nullptr;
+    crosshairPipeline = nullptr;
+    outlinePipeline = nullptr;
     taaDescriptorSets.clear();
     for (auto &view : taaHistoryImageViews) {
       view = nullptr;
@@ -390,7 +705,18 @@ private:
     multisampleColorImageViews.clear();
     multisampleColorImages.clear();
     multisampleColorImageMemories.clear();
+    hzbSets.clear();
+    hzbDescriptorPool = nullptr;
+    hzbMipViews.clear();
+    hzbView = nullptr;
+    hzbImage = nullptr;
+    hzbImageMemory = nullptr;
+    hzbImageInitialized = false;
+    hzbValid = false;
     depthImageViews.clear();
+    resolvedDepthImageViews.clear();
+    resolvedDepthImages.clear();
+    resolvedDepthImageMemories.clear();
     depthImages.clear();
     depthImageMemories.clear();
     swapChainImageViews.clear();
@@ -429,8 +755,10 @@ private:
     createImageViews();
     createGraphicsPipeline();
     createTaaPipeline();
+    createOverlayPipeline();
     createDepthResources();
     createTaaDescriptorSets();
+    createHzbResources();
   }
 #pragma endregion
 #pragma endregion
@@ -545,6 +873,8 @@ private:
     bool supportsRequiredFeatures =
         features.template get<vk::PhysicalDeviceFeatures2>().features.samplerAnisotropy &&
         features.template get<vk::PhysicalDeviceFeatures2>().features.shaderInt64 &&
+        features.template get<vk::PhysicalDeviceFeatures2>().features.shaderStorageImageArrayDynamicIndexing &&
+        features.template get<vk::PhysicalDeviceFeatures2>().features.fillModeNonSolid &&
         features.template get<vk::PhysicalDeviceFeatures2>().features.independentBlend &&
         features.template get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
         features.template get<vk::PhysicalDeviceVulkan12Features>().runtimeDescriptorArray &&
@@ -595,8 +925,7 @@ private:
           physicalDevice.getSurfaceSupportKHR(qfpIndex, *surface)) {
         // found a queue family that supports both graphics and present
         queueIndex = qfpIndex;
-        timestampValidBits = queueFamilyProperties[qfpIndex].timestampValidBits;
-            break;
+        break;
       }
     }
     if (queueIndex == ~0) {
@@ -608,7 +937,11 @@ private:
                        vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features,
                        vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT, vk::PhysicalDeviceMeshShaderFeaturesEXT>
         featureChain = {
-            {.features = {.independentBlend = true, .samplerAnisotropy = true, .shaderInt64 = true}},
+            {.features = {.independentBlend = true,
+                          .fillModeNonSolid = true, // wireframe (T)
+                          .samplerAnisotropy = true,
+                          .shaderStorageImageArrayDynamicIndexing = true, // Hi-Z mip array (hzb.slang)
+                          .shaderInt64 = true}},
             {.shaderDrawParameters = true}, // vk::PhysicalDeviceVulkan11Features
             {.shaderSampledImageArrayNonUniformIndexing = true,
              .descriptorBindingSampledImageUpdateAfterBind = true,
@@ -632,7 +965,6 @@ private:
 
     device = vk::raii::Device(physicalDevice, deviceCreateInfo);
     queue = vk::raii::Queue(device, queueIndex, 0);
-    timestampPeriod = physicalDevice.getProperties().limits.timestampPeriod;
   }
 #pragma endregion
 #pragma endregion
@@ -691,15 +1023,17 @@ private:
       throw std::runtime_error("device does not support sampled image descriptors");
     }
 
-    std::array<vk::DescriptorSetLayoutBinding, 6> bindings{
+    const vk::ShaderStageFlags geometryStages =
+        vk::ShaderStageFlagBits::eTaskEXT | vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eVertex;
+    std::array<vk::DescriptorSetLayoutBinding, 9> bindings{
         {{.binding = 0,
           .descriptorType = vk::DescriptorType::eStorageBuffer,
           .descriptorCount = 1,
-          .stageFlags = vk::ShaderStageFlagBits::eMeshEXT},
+          .stageFlags = geometryStages},
          {.binding = 1,
           .descriptorType = vk::DescriptorType::eUniformBuffer,
           .descriptorCount = 1,
-          .stageFlags = vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eFragment},
+          .stageFlags = geometryStages | vk::ShaderStageFlagBits::eFragment},
          {.binding = 2,
           .descriptorType = vk::DescriptorType::eSampler,
           .descriptorCount = 1,
@@ -707,18 +1041,30 @@ private:
          {.binding = 3,
           .descriptorType = vk::DescriptorType::eStorageBuffer,
           .descriptorCount = 1,
-          .stageFlags = vk::ShaderStageFlagBits::eMeshEXT},
-         {.binding = 4,
+          .stageFlags = geometryStages},
+         {.binding = 4, // QuadCount, vertex path
           .descriptorType = vk::DescriptorType::eStorageBuffer,
           .descriptorCount = 1,
-          .stageFlags = vk::ShaderStageFlagBits::eMeshEXT},
+          .stageFlags = vk::ShaderStageFlagBits::eVertex},
          {.binding = 11,
           .descriptorType = vk::DescriptorType::eSampledImage,
           .descriptorCount = textureDescriptorCapacity,
-          .stageFlags = vk::ShaderStageFlagBits::eFragment}}};
+          .stageFlags = vk::ShaderStageFlagBits::eFragment},
+         {.binding = 5,
+          .descriptorType = vk::DescriptorType::eStorageBuffer,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eFragment},
+         {.binding = 6, // QuadClusters, task shader
+          .descriptorType = vk::DescriptorType::eStorageBuffer,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eTaskEXT},
+         {.binding = 7, // Hi-Z, task shader
+          .descriptorType = vk::DescriptorType::eSampledImage,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eTaskEXT}}};
 
-    std::array<vk::DescriptorBindingFlags, 6> bindingFlags{};
-    bindingFlags[5] =
+    std::array<vk::DescriptorBindingFlags, 9> bindingFlags{};
+    bindingFlags[5] = // binding 11, the bindless texture array
         vk::DescriptorBindingFlagBits::eVariableDescriptorCount | vk::DescriptorBindingFlagBits::eUpdateAfterBind;
     vk::DescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{
         .bindingCount = static_cast<uint32_t>(bindingFlags.size()), .pBindingFlags = bindingFlags.data()};
@@ -757,11 +1103,19 @@ private:
   void createGraphicsPipeline() {
     vk::raii::ShaderModule shaderModule = createShaderModule(readFile("shaders/slang.spv"));
 
+    // Separate module on purpose: with the task and mesh entry points in one SPIR-V module (two
+    // TaskPayloadWorkgroupEXT variables), the NVIDIA driver handed meshMain an empty payload.
+    vk::raii::ShaderModule taskShaderModule = createShaderModule(readFile("shaders/task.spv"));
+    vk::PipelineShaderStageCreateInfo taskShaderStageInfo{
+        .stage = vk::ShaderStageFlagBits::eTaskEXT, .module = taskShaderModule, .pName = "taskMain"};
     vk::PipelineShaderStageCreateInfo meshShaderStageInfo{
         .stage = vk::ShaderStageFlagBits::eMeshEXT, .module = shaderModule, .pName = "meshMain"};
     vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
         .stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "fragMain"};
-    vk::PipelineShaderStageCreateInfo shaderStages[] = {meshShaderStageInfo, fragShaderStageInfo};
+    vk::PipelineShaderStageCreateInfo shaderStages[] = {taskShaderStageInfo, meshShaderStageInfo, fragShaderStageInfo};
+    vk::PipelineShaderStageCreateInfo vertexShaderStageInfo{
+        .stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = "vertMain"};
+    vk::PipelineShaderStageCreateInfo vertexPullingStages[] = {vertexShaderStageInfo, fragShaderStageInfo};
 
     vk::PipelineVertexInputStateCreateInfo vertexInputInfo{};
     vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleList};
@@ -799,15 +1153,19 @@ private:
     vk::PipelineDynamicStateCreateInfo dynamicState{.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()),
                                                     .pDynamicStates = dynamicStates.data()};
 
-    vk::PipelineLayoutCreateInfo pipelineLayoutInfo{
-        .setLayoutCount = 1, .pSetLayouts = &*descriptorSetLayout, .pushConstantRangeCount = 0};
+    const vk::PushConstantRange geometryPushRange{
+        .stageFlags = GEOMETRY_PUSH_STAGES, .offset = 0, .size = sizeof(GeometryPushConstants)};
+    vk::PipelineLayoutCreateInfo pipelineLayoutInfo{.setLayoutCount = 1,
+                                                    .pSetLayouts = &*descriptorSetLayout,
+                                                    .pushConstantRangeCount = 1,
+                                                    .pPushConstantRanges = &geometryPushRange};
     pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
 
     vk::Format depthFormat = findDepthFormat();
 
     const std::array<vk::Format, 2> colorFormats{swapChainSurfaceFormat.format, MOTION_FORMAT};
     vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
-        {.stageCount = 2,
+        {.stageCount = 3,
          .pStages = shaderStages,
          .pVertexInputState = &vertexInputInfo,
          .pInputAssemblyState = &inputAssembly,
@@ -824,6 +1182,20 @@ private:
          .depthAttachmentFormat = depthFormat}};
 
     graphicsPipeline =
+        vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+
+    // Identical state; vertex input stays empty because the vertex shader pulls from QuadBuffer itself.
+    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().stageCount = 2;
+    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().pStages = vertexPullingStages;
+    vertexPullingPipeline =
+        vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+
+    rasterizer.polygonMode = vk::PolygonMode::eLine;
+    wireframeVertexPullingPipeline =
+        vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().stageCount = 3;
+    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().pStages = shaderStages;
+    wireframePipeline =
         vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
   }
 
@@ -879,8 +1251,398 @@ private:
     taaPipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
   }
 
+  // Text box (alpha blend) and crosshair (inverting blend: 1 - destination); both use OverlayParams push constants.
+  void createOverlayPipeline() {
+    vk::raii::ShaderModule shaderModule = createShaderModule(readFile("shaders/overlay.spv"));
+    const vk::PushConstantRange pushConstantRange{.stageFlags = vk::ShaderStageFlagBits::eVertex |
+                                                                vk::ShaderStageFlagBits::eFragment,
+                                                  .offset = 0,
+                                                  .size = sizeof(OverlayParams)};
+    overlayPipelineLayout = vk::raii::PipelineLayout(
+        device, vk::PipelineLayoutCreateInfo{.pushConstantRangeCount = 1, .pPushConstantRanges = &pushConstantRange});
+    overlayPipeline = createOverlayStylePipeline(shaderModule, "overlayVertexMain", "overlayFragmentMain",
+                                                 vk::BlendFactor::eSrcAlpha, vk::BlendFactor::eOneMinusSrcAlpha);
+    crosshairPipeline = createOverlayStylePipeline(shaderModule, "crosshairVertexMain", "crosshairFragmentMain",
+                                                   vk::BlendFactor::eOneMinusDstColor, vk::BlendFactor::eZero);
+    createOutlinePipeline();
+  }
+
+  // Scene-pass pipeline (MSAA, color + motion, depth test without writes) using the scene descriptor set's uniform
+  // buffer, so the outline is jittered and reprojected like the terrain and TAA treats it the same way.
+  void createOutlinePipeline() {
+    vk::raii::ShaderModule shaderModule = createShaderModule(readFile("shaders/outline.spv"));
+    const std::array<vk::PipelineShaderStageCreateInfo, 2> shaderStages{
+        {{.stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = "outlineVertexMain"},
+         {.stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "outlineFragmentMain"}}};
+    const vk::PipelineVertexInputStateCreateInfo vertexInputInfo{};
+    const vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleList};
+    const vk::PipelineViewportStateCreateInfo viewportState{.viewportCount = 1, .scissorCount = 1};
+    const vk::PipelineRasterizationStateCreateInfo rasterizer{
+        .polygonMode = vk::PolygonMode::eFill, .cullMode = vk::CullModeFlagBits::eNone, .lineWidth = 1.0f};
+    const vk::PipelineMultisampleStateCreateInfo multisampling{.rasterizationSamples = RENDER_SAMPLE_COUNT};
+    const vk::PipelineDepthStencilStateCreateInfo depthStencil{
+        .depthTestEnable = vk::True, .depthWriteEnable = vk::False, .depthCompareOp = vk::CompareOp::eLessOrEqual};
+    const vk::PipelineColorBlendAttachmentState blendAttachment{
+        .blendEnable = vk::True,
+        .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
+        .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+        .colorBlendOp = vk::BlendOp::eAdd,
+        .srcAlphaBlendFactor = vk::BlendFactor::eZero,
+        .dstAlphaBlendFactor = vk::BlendFactor::eOne,
+        .alphaBlendOp = vk::BlendOp::eAdd,
+        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+    // Motion is overwritten: the outline lies on the surface it covers, so their motion matches anyway.
+    const vk::PipelineColorBlendAttachmentState motionAttachment{
+        .blendEnable = vk::False,
+        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+    const std::array<vk::PipelineColorBlendAttachmentState, 2> blendAttachments{blendAttachment, motionAttachment};
+    const vk::PipelineColorBlendStateCreateInfo colorBlending{
+        .attachmentCount = static_cast<uint32_t>(blendAttachments.size()), .pAttachments = blendAttachments.data()};
+    const std::array<vk::DynamicState, 2> dynamicStates{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+    const vk::PipelineDynamicStateCreateInfo dynamicState{
+        .dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data()};
+    const vk::PushConstantRange pushConstantRange{
+        .stageFlags = vk::ShaderStageFlagBits::eVertex, .offset = 0, .size = sizeof(OutlineParams)};
+    outlinePipelineLayout =
+        vk::raii::PipelineLayout(device, vk::PipelineLayoutCreateInfo{.setLayoutCount = 1,
+                                                                      .pSetLayouts = &*descriptorSetLayout,
+                                                                      .pushConstantRangeCount = 1,
+                                                                      .pPushConstantRanges = &pushConstantRange});
+
+    const std::array<vk::Format, 2> colorFormats{swapChainSurfaceFormat.format, MOTION_FORMAT};
+    vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
+        {.stageCount = static_cast<uint32_t>(shaderStages.size()),
+         .pStages = shaderStages.data(),
+         .pVertexInputState = &vertexInputInfo,
+         .pInputAssemblyState = &inputAssembly,
+         .pViewportState = &viewportState,
+         .pRasterizationState = &rasterizer,
+         .pMultisampleState = &multisampling,
+         .pDepthStencilState = &depthStencil,
+         .pColorBlendState = &colorBlending,
+         .pDynamicState = &dynamicState,
+         .layout = outlinePipelineLayout,
+         .renderPass = nullptr},
+        {.colorAttachmentCount = static_cast<uint32_t>(colorFormats.size()),
+         .pColorAttachmentFormats = colorFormats.data(),
+         .depthAttachmentFormat = findDepthFormat()}};
+    outlinePipeline =
+        vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+  }
+
+  // Last draw of the scene pass (viewport and scissor are still the scene's): the targeted block's outline.
+  void recordOutline(vk::raii::CommandBuffer &commandBuffer) {
+    if (!outlineTarget) {
+      return;
+    }
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *outlinePipeline);
+    commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *outlinePipelineLayout, 0,
+                                     *descriptorSets[frameIndex], nullptr);
+    // A hair larger than the block, so its edges sit just outside the faces they outline.
+    constexpr float grow = 0.002f;
+    const glm::vec3 block{static_cast<float>((*outlineTarget)[0]), static_cast<float>((*outlineTarget)[1]),
+                          static_cast<float>((*outlineTarget)[2])};
+    const float lineWidth = std::max(1.0f, std::round(static_cast<float>(swapChainExtent.height) / 400.0f));
+    const OutlineParams params{.boxMin = glm::vec4(block - grow, lineWidth),
+                               .boxMax = glm::vec4(block + 1.0f + grow, 0.0f)};
+    commandBuffer.pushConstants(*outlinePipelineLayout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(params), &params);
+    commandBuffer.draw(72, 1, 0, 0);
+  }
+
+  vk::raii::Pipeline createOverlayStylePipeline(const vk::raii::ShaderModule &shaderModule, const char *vertexEntry,
+                                                const char *fragmentEntry, vk::BlendFactor srcColorFactor,
+                                                vk::BlendFactor dstColorFactor) {
+    const std::array<vk::PipelineShaderStageCreateInfo, 2> shaderStages{
+        {{.stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = vertexEntry},
+         {.stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = fragmentEntry}}};
+    const vk::PipelineVertexInputStateCreateInfo vertexInputInfo{};
+    const vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleList};
+    const vk::PipelineViewportStateCreateInfo viewportState{.viewportCount = 1, .scissorCount = 1};
+    const vk::PipelineRasterizationStateCreateInfo rasterizer{
+        .polygonMode = vk::PolygonMode::eFill, .cullMode = vk::CullModeFlagBits::eNone, .lineWidth = 1.0f};
+    const vk::PipelineMultisampleStateCreateInfo multisampling{.rasterizationSamples = vk::SampleCountFlagBits::e1};
+    const vk::PipelineColorBlendAttachmentState blendAttachment{
+        .blendEnable = vk::True,
+        .srcColorBlendFactor = srcColorFactor,
+        .dstColorBlendFactor = dstColorFactor,
+        .colorBlendOp = vk::BlendOp::eAdd,
+        .srcAlphaBlendFactor = vk::BlendFactor::eZero,
+        .dstAlphaBlendFactor = vk::BlendFactor::eOne,
+        .alphaBlendOp = vk::BlendOp::eAdd,
+        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+    const vk::PipelineColorBlendStateCreateInfo colorBlending{.attachmentCount = 1, .pAttachments = &blendAttachment};
+    const std::array<vk::DynamicState, 2> dynamicStates{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+    const vk::PipelineDynamicStateCreateInfo dynamicState{
+        .dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()), .pDynamicStates = dynamicStates.data()};
+    const vk::Format colorFormat = swapChainSurfaceFormat.format;
+    vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
+        {.stageCount = static_cast<uint32_t>(shaderStages.size()),
+         .pStages = shaderStages.data(),
+         .pVertexInputState = &vertexInputInfo,
+         .pInputAssemblyState = &inputAssembly,
+         .pViewportState = &viewportState,
+         .pRasterizationState = &rasterizer,
+         .pMultisampleState = &multisampling,
+         .pColorBlendState = &colorBlending,
+         .pDynamicState = &dynamicState,
+         .layout = overlayPipelineLayout,
+         .renderPass = nullptr},
+        {.colorAttachmentCount = 1, .pColorAttachmentFormats = &colorFormat}};
+    return vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
+  }
+
+  // Glyph index in overlay.slang's FONT table; characters it doesn't have become spaces.
+  static uint8_t overlayGlyphIndex(char c) {
+    static constexpr std::string_view glyphs = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ:.+-/()";
+    if (c >= 'a' && c <= 'z') {
+      c = static_cast<char>(c - 'a' + 'A');
+    }
+    const size_t index = glyphs.find(c);
+    return index == std::string_view::npos ? 0u : static_cast<uint8_t>(index);
+  }
+
+  // Top-right debug text: FPS, the active geometry path, terrain view and player block coordinates. Drawn on top of the presented image (after TAA).
+  void recordOverlay(vk::raii::CommandBuffer &commandBuffer, uint32_t imageIndex) {
+    const std::array<std::string, OVERLAY_LINES> lines{
+        "FPS " + std::to_string(static_cast<int>(std::lround(displayedFps))),
+        std::string(useVertexPulling ? "VERTEX " : "MESH ") + (player.waitingForTerrain()                 ? "LOADING"
+                                                               : player.mode() == Player::Mode::Spectator ? "FREECAM"
+                                                               : player.mode() == Player::Mode::Flying    ? "FLYING"
+                                                                                                          : "WALKING"),
+        std::string("VIEW ") + terrainViewName(terrainView),
+        "XYZ " + std::to_string(static_cast<int64_t>(std::floor(player.feetPosition().x))) + " " +
+            std::to_string(static_cast<int64_t>(std::floor(player.feetPosition().y))) + " " +
+            std::to_string(static_cast<int64_t>(std::floor(player.feetPosition().z)))};
+    OverlayParams params{
+        .screenSize = {static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height)},
+        .scale = std::max(1.0f, std::round(static_cast<float>(swapChainExtent.height) / 540.0f)),
+        .columns = 0,
+        .text = {}};
+    for (const auto &line : lines) {
+      params.columns = std::max(params.columns, static_cast<uint32_t>(std::min<size_t>(line.size(), OVERLAY_COLUMNS)));
+    }
+    std::array<uint8_t, OVERLAY_LINES * OVERLAY_COLUMNS> glyphs{};
+    for (uint32_t row = 0; row < OVERLAY_LINES; ++row) {
+      const std::string &line = lines[row];
+      const uint32_t length = static_cast<uint32_t>(std::min<size_t>(line.size(), OVERLAY_COLUMNS));
+      const uint32_t padding = params.columns - length; // right-align
+      for (uint32_t i = 0; i < length; ++i) {
+        glyphs[row * OVERLAY_COLUMNS + padding + i] = overlayGlyphIndex(line[i]);
+      }
+    }
+    std::memcpy(params.text.data(), glyphs.data(), glyphs.size());
+
+    // The TAA pass just wrote this image as a color attachment; order the overlay's blend after it.
+    const vk::MemoryBarrier2 taaDone{.srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                     .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                                     .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                     .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                                                      vk::AccessFlagBits2::eColorAttachmentWrite};
+    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &taaDone});
+
+    const vk::RenderingAttachmentInfo overlayAttachment{.imageView = swapChainImageViews[imageIndex],
+                                                        .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                                                        .loadOp = vk::AttachmentLoadOp::eLoad,
+                                                        .storeOp = vk::AttachmentStoreOp::eStore};
+    commandBuffer.beginRendering(vk::RenderingInfo{.renderArea = {.offset = {0, 0}, .extent = swapChainExtent},
+                                                   .layerCount = 1,
+                                                   .colorAttachmentCount = 1,
+                                                   .pColorAttachments = &overlayAttachment});
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *overlayPipeline);
+    commandBuffer.setViewport(0, vk::Viewport(0.0f, 0.0f, static_cast<float>(swapChainExtent.width),
+                                              static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
+    commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
+    commandBuffer.pushConstants(*overlayPipelineLayout,
+                                vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+                                sizeof(params), &params);
+    commandBuffer.draw(6, 1, 0, 0);
+    // Same layout and push constants. Hidden in freecam, where blocks can't be broken.
+    if (player.mode() != Player::Mode::Spectator) {
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *crosshairPipeline);
+      commandBuffer.draw(18, 1, 0, 0);
+    }
+    commandBuffer.endRendering();
+  }
+
+  void createHzbPipelines() {
+    std::array<vk::DescriptorSetLayoutBinding, 2> bindings{
+        {{.binding = 0,
+          .descriptorType = vk::DescriptorType::eSampledImage,
+          .descriptorCount = 1,
+          .stageFlags = vk::ShaderStageFlagBits::eCompute},
+         {.binding = 1, // one storage view per mip; unused slots repeat the last mip
+          .descriptorType = vk::DescriptorType::eStorageImage,
+          .descriptorCount = MAX_HZB_MIPS,
+          .stageFlags = vk::ShaderStageFlagBits::eCompute}}};
+    hzbSetLayout = vk::raii::DescriptorSetLayout(
+        device, vk::DescriptorSetLayoutCreateInfo{.bindingCount = static_cast<uint32_t>(bindings.size()),
+                                                  .pBindings = bindings.data()});
+    const vk::PushConstantRange pushRange{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = sizeof(HzbPushParams)};
+    const vk::DescriptorSetLayout setLayout = hzbSetLayout;
+    hzbPipelineLayout =
+        vk::raii::PipelineLayout(device, vk::PipelineLayoutCreateInfo{.setLayoutCount = 1,
+                                                                      .pSetLayouts = &setLayout,
+                                                                      .pushConstantRangeCount = 1,
+                                                                      .pPushConstantRanges = &pushRange});
+    vk::raii::ShaderModule module = createShaderModule(readFile("shaders/hzb.spv"));
+    auto create = [&](const char *entry) {
+      return vk::raii::Pipeline(
+          device, nullptr,
+          vk::ComputePipelineCreateInfo{
+              .stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = module, .pName = entry},
+              .layout = hzbPipelineLayout});
+    };
+    hzbBuildLowPipeline = create("hzbBuildLow");
+    hzbBuildHighPipeline = create("hzbBuildHigh");
+  }
+
+  // Swapchain-sized: the pyramid, its views and descriptor sets, and the task shader's binding 7.
+  void createHzbResources() {
+    auto halfNextPowerOfTwo = [](uint32_t v) {
+      uint32_t p = 1;
+      while (p < v) {
+        p <<= 1u;
+      }
+      return std::max(p / 2u, 1u);
+    };
+    hzbSize = vk::Extent2D{std::min(halfNextPowerOfTwo(swapChainExtent.width), HZB_MAX_MIP0_SIDE),
+                           std::min(halfNextPowerOfTwo(swapChainExtent.height), HZB_MAX_MIP0_SIDE)};
+    hzbMipCount = 1;
+    while ((std::max(hzbSize.width, hzbSize.height) >> hzbMipCount) != 0u) {
+      ++hzbMipCount;
+    }
+    auto [image, memory] = createImage(hzbSize.width, hzbSize.height, vk::Format::eR32Sfloat, vk::ImageTiling::eOptimal,
+                                       vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+                                       vk::MemoryPropertyFlagBits::eDeviceLocal, hzbMipCount);
+    hzbImage = std::move(image);
+    hzbImageMemory = std::move(memory);
+    hzbView = createImageView(*hzbImage, vk::Format::eR32Sfloat, vk::ImageAspectFlagBits::eColor, hzbMipCount);
+    hzbMipViews.clear();
+    for (uint32_t mip = 0; mip < hzbMipCount; ++mip) {
+      hzbMipViews.emplace_back(
+          device, vk::ImageViewCreateInfo{.image = *hzbImage,
+                                          .viewType = vk::ImageViewType::e2D,
+                                          .format = vk::Format::eR32Sfloat,
+                                          .subresourceRange = {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1}});
+    }
+    hzbImageInitialized = false;
+    hzbValid = false;
+
+    const uint32_t setCount = static_cast<uint32_t>(swapChainImages.size());
+    const std::array<vk::DescriptorPoolSize, 2> poolSizes{
+        {{.type = vk::DescriptorType::eSampledImage, .descriptorCount = setCount},
+         {.type = vk::DescriptorType::eStorageImage, .descriptorCount = MAX_HZB_MIPS * setCount}}};
+    hzbDescriptorPool = vk::raii::DescriptorPool(
+        device, vk::DescriptorPoolCreateInfo{.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+                                             .maxSets = setCount,
+                                             .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
+                                             .pPoolSizes = poolSizes.data()});
+    std::vector<vk::DescriptorSetLayout> layouts(setCount, *hzbSetLayout);
+    hzbSets = device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+        .descriptorPool = *hzbDescriptorPool, .descriptorSetCount = setCount, .pSetLayouts = layouts.data()});
+
+    std::array<vk::DescriptorImageInfo, MAX_HZB_MIPS> mipInfos{};
+    for (uint32_t mip = 0; mip < MAX_HZB_MIPS; ++mip) {
+      mipInfos[mip] = {.imageView = *hzbMipViews[std::min(mip, hzbMipCount - 1u)],
+                       .imageLayout = vk::ImageLayout::eGeneral};
+    }
+    for (size_t i = 0; i < hzbSets.size(); ++i) {
+      const vk::DescriptorImageInfo depthInfo{.imageView = *resolvedDepthImageViews[i],
+                                              .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+      const std::array<vk::WriteDescriptorSet, 2> writes{{{.dstSet = hzbSets[i],
+                                                           .dstBinding = 0,
+                                                           .descriptorCount = 1,
+                                                           .descriptorType = vk::DescriptorType::eSampledImage,
+                                                           .pImageInfo = &depthInfo},
+                                                          {.dstSet = hzbSets[i],
+                                                           .dstBinding = 1,
+                                                           .descriptorCount = MAX_HZB_MIPS,
+                                                           .descriptorType = vk::DescriptorType::eStorageImage,
+                                                           .pImageInfo = mipInfos.data()}}};
+      device.updateDescriptorSets(writes, {});
+    }
+
+    const vk::DescriptorImageInfo taskInfo{.imageView = *hzbView, .imageLayout = vk::ImageLayout::eGeneral};
+    std::vector<vk::DescriptorSet> sceneSets;
+    for (const auto &set : descriptorSets) {
+      sceneSets.push_back(*set);
+    }
+    for (const auto &set : cpuDescriptorSets) {
+      sceneSets.push_back(*set);
+    }
+    for (const vk::DescriptorSet set : sceneSets) {
+      device.updateDescriptorSets(vk::WriteDescriptorSet{.dstSet = set,
+                                                         .dstBinding = 7,
+                                                         .descriptorCount = 1,
+                                                         .descriptorType = vk::DescriptorType::eSampledImage,
+                                                         .pImageInfo = &taskInfo},
+                                  {});
+    }
+  }
+
+  // After the scene pass: depth (MSAA) -> Hi-Z mip 0 -> ... -> last mip, for the next frame's taskMain.
+  void recordHzb(vk::raii::CommandBuffer &commandBuffer, uint32_t imageIndex) {
+    const vk::ImageSubresourceRange allMips{vk::ImageAspectFlagBits::eColor, 0, hzbMipCount, 0, 1};
+    const std::array<vk::ImageMemoryBarrier2, 2> before{
+        {{.srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+          .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+          .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+          .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+          .oldLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+          .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+          .image = *resolvedDepthImages[imageIndex],
+          .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}},
+         // This frame's taskMain read the pyramid; finish that before overwriting it.
+         {.srcStageMask =
+              hzbImageInitialized ? vk::PipelineStageFlagBits2::eTaskShaderEXT : vk::PipelineStageFlagBits2::eTopOfPipe,
+          .srcAccessMask = hzbImageInitialized ? vk::AccessFlagBits2::eShaderRead : vk::AccessFlagBits2::eNone,
+          .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+          .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+          .oldLayout = hzbImageInitialized ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
+          .newLayout = vk::ImageLayout::eGeneral,
+          .image = *hzbImage,
+          .subresourceRange = allMips}}};
+    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = static_cast<uint32_t>(before.size()),
+                                                      .pImageMemoryBarriers = before.data()});
+    hzbImageInitialized = true;
+
+    const auto mipBarrier = [&](vk::PipelineStageFlags2 dstStage, vk::AccessFlags2 dstAccess) {
+      const vk::ImageMemoryBarrier2 barrier{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                                            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                                            .dstStageMask = dstStage,
+                                            .dstAccessMask = dstAccess,
+                                            .oldLayout = vk::ImageLayout::eGeneral,
+                                            .newLayout = vk::ImageLayout::eGeneral,
+                                            .image = *hzbImage,
+                                            .subresourceRange = allMips};
+      commandBuffer.pipelineBarrier2(
+          vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    };
+
+    const HzbPushParams params{.mip0Size = {hzbSize.width, hzbSize.height},
+                               .depthSize = {swapChainExtent.width, swapChainExtent.height},
+                               .mipCount = hzbMipCount};
+    commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *hzbPipelineLayout, 0, *hzbSets[imageIndex],
+                                     nullptr);
+    commandBuffer.pushConstants(*hzbPipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
+    // One thread per mip 0 texel; each 16x16 group reduces its block to one texel of mip 4.
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *hzbBuildLowPipeline);
+    commandBuffer.dispatch((hzbSize.width + 15u) / 16u, (hzbSize.height + 15u) / 16u, 1);
+    if (hzbMipCount > HZB_LOW_MIPS) {
+      mipBarrier(vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *hzbBuildHighPipeline);
+      commandBuffer.dispatch(1, 1, 1);
+    }
+    mipBarrier(vk::PipelineStageFlagBits2::eTaskShaderEXT, vk::AccessFlagBits2::eShaderRead);
+    hzbValid = true;
+  }
+
   void createChunkComputePipeline() {
-    std::array<vk::DescriptorSetLayoutBinding, 7> bindings{};
+    std::array<vk::DescriptorSetLayoutBinding, 18> bindings{};
     for (uint32_t binding = 0; binding < bindings.size(); ++binding) {
       bindings[binding] = {.binding = binding,
                            .descriptorType = vk::DescriptorType::eStorageBuffer,
@@ -909,8 +1671,18 @@ private:
     };
 
     generateHeightsPipeline = createComputePipeline("generateHeights");
+    retireWorkPipeline = createComputePipeline("retireWork");
+    allocateWorkPipeline = createComputePipeline("allocateWork");
+    finalizeWorkPipeline = createComputePipeline("finalizeWork");
+    initWorkPoolPipeline = createComputePipeline("initWorkPool");
+    collectRelocationsPipeline = createComputePipeline("collectRelocations");
+    relocateSlotsPipeline = createComputePipeline("relocateSlots");
+    rebuildFreeStackPipeline = createComputePipeline("rebuildFreeStack");
     meshColumnsPipeline = createComputePipeline("meshColumns");
-    finalizeMeshPipeline = createComputePipeline("finalizeMeshDispatch");
+    finalizeVertexDrawPipeline = createComputePipeline("finalizeVertexDraw");
+    compactQuadsPipeline = createComputePipeline("compactQuads");
+    copyCompactedQuadsPipeline = createComputePipeline("copyCompactedQuads");
+    createHzbPipelines();
   }
 #pragma endregion
 #pragma endregion
@@ -979,13 +1751,23 @@ private:
       multisampleMotionImageViews.emplace_back(
           createImageView(multisampleMotionImages.back(), MOTION_FORMAT, vk::ImageAspectFlagBits::eColor));
 
+      // Never sampled (Hi-Z reads the resolve below), so the driver can keep it compressed.
       auto [depthImage, depthImageMemory] =
           createImage(swapChainExtent.width, swapChainExtent.height, depthFormat, vk::ImageTiling::eOptimal,
-                      vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled,
-                      vk::MemoryPropertyFlagBits::eDeviceLocal, 1, RENDER_SAMPLE_COUNT);
+                      vk::ImageUsageFlagBits::eDepthStencilAttachment, vk::MemoryPropertyFlagBits::eDeviceLocal, 1,
+                      RENDER_SAMPLE_COUNT);
       depthImages.emplace_back(std::move(depthImage));
       depthImageMemories.emplace_back(std::move(depthImageMemory));
       depthImageViews.emplace_back(createImageView(depthImages.back(), depthFormat, vk::ImageAspectFlagBits::eDepth));
+
+      auto [resolvedDepthImage, resolvedDepthImageMemory] =
+          createImage(swapChainExtent.width, swapChainExtent.height, depthFormat, vk::ImageTiling::eOptimal,
+                      vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled,
+                      vk::MemoryPropertyFlagBits::eDeviceLocal);
+      resolvedDepthImages.emplace_back(std::move(resolvedDepthImage));
+      resolvedDepthImageMemories.emplace_back(std::move(resolvedDepthImageMemory));
+      resolvedDepthImageViews.emplace_back(
+          createImageView(resolvedDepthImages.back(), depthFormat, vk::ImageAspectFlagBits::eDepth));
     }
 
     for (size_t i = 0; i < taaHistoryImages.size(); ++i) {
@@ -1095,76 +1877,14 @@ private:
   }
 
   void createTextureImages() {
-    constexpr std::array<const char *, MAX_BLOCK_TYPES> blockDefinitionPaths = {
-        "blocks/grass.block", "blocks/dirt.block",  "blocks/stone.block", "blocks/sand.block",  "blocks/snow.block",
-        "blocks/stone.block", "blocks/stone.block", "blocks/stone.block", "blocks/stone.block", "blocks/stone.block"};
-    constexpr std::array<const char *, 6> normalNames = {"positive_x", "negative_x", "positive_y",
-                                                         "negative_y", "positive_z", "negative_z"};
-    std::vector<std::string> texturePaths;
-    std::unordered_map<std::string, uint32_t> textureIndices;
-
-    const auto trim = [](std::string value) {
-      const auto first = value.find_first_not_of(" \t\r\n");
-      if (first == std::string::npos) {
-        return std::string{};
-      }
-      const auto last = value.find_last_not_of(" \t\r\n");
-      return value.substr(first, last - first + 1);
-    };
-
-    for (size_t blockType = 0; blockType < blockDefinitionPaths.size(); ++blockType) {
-      std::ifstream definition(blockDefinitionPaths[blockType]);
-      if (!definition) {
-        throw std::runtime_error(std::string("failed to open block definition: ") + blockDefinitionPaths[blockType]);
-      }
-
-      std::array<bool, 6> definedNormals{};
-      std::string line;
-      size_t lineNumber = 0;
-      while (std::getline(definition, line)) {
-        ++lineNumber;
-        const auto commentStart = line.find('#');
-        if (commentStart != std::string::npos) {
-          line.erase(commentStart);
-        }
-        line = trim(std::move(line));
-        if (line.empty()) {
-          continue;
-        }
-
-        const auto separator = line.find('=');
-        if (separator == std::string::npos) {
-          throw std::runtime_error(std::string("invalid block definition at ") + blockDefinitionPaths[blockType] + ":" +
-                                   std::to_string(lineNumber));
-        }
-        const std::string normalName = trim(line.substr(0, separator));
-        const std::string textureName = trim(line.substr(separator + 1));
-        const auto normal = std::find_if(normalNames.begin(), normalNames.end(),
-                                         [&normalName](const char *name) { return normalName == name; });
-        if (normal == normalNames.end() || textureName.empty()) {
-          throw std::runtime_error(std::string("invalid normal or texture at ") + blockDefinitionPaths[blockType] +
-                                   ":" + std::to_string(lineNumber));
-        }
-        const size_t normalIndex = static_cast<size_t>(normal - normalNames.begin());
-        if (definedNormals[normalIndex]) {
-          throw std::runtime_error(std::string("duplicate normal in block definition: ") +
-                                   blockDefinitionPaths[blockType]);
-        }
-        definedNormals[normalIndex] = true;
-
-        const std::string texturePath = "textures/" + textureName;
-        auto [textureIndex, inserted] = textureIndices.emplace(texturePath, static_cast<uint32_t>(texturePaths.size()));
-        if (inserted) {
-          texturePaths.push_back(texturePath);
-        }
-        blockTextureIndices[blockType][normalIndex] = textureIndex->second;
-      }
-      if (!std::all_of(definedNormals.begin(), definedNormals.end(), [](bool defined) { return defined; })) {
-        throw std::runtime_error(std::string("block definition must specify all six normals: ") +
-                                 blockDefinitionPaths[blockType]);
-      }
+    blockRegistry = blocks::loadRegistry("blocks.txt", "textures/");
+    for (size_t layer = 0; layer < world::kTerrainLayerBlocks.size(); ++layer) {
+      terrainLayerBlocks[layer] = blockRegistry.idOf(world::kTerrainLayerBlocks[layer]);
+      terrainLayerFillerBlocks[layer] = blockRegistry.idOf(world::kTerrainLayerFillerBlocks[layer]);
+      terrainLayerDeepBlocks[layer] = blockRegistry.idOf(world::kTerrainLayerDeepBlocks[layer]);
     }
 
+    const auto &texturePaths = blockRegistry.texturePaths;
     if (texturePaths.size() > textureDescriptorCapacity) {
       throw std::runtime_error("texture descriptor capacity is too small for the loaded textures");
     }
@@ -1176,6 +1896,35 @@ private:
       textureImageMemories.emplace_back(nullptr);
       createTextureImage(path.c_str(), textureImages.back(), textureImageMemories.back());
     }
+  }
+
+  // Uploads the per-face block table once; the fragment shader reads it by block ID and normal.
+  void createBlockFaceBuffer() {
+    std::vector<GpuBlockFace> faces;
+    faces.reserve(blockRegistry.blocks.size() * blocks::kFaceCount);
+    for (const blocks::Block &block : blockRegistry.blocks) {
+      for (const blocks::Face &face : block.faces) {
+        faces.push_back({.texture = face.texture,
+                         .lodTexture = face.hasLodTexture ? face.lodTexture : face.texture,
+                         .flags = (face.randomRotation ? BLOCK_FACE_RANDOM_ROTATION : 0u) |
+                                  (face.hasLodTexture ? BLOCK_FACE_HAS_LOD_TEXTURE : 0u),
+                         .padding = 0,
+                         .lodTint = {block.lodTint[0], block.lodTint[1], block.lodTint[2], 1.0f}});
+      }
+    }
+
+    const vk::DeviceSize size = faces.size() * sizeof(GpuBlockFace);
+    auto [stagingBuffer, stagingBufferMemory] =
+        createBuffer(size, vk::BufferUsageFlagBits::eTransferSrc,
+                     vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    void *data = stagingBufferMemory.mapMemory(0, size);
+    std::memcpy(data, faces.data(), static_cast<size_t>(size));
+    stagingBufferMemory.unmapMemory();
+
+    std::tie(blockFaceBuffer, blockFaceBufferMemory) =
+        createBuffer(size, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+                     vk::MemoryPropertyFlagBits::eDeviceLocal);
+    copyBuffer(stagingBuffer, blockFaceBuffer, size);
   }
 
   void createTextureImageViews() {
@@ -1355,6 +2104,12 @@ private:
     chunkOffsetBuffer = std::move(offsetBufferValue);
     chunkOffsetBufferMemory = std::move(offsetBufferMemoryValue);
 
+    // compactQuads output: packed QuadBuffer, then packed ChunkOffsets.
+    auto [compactBufferValue, compactBufferMemoryValue] = createBuffer(
+        2u * bufferSize, vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    quadCompactBuffer = std::move(compactBufferValue);
+    quadCompactBufferMemory = std::move(compactBufferMemoryValue);
+
     constexpr uint32_t HEIGHT_STRIDE = CHUNK_SIZE + 2u;
     const vk::DeviceSize heightBufferSize =
         sizeof(int32_t) * MAX_HORIZONTAL_CHUNK_COUNT * HEIGHT_STRIDE * HEIGHT_STRIDE;
@@ -1364,21 +2119,54 @@ private:
     chunkHeightBufferMemory = std::move(heightBufferMemoryValue);
 
     auto [quadCountBufferValue, quadCountBufferMemoryValue] =
-        createBuffer(sizeof(uint32_t), vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+        createBuffer(2u * sizeof(uint32_t),
+                     vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst |
+                         vk::BufferUsageFlagBits::eTransferSrc,
                      vk::MemoryPropertyFlagBits::eDeviceLocal);
     quadCountBuffer = std::move(quadCountBufferValue);
     quadCountBufferMemory = std::move(quadCountBufferMemoryValue);
 
-    auto [drawArgumentsBufferValue, drawArgumentsBufferMemoryValue] =
-        createBuffer(sizeof(vk::DrawMeshTasksIndirectCommandEXT),
+    // Static {0,1,2, 0,2,3} + 4q pattern for VERTEX_QUADS_PER_INSTANCE quads; written once, never changes.
+    {
+      const vk::DeviceSize indexBufferSize = sizeof(uint16_t) * 6u * VERTEX_QUADS_PER_INSTANCE;
+      auto [indexBufferValue, indexBufferMemoryValue] =
+          createBuffer(indexBufferSize, vk::BufferUsageFlagBits::eIndexBuffer,
+                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      quadIndexBuffer = std::move(indexBufferValue);
+      quadIndexBufferMemory = std::move(indexBufferMemoryValue);
+      auto *indices = static_cast<uint16_t *>(quadIndexBufferMemory.mapMemory(0, indexBufferSize));
+      for (uint32_t quad = 0; quad < VERTEX_QUADS_PER_INSTANCE; ++quad) {
+        const auto base = static_cast<uint16_t>(quad * 4u);
+        const std::array<uint16_t, 6> quadIndices{
+            base, static_cast<uint16_t>(base + 1u), static_cast<uint16_t>(base + 2u),
+            base, static_cast<uint16_t>(base + 2u), static_cast<uint16_t>(base + 3u)};
+        std::memcpy(indices + quad * 6u, quadIndices.data(), sizeof(quadIndices));
+      }
+      quadIndexBufferMemory.unmapMemory();
+    }
+
+    createWorkPoolBuffers();
+
+    auto [vertexDrawArgumentsValue, vertexDrawArgumentsMemoryValue] =
+        createBuffer(sizeof(vk::DrawIndexedIndirectCommand),
                      vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer,
                      vk::MemoryPropertyFlagBits::eDeviceLocal);
-    meshDrawArgumentsBuffer = std::move(drawArgumentsBufferValue);
-    meshDrawArgumentsBufferMemory = std::move(drawArgumentsBufferMemoryValue);
+    vertexDrawArgumentsBuffer = std::move(vertexDrawArgumentsValue);
+    vertexDrawArgumentsBufferMemory = std::move(vertexDrawArgumentsMemoryValue);
 
     const vk::DeviceSize coordinateBufferSize = sizeof(world::ChunkLod) * MAX_HORIZONTAL_CHUNK_COUNT;
-    const vk::DeviceSize workBufferSize =
-        sizeof(std::array<int32_t, 2>) * MAX_HORIZONTAL_CHUNK_COUNT * VERTICAL_CHUNK_COUNT;
+    const vk::BufferUsageFlags gpuOnly = vk::BufferUsageFlagBits::eStorageBuffer;
+    // Set up by initWorkPool: the first remesh is a full rebuild, recorded before the first draw that reads it.
+    std::tie(workPoolBuffer, workPoolBufferMemory) =
+        createBuffer(sizeof(int32_t) * WORK_POOL_INTS,
+                     gpuOnly | vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eTransferSrc,
+                     vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(columnWorkSlotBuffer, columnWorkSlotBufferMemory) =
+        createBuffer(sizeof(uint32_t) * MAX_HORIZONTAL_CHUNK_COUNT * world::kMaxColumnChunks, gpuOnly,
+                     vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(columnHeightRangeBuffer, columnHeightRangeBufferMemory) =
+        createBuffer(2u * sizeof(int32_t) * MAX_HORIZONTAL_CHUNK_COUNT * HEIGHT_GROUPS_PER_COLUMN, gpuOnly,
+                     vk::MemoryPropertyFlagBits::eDeviceLocal);
 
     for (size_t frame = 0; frame < MAX_FRAMES_IN_FLIGHT; ++frame) {
       auto [coordinateBuffer, coordinateBufferMemory] =
@@ -1389,56 +2177,444 @@ private:
       chunkCoordinateBuffersMapped.emplace_back(
           chunkCoordinateBufferMemories.back().mapMemory(0, coordinateBufferSize));
       std::memset(chunkCoordinateBuffersMapped.back(), 0, static_cast<size_t>(coordinateBufferSize));
-      std::memcpy(chunkCoordinateBuffersMapped.back(), visibleChunkSet.data(),
-                  visibleChunkSet.size() * sizeof(world::ChunkLod));
 
-      auto [workBuffer, workBufferMemory] =
-          createBuffer(workBufferSize, vk::BufferUsageFlagBits::eStorageBuffer,
+      const vk::DeviceSize neighborLodBufferSize = sizeof(uint32_t) * MAX_HORIZONTAL_CHUNK_COUNT;
+      auto [neighborLodBuffer, neighborLodBufferMemory] =
+          createBuffer(neighborLodBufferSize, vk::BufferUsageFlagBits::eStorageBuffer,
                        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-      chunkWorkBuffers.emplace_back(std::move(workBuffer));
-      chunkWorkBufferMemories.emplace_back(std::move(workBufferMemory));
-      chunkWorkBuffersMapped.emplace_back(chunkWorkBufferMemories.back().mapMemory(0, workBufferSize));
-      std::memset(chunkWorkBuffersMapped.back(), 0, static_cast<size_t>(workBufferSize));
-      std::memcpy(chunkWorkBuffersMapped.back(), visibleChunkWork.data(),
-                  visibleChunkWork.size() * sizeof(visibleChunkWork[0]));
+      chunkNeighborLodBuffers.emplace_back(std::move(neighborLodBuffer));
+      chunkNeighborLodBufferMemories.emplace_back(std::move(neighborLodBufferMemory));
+      chunkNeighborLodBuffersMapped.emplace_back(
+          chunkNeighborLodBufferMemories.back().mapMemory(0, neighborLodBufferSize));
+      std::memset(chunkNeighborLodBuffersMapped.back(), 0, static_cast<size_t>(neighborLodBufferSize));
+
+      const vk::DeviceSize columnListSize = sizeof(uint32_t) * MAX_HORIZONTAL_CHUNK_COUNT;
+      auto [columnListBuffer, columnListMemory] =
+          createBuffer(columnListSize, vk::BufferUsageFlagBits::eStorageBuffer,
+                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      columnListBuffers.emplace_back(std::move(columnListBuffer));
+      columnListBufferMemories.emplace_back(std::move(columnListMemory));
+      columnListBuffersMapped.emplace_back(columnListBufferMemories.back().mapMemory(0, columnListSize));
+
+      const vk::DeviceSize retireListSize = sizeof(uint32_t) * MAX_HORIZONTAL_CHUNK_COUNT;
+      auto [retireListBuffer, retireListMemory] =
+          createBuffer(retireListSize, vk::BufferUsageFlagBits::eStorageBuffer,
+                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      retireListBuffers.emplace_back(std::move(retireListBuffer));
+      retireListBufferMemories.emplace_back(std::move(retireListMemory));
+      retireListBuffersMapped.emplace_back(retireListBufferMemories.back().mapMemory(0, retireListSize));
+
+      auto [readbackBuffer, readbackMemory] =
+          createBuffer(READBACK_UINTS * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst,
+                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      quadCountReadbackBuffers.emplace_back(std::move(readbackBuffer));
+      quadCountReadbackMemories.emplace_back(std::move(readbackMemory));
+      quadCountReadbackMapped.emplace_back(
+          static_cast<const uint32_t *>(
+              quadCountReadbackMemories.back().mapMemory(0, READBACK_UINTS * sizeof(uint32_t))));
     }
+  }
+
+  // Everything sized by workPoolCapacity (bindings 5, 6, 13, 16 and 17). Contents start undefined: a full rebuild
+  // (clears + initWorkPool) always follows.
+  void createWorkPoolBuffers() {
+    const vk::BufferUsageFlags gpuOnly = vk::BufferUsageFlagBits::eStorageBuffer;
+    std::tie(quadClusterBuffer, quadClusterBufferMemory) =
+        createBuffer(QUAD_CLUSTER_SIZE * QUAD_CLUSTERS_PER_CHUNK * workPoolCapacity,
+                     gpuOnly | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(chunkWorkBuffer, chunkWorkBufferMemory) = createBuffer(
+        sizeof(std::array<int32_t, 4>) * workPoolCapacity, gpuOnly, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(freeWorkSlotBuffer, freeWorkSlotBufferMemory) =
+        createBuffer(sizeof(uint32_t) * workPoolCapacity, gpuOnly, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(slotOwnerBuffer, slotOwnerBufferMemory) =
+        createBuffer(sizeof(uint32_t) * workPoolCapacity, gpuOnly, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(relocationScratchBuffer, relocationScratchBufferMemory) =
+        createBuffer(2u * sizeof(uint32_t) * workPoolCapacity, gpuOnly, vk::MemoryPropertyFlagBits::eDeviceLocal);
+  }
+
+  // allocateWork ran out of work slots: grow the pool to fit `demand` slots (with headroom, and at least double) and
+  // remesh everything into it. Rare (the pool keeps its size afterwards), so it simply waits for the GPU to go idle
+  // before replacing the buffers.
+  void growWorkPool(uint64_t demand) {
+    const uint32_t oldCapacity = workPoolCapacity;
+    const uint64_t wanted = std::max<uint64_t>(2ull * workPoolCapacity, demand + demand / 4u);
+    workPoolCapacity = static_cast<uint32_t>(std::min<uint64_t>(std::bit_ceil(wanted), WORK_POOL_MAX_CAPACITY));
+    std::cerr << "GPU work slot pool: " << oldCapacity << " slots ran out, growing to " << workPoolCapacity << "\n";
+    device.waitIdle();
+    createWorkPoolBuffers();
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+      const std::array<std::pair<uint32_t, vk::Buffer>, 5> computeBindings{{{5u, *chunkWorkBuffer},
+                                                                             {6u, *quadClusterBuffer},
+                                                                             {13u, *freeWorkSlotBuffer},
+                                                                             {16u, *slotOwnerBuffer},
+                                                                             {17u, *relocationScratchBuffer}}};
+      std::array<vk::DescriptorBufferInfo, computeBindings.size() + 1> infos{};
+      std::array<vk::WriteDescriptorSet, computeBindings.size() + 1> writes{};
+      for (size_t b = 0; b < computeBindings.size(); ++b) {
+        infos[b] = {.buffer = computeBindings[b].second, .offset = 0, .range = vk::WholeSize};
+        writes[b] = {.dstSet = chunkComputeDescriptorSets[i],
+                     .dstBinding = computeBindings[b].first,
+                     .descriptorCount = 1,
+                     .descriptorType = vk::DescriptorType::eStorageBuffer,
+                     .pBufferInfo = &infos[b]};
+      }
+      // The GPU clipmap's graphics set reads the clusters too (task shader, binding 6).
+      infos.back() = {.buffer = *quadClusterBuffer, .offset = 0, .range = vk::WholeSize};
+      writes.back() = {.dstSet = descriptorSets[i],
+                       .dstBinding = 6,
+                       .descriptorCount = 1,
+                       .descriptorType = vk::DescriptorType::eStorageBuffer,
+                       .pBufferInfo = &infos.back()};
+      device.updateDescriptorSets(writes, {});
+    }
+    forceFullRebuild = true;
+    chunkBuffersDirty = true;
+  }
+
+  void createCpuChunkBuffers() {
+    const vk::BufferUsageFlags deviceUsage =
+        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst;
+    const vk::DeviceSize quadBytes = sizeof(uint64_t) * CPU_MAX_QUADS;
+    std::tie(cpuQuadBuffer, cpuQuadBufferMemory) =
+        createBuffer(quadBytes, deviceUsage, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(cpuChunkOffsetBuffer, cpuChunkOffsetBufferMemory) =
+        createBuffer(quadBytes, deviceUsage, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(cpuClusterBuffer, cpuClusterBufferMemory) =
+        createBuffer(QUAD_CLUSTER_SIZE * QUAD_CLUSTERS_PER_CHUNK * CPU_MAX_CHUNK_SLOTS, deviceUsage,
+                     vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(cpuQuadCountBuffer, cpuQuadCountBufferMemory) =
+        createBuffer(2u * sizeof(uint32_t), deviceUsage, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    for (size_t frame = 0; frame < MAX_FRAMES_IN_FLIGHT; ++frame) {
+      auto [staging, stagingMemory] =
+          createBuffer(CPU_STAGING_BYTES, vk::BufferUsageFlagBits::eTransferSrc,
+                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      cpuStagingBuffers.emplace_back(std::move(staging));
+      cpuStagingMemories.emplace_back(std::move(stagingMemory));
+      cpuStagingMapped.push_back(static_cast<std::byte *>(cpuStagingMemories.back().mapMemory(0, CPU_STAGING_BYTES)));
+    }
+    // Start with no clusters.
+    auto commandBuffer = beginSingleTimeCommands();
+    commandBuffer.fillBuffer(*cpuClusterBuffer, 0, vk::WholeSize, 0u);
+    commandBuffer.fillBuffer(*cpuQuadCountBuffer, 0, vk::WholeSize, 0u);
+    endSingleTimeCommands(std::move(commandBuffer));
+  }
+
+  // Breaks on click / hold and picks the block to outline (after breaking, so the outline moves on at once).
+  void updateBlockBreaking(const glm::vec3 &eye) {
+    const bool clicked = std::exchange(breakClickPending, false);
+    outlineTarget.reset();
+    if (player.mode() == Player::Mode::Spectator) {
+      return;
+    }
+    const glm::vec3 &front = camera.front();
+    const auto target = [&] {
+      return cpuWorld->raycast({eye.x, eye.y, eye.z}, {front.x, front.y, front.z}, BLOCK_REACH);
+    };
+    std::optional<cpuworld::BlockHit> hit = target();
+    const double now = glfwGetTime();
+    const bool held = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    if (hit && camera.cursorCaptured() && (clicked || (held && now >= nextBreakTime))) {
+      nextBreakTime = now + BLOCK_BREAK_REPEAT_SECONDS;
+      cpuWorld->breakBlock(hit->block[0], hit->block[1], hit->block[2]);
+      hit = target();
+    }
+    if (hit) {
+      outlineTarget = hit->block;
+    }
+  }
+
+  void createCpuWorld() {
+    cpuworld::TerrainBlockIds ids;
+    for (size_t layer = 0; layer < ids.top.size(); ++layer) {
+      ids.top[layer] = static_cast<uint16_t>(terrainLayerBlocks[layer]);
+      ids.filler[layer] = static_cast<uint16_t>(terrainLayerFillerBlocks[layer]);
+      ids.deep[layer] = static_cast<uint16_t>(terrainLayerDeepBlocks[layer]);
+    }
+    cpuWorld = std::make_unique<cpuworld::CpuWorld>(ids);
+    const int32_t spawnHeight =
+        std::max(static_cast<int32_t>(std::floor(terrain::sampleHeight(0, 0))), world::kMinTerrainHeight);
+    player.spawn({0.5, static_cast<double>(spawnHeight), 0.5});
+  }
+
+  static uint64_t cpuColumnKey(int32_t cx, int32_t cz) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(cx)) << 32u) | static_cast<uint32_t>(cz);
+  }
+
+  void stageCpuClusters(const CpuChunkAllocation &chunk, uint32_t frame) {
+    std::memcpy(cpuStagingMapped[frame] + cpuStagingUsed, chunk.clusters.data(), sizeof(chunk.clusters));
+    cpuClusterCopies.push_back(
+        {cpuStagingUsed, QUAD_CLUSTER_SIZE * QUAD_CLUSTERS_PER_CHUNK * chunk.slot, sizeof(chunk.clusters)});
+    cpuStagingUsed += sizeof(chunk.clusters);
+  }
+
+  // Per frame, after updateVisibleClipmap: moves the CPU square with the player, shows exactly the columns of the
+  // applied clipmap's square, turns finished / unloaded columns into this frame's transfers (staging[frame]), and
+  // offers the ready square to the clipmap once it is uploaded.
+  void updateCpuWorld(const glm::vec3 &eye, uint32_t frame) {
+    const cpuworld::ChunkXZ desired{cpuworld::floorDiv(static_cast<int32_t>(std::floor(eye.x)), CHUNK_SIZE),
+                                    cpuworld::floorDiv(static_cast<int32_t>(std::floor(eye.z)), CHUNK_SIZE)};
+    const std::optional<cpuworld::ChunkXZ> applied =
+        lastAppliedClipmapView ? lastAppliedClipmapView->cpuRegionCenter : std::nullopt;
+    const auto shouldShow = [&](int32_t cx, int32_t cz) {
+      return applied && cpuworld::CpuWorld::inSquare(*applied, cx, cz);
+    };
+    std::vector<cpuworld::ChunkXZ> pinned;
+    for (const auto &center : {applied, cpuAdvertisedCenter}) {
+      if (center) {
+        pinned.push_back(*center);
+      }
+    }
+    for (const auto &[sequence, center] : inFlightCpuCenters) {
+      pinned.push_back(center);
+    }
+    cpuWorld->update(desired, pinned);
+    for (auto &event : cpuWorld->takeMeshEvents()) {
+      cpuPendingEvents.push_back(std::move(event));
+    }
+
+    cpuQuadCopies.clear();
+    cpuOffsetCopies.clear();
+    cpuClusterCopies.clear();
+    cpuClearedSlots.clear();
+    cpuStagingUsed = 0;
+    std::byte *staging = cpuStagingMapped[frame];
+
+    // Visibility first, unconditionally: it must change in the same frame as the applied clipmap. Only clusters are
+    // written (768 bytes per chunk), so it always fits in the staging buffer.
+    for (auto &[columnKey, column] : cpuColumns) {
+      const bool show = shouldShow(column.cx, column.cz);
+      if (show == column.visible) {
+        continue;
+      }
+      column.visible = show;
+      for (const CpuChunkAllocation &chunk : column.chunks) {
+        if (show) {
+          stageCpuClusters(chunk, frame);
+        } else {
+          cpuClearedSlots.push_back(chunk.slot);
+        }
+      }
+    }
+
+    while (!cpuPendingEvents.empty()) {
+      cpuworld::ColumnMeshEvent &event = cpuPendingEvents.front();
+      vk::DeviceSize bytes = 0;
+      for (const cpuworld::ChunkMesh &mesh : event.chunks) {
+        bytes += 2u * sizeof(uint64_t) * mesh.quads.size() + sizeof(mesh.clusters);
+      }
+      if (cpuStagingUsed != 0u && cpuStagingUsed + bytes > CPU_STAGING_BYTES) {
+        break; // next frame
+      }
+      if (cpuStagingUsed + bytes > CPU_STAGING_BYTES) {
+        throw std::runtime_error("CPU chunk column exceeds the staging buffer");
+      }
+
+      const uint64_t columnKey = cpuColumnKey(event.cx, event.cz);
+      const auto release = [&](const CpuChunkAllocation &chunk) {
+        cpuClearedSlots.push_back(chunk.slot);
+        cpuQuadRanges.release(chunk.quadOffset, chunk.quadCount);
+        cpuChunkSlots.release(chunk.slot);
+        cpuQuadCountDirty = true;
+      };
+      const auto upload = [&](CpuColumnGpu &column, cpuworld::ChunkMesh &mesh) {
+        const uint32_t quadCount = static_cast<uint32_t>(mesh.quads.size());
+        if (quadCount == 0u) {
+          return;
+        }
+        const std::optional<uint32_t> quadOffset = cpuQuadRanges.allocate(quadCount);
+        if (!quadOffset || cpuChunkSlots.highWater() >= CPU_MAX_CHUNK_SLOTS) {
+          if (quadOffset) {
+            cpuQuadRanges.release(*quadOffset, quadCount);
+          }
+          if (!cpuCapacityWarned) {
+            std::clog << "CPU chunk buffers are full; some near chunks are not drawn\n";
+            cpuCapacityWarned = true;
+          }
+          return;
+        }
+        CpuChunkAllocation chunk{mesh.cy, cpuChunkSlots.allocate(), *quadOffset, quadCount, mesh.clusters};
+        for (cpuworld::QuadCluster &cluster : chunk.clusters) {
+          cluster.base += *quadOffset;
+        }
+
+        const vk::DeviceSize quadBytes = sizeof(uint64_t) * quadCount;
+        std::memcpy(staging + cpuStagingUsed, mesh.quads.data(), quadBytes);
+        cpuQuadCopies.push_back({cpuStagingUsed, sizeof(uint64_t) * *quadOffset, quadBytes});
+        cpuStagingUsed += quadBytes;
+        std::fill_n(reinterpret_cast<uint64_t *>(staging + cpuStagingUsed), quadCount, mesh.chunkOffset);
+        cpuOffsetCopies.push_back({cpuStagingUsed, sizeof(uint64_t) * *quadOffset, quadBytes});
+        cpuStagingUsed += quadBytes;
+        // Hidden chunks leave their slot zeroed (freed slots are cleared, new ones start at zero).
+        if (column.visible) {
+          stageCpuClusters(chunk, frame);
+        }
+        column.chunks.push_back(chunk);
+        cpuQuadCountDirty = true;
+      };
+
+      const auto existing = cpuColumns.find(columnKey);
+      if (event.partial) {
+        // Block edit: swap only the remeshed chunks. A column already unloaded again has nothing to update.
+        if (existing != cpuColumns.end()) {
+          CpuColumnGpu &column = existing->second;
+          for (cpuworld::ChunkMesh &mesh : event.chunks) {
+            std::erase_if(column.chunks, [&](const CpuChunkAllocation &chunk) {
+              if (chunk.cy != mesh.cy) {
+                return false;
+              }
+              release(chunk);
+              return true;
+            });
+            upload(column, mesh);
+          }
+        }
+      } else {
+        if (existing != cpuColumns.end()) {
+          for (const CpuChunkAllocation &chunk : existing->second.chunks) {
+            release(chunk);
+          }
+          cpuColumns.erase(existing);
+        }
+        if (!event.removed) {
+          CpuColumnGpu column{event.cx, event.cz, shouldShow(event.cx, event.cz), {}};
+          for (cpuworld::ChunkMesh &mesh : event.chunks) {
+            upload(column, mesh);
+          }
+          cpuColumns.emplace(columnKey, std::move(column));
+        }
+      }
+      cpuPendingEvents.pop_front();
+    }
+
+    // Offer the ready square only when everything handed over so far is on its way to the GPU.
+    if (cpuPendingEvents.empty()) {
+      cpuAdvertisedCenter = cpuWorld->readyCenter();
+    }
+  }
+
+  // Clears (hidden / freed clusters), then copies from this frame's staging buffer, before any of this frame's draws.
+  void recordCpuUploads(vk::raii::CommandBuffer &commandBuffer) {
+    if (cpuQuadCopies.empty() && cpuClusterCopies.empty() && cpuClearedSlots.empty() && !cpuQuadCountDirty) {
+      return;
+    }
+    const vk::MemoryBarrier2 afterDraws{.srcStageMask = vk::PipelineStageFlagBits2::eTaskShaderEXT |
+                                                        vk::PipelineStageFlagBits2::eMeshShaderEXT |
+                                                        vk::PipelineStageFlagBits2::eVertexShader,
+                                        .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                                        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite};
+    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &afterDraws});
+
+    for (const uint32_t slot : cpuClearedSlots) {
+      commandBuffer.fillBuffer(*cpuClusterBuffer, QUAD_CLUSTER_SIZE * QUAD_CLUSTERS_PER_CHUNK * slot,
+                               QUAD_CLUSTER_SIZE * QUAD_CLUSTERS_PER_CHUNK, 0u);
+    }
+    if (!cpuClearedSlots.empty()) {
+      // A cleared slot may be reused by this frame's copies.
+      const vk::MemoryBarrier2 fillsDone{.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                                         .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                         .dstAccessMask = vk::AccessFlagBits2::eTransferWrite};
+      commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &fillsDone});
+    }
+    const vk::Buffer staging = *cpuStagingBuffers[frameIndex];
+    if (!cpuQuadCopies.empty()) {
+      commandBuffer.copyBuffer(staging, *cpuQuadBuffer, cpuQuadCopies);
+      commandBuffer.copyBuffer(staging, *cpuChunkOffsetBuffer, cpuOffsetCopies);
+    }
+    if (!cpuClusterCopies.empty()) {
+      commandBuffer.copyBuffer(staging, *cpuClusterBuffer, cpuClusterCopies);
+    }
+    if (cpuQuadCountDirty) {
+      const std::array<uint32_t, 2> count{cpuQuadRanges.highWater(), 0u};
+      commandBuffer.updateBuffer<uint32_t>(*cpuQuadCountBuffer, 0, count);
+      cpuQuadCountDirty = false;
+    }
+
+    const vk::MemoryBarrier2 uploadsDone{.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                                         .dstStageMask = vk::PipelineStageFlagBits2::eTaskShaderEXT |
+                                                         vk::PipelineStageFlagBits2::eMeshShaderEXT |
+                                                         vk::PipelineStageFlagBits2::eVertexShader,
+                                         .dstAccessMask = vk::AccessFlagBits2::eShaderRead};
+    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &uploadsDone});
+    cpuQuadCopies.clear();
+    cpuOffsetCopies.clear();
+    cpuClusterCopies.clear();
+    cpuClearedSlots.clear();
   }
 
   void updateVisibleClipmap(const ClipmapView &view) {
-    Profiler::Scope profile(Profiler::Metric::ClipmapUpdate);
     if (!lastSubmittedClipmapView || !clipmapViewCanCover(*lastSubmittedClipmapView, view)) {
       latestSubmittedClipmapSequence = clipmapCuller.submit(view);
+      if (view.cpuRegionCenter) {
+        inFlightCpuCenters.emplace_back(latestSubmittedClipmapSequence, *view.cpuRegionCenter);
+        constexpr size_t maxPinned = 8; // the culler only runs the newest pending job, so older ones mostly vanish
+        while (inFlightCpuCenters.size() > maxPinned) {
+          inFlightCpuCenters.pop_front();
+        }
+      }
       lastSubmittedClipmapView = view;
     }
-    if (auto completion = clipmapCuller.takeCompletion(); completion &&
-                                                          completion->sequence > lastAppliedClipmapSequence &&
-                                                          clipmapViewCanCover(completion->view, view)) {
+    // A result built around a CPU square that isn't fully loaded and uploaded any more would leave a hole. Once
+    // applied, its square is pinned in cpuWorld (updateCpuWorld runs after this).
+    const auto cpuCenterUsable = [&](const std::optional<cpuworld::ChunkXZ> &center) {
+      return !center || center == cpuAdvertisedCenter ||
+             (lastAppliedClipmapView && center == lastAppliedClipmapView->cpuRegionCenter) ||
+             (cpuPendingEvents.empty() && cpuWorld->squareLoaded(*center));
+    };
+    if (auto completion = clipmapCuller.takeCompletion();
+        completion && completion->sequence > lastAppliedClipmapSequence &&
+        clipmapViewCanCover(completion->view, view, kClipmapStaleCover) &&
+        cpuCenterUsable(completion->view.cpuRegionCenter)) {
       lastAppliedClipmapSequence = completion->sequence;
+      while (!inFlightCpuCenters.empty() && inFlightCpuCenters.front().first <= completion->sequence) {
+        inFlightCpuCenters.pop_front();
+      }
       lastAppliedClipmapView = completion->view;
-      if (completion->result.chunks != visibleChunkSet || completion->result.work != visibleChunkWork) {
+      if (completion->result.chunks != visibleChunkSet ||
+          completion->result.neighborLods != visibleChunkNeighborLods) {
         visibleChunkSet = std::move(completion->result.chunks);
-        visibleChunkWork = std::move(completion->result.work);
-        chunkComputeCount = static_cast<uint32_t>(visibleChunkWork.size());
+        visibleChunkNeighborLods = std::move(completion->result.neighborLods);
         chunkBuffersDirty = true;
       }
     }
-    if (!lastAppliedClipmapView || !clipmapViewCanCover(*lastAppliedClipmapView, view)) {
-      Profiler::Scope fallbackProfile(Profiler::Metric::ClipmapFallback);
+    // Synchronous fallback only when the applied set is beyond the stale tolerance (first frame, FOV/LOD change,
+    // teleport, a fast turn on the frustum-culled path). Normal movement keeps the previous set until the async
+    // result lands, even when the camera outruns the grace distance meanwhile (fast flight, slow debug builds):
+    // rebuilding the clipmap on this thread then stalled the frame for several ms on every async round trip.
+    if (!lastAppliedClipmapView || !clipmapViewCanCover(*lastAppliedClipmapView, view, kClipmapStaleCover)) {
       ClipmapResult result = buildVisibleClipmap(view);
       lastAppliedClipmapSequence = latestSubmittedClipmapSequence;
+      inFlightCpuCenters.clear();
       lastAppliedClipmapView = view;
-      if (result.chunks != visibleChunkSet || result.work != visibleChunkWork) {
+      if (result.chunks != visibleChunkSet || result.neighborLods != visibleChunkNeighborLods) {
         visibleChunkSet = std::move(result.chunks);
-        visibleChunkWork = std::move(result.work);
-        chunkComputeCount = static_cast<uint32_t>(visibleChunkWork.size());
+        visibleChunkNeighborLods = std::move(result.neighborLods);
         chunkBuffersDirty = true;
       }
     }
   }
 
-  static bool clipmapViewCanCover(const ClipmapView &builtView, const ClipmapView &currentView) {
-    constexpr float maxPositionDelta = static_cast<float>(CHUNK_SIZE) * 2.0f;
-    constexpr float minForwardDot = 0.9961947f;
+  struct ClipmapCoverTolerance {
+    float maxPositionDelta;
+    float minForwardDot;
+    bool sameCpuRegion;
+  };
+  // Submit a new async cull once the camera leaves the culling margin (2 chunks / 5 degrees). Keep using the
+  // previous set while that job is in flight, up to the stale tolerance (12 chunks / 7.5 degrees); past it the main
+  // thread builds the set itself. The position limit is loose because the set covers the whole area around the
+  // camera: a lagging one only has slightly coarser LODs near the camera and a few chunks missing at the far
+  // horizon. The direction limit stays tight, because the frustum-culled set has nothing outside the view.
+  // A new CPU square needs a new clipmap (submit), but the old one stays valid meanwhile because the CPU keeps the
+  // old square loaded (stale cover ignores it).
+  static constexpr ClipmapCoverTolerance kClipmapSubmitCover{static_cast<float>(CHUNK_SIZE) * 2.0f, 0.9961947f, true};
+  static constexpr ClipmapCoverTolerance kClipmapStaleCover{static_cast<float>(CHUNK_SIZE) * 12.0f, 0.9914449f, false};
+
+  static bool clipmapViewCanCover(const ClipmapView &builtView, const ClipmapView &currentView,
+                                  const ClipmapCoverTolerance &tolerance = kClipmapSubmitCover) {
+    const float maxPositionDelta = tolerance.maxPositionDelta;
+    const float minForwardDot = tolerance.minForwardDot;
     const float dx = builtView.position[0] - currentView.position[0];
     const float dy = builtView.position[1] - currentView.position[1];
     const float dz = builtView.position[2] - currentView.position[2];
@@ -1446,24 +2622,28 @@ private:
     const float forwardDot = builtView.forward[0] * currentView.forward[0] +
                              builtView.forward[1] * currentView.forward[1] +
                              builtView.forward[2] * currentView.forward[2];
-    return positionDeltaSquared <= maxPositionDelta * maxPositionDelta && forwardDot >= minForwardDot &&
+    // Without frustum culling the result doesn't depend on the view direction, so turning never forces a rebuild.
+    const bool directionCovered = !builtView.frustumCull || forwardDot >= minForwardDot;
+    return positionDeltaSquared <= maxPositionDelta * maxPositionDelta && directionCovered &&
+           builtView.frustumCull == currentView.frustumCull &&
            builtView.lodDistanceSquared == currentView.lodDistanceSquared &&
            builtView.verticalFovRadians == currentView.verticalFovRadians &&
-           builtView.aspectRatio == currentView.aspectRatio;
+           builtView.aspectRatio == currentView.aspectRatio &&
+           (!tolerance.sameCpuRegion || builtView.cpuRegionCenter == currentView.cpuRegionCenter);
   }
 #pragma endregion
 
 #pragma region Descriptor Setup
   void createDescriptorPool() {
     std::array<vk::DescriptorPoolSize, 4> poolSize{
-        {{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 16u * MAX_FRAMES_IN_FLIGHT},
-         {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = MAX_FRAMES_IN_FLIGHT},
+        {{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 40u * MAX_FRAMES_IN_FLIGHT},
+         {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 2u * MAX_FRAMES_IN_FLIGHT},
          {.type = vk::DescriptorType::eSampledImage,
-          .descriptorCount = MAX_FRAMES_IN_FLIGHT * static_cast<uint32_t>(textureImageViews.size())},
-         {.type = vk::DescriptorType::eSampler, .descriptorCount = MAX_FRAMES_IN_FLIGHT}}};
+          .descriptorCount = 2u * MAX_FRAMES_IN_FLIGHT * (static_cast<uint32_t>(textureImageViews.size()) + 1u)},
+         {.type = vk::DescriptorType::eSampler, .descriptorCount = 2u * MAX_FRAMES_IN_FLIGHT}}};
     vk::DescriptorPoolCreateInfo poolInfo{.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet |
                                                    vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind,
-                                          .maxSets = 3u * MAX_FRAMES_IN_FLIGHT,
+                                          .maxSets = 4u * MAX_FRAMES_IN_FLIGHT,
                                           .poolSizeCount = static_cast<uint32_t>(poolSize.size()),
                                           .pPoolSizes = poolSize.data()};
     descriptorPool = vk::raii::DescriptorPool(device, poolInfo);
@@ -1483,6 +2663,8 @@ private:
 
     descriptorSets.clear();
     descriptorSets = device.allocateDescriptorSets(allocInfo);
+    cpuDescriptorSets.clear();
+    cpuDescriptorSets = device.allocateDescriptorSets(allocInfo);
 
     std::vector<vk::DescriptorImageInfo> textureImageInfos;
     textureImageInfos.reserve(textureImageViews.size());
@@ -1491,55 +2673,79 @@ private:
           {.sampler = nullptr, .imageView = imageView, .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal});
     }
 
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+    // Two sets per frame with the same layout: the GPU-meshed clipmap, and the CPU-meshed near chunks.
+    for (size_t setIndex = 0; setIndex < 2u * MAX_FRAMES_IN_FLIGHT; setIndex++) {
+      const size_t i = setIndex % MAX_FRAMES_IN_FLIGHT;
+      const bool cpuSet = setIndex >= MAX_FRAMES_IN_FLIGHT;
+      const vk::DescriptorSet set = cpuSet ? *cpuDescriptorSets[i] : *descriptorSets[i];
       vk::DescriptorBufferInfo uniformBufferInfo{
           .buffer = uniformBuffers[i], .offset = 0, .range = sizeof(UniformBufferObject)};
-      vk::DescriptorBufferInfo quadBufferInfo{
-          .buffer = quadBuffer, .offset = 0, .range = sizeof(uint64_t) * MAX_QUAD_COUNT};
-      vk::DescriptorBufferInfo chunkOffsetBufferInfo{
-          .buffer = chunkOffsetBuffer, .offset = 0, .range = sizeof(uint64_t) * MAX_QUAD_COUNT};
-      vk::DescriptorBufferInfo quadCountBufferInfo{.buffer = quadCountBuffer, .offset = 0, .range = sizeof(uint32_t)};
+      vk::DescriptorBufferInfo quadBufferInfo{.buffer = cpuSet ? *cpuQuadBuffer : *quadBuffer,
+                                              .offset = 0,
+                                              .range = sizeof(uint64_t) * (cpuSet ? CPU_MAX_QUADS : MAX_QUAD_COUNT)};
+      vk::DescriptorBufferInfo chunkOffsetBufferInfo{.buffer = cpuSet ? *cpuChunkOffsetBuffer : *chunkOffsetBuffer,
+                                                     .offset = 0,
+                                                     .range =
+                                                         sizeof(uint64_t) * (cpuSet ? CPU_MAX_QUADS : MAX_QUAD_COUNT)};
       vk::DescriptorImageInfo samplerInfo{
           .sampler = textureSampler, .imageView = nullptr, .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
 
-      std::array<vk::WriteDescriptorSet, 6> descriptorWrites{{
-          {.dstSet = descriptorSets[i],
+      vk::DescriptorBufferInfo blockFaceBufferInfo{.buffer = blockFaceBuffer, .offset = 0, .range = vk::WholeSize};
+      vk::DescriptorBufferInfo quadCountBufferInfo{
+          .buffer = cpuSet ? *cpuQuadCountBuffer : *quadCountBuffer, .offset = 0, .range = sizeof(uint32_t)};
+      vk::DescriptorBufferInfo clusterBufferInfo{
+          .buffer = cpuSet ? *cpuClusterBuffer : *quadClusterBuffer, .offset = 0, .range = vk::WholeSize};
+      std::array<vk::WriteDescriptorSet, 8> descriptorWrites{{
+          {.dstSet = set,
            .dstBinding = 0,
            .dstArrayElement = 0,
            .descriptorCount = 1,
            .descriptorType = vk::DescriptorType::eStorageBuffer,
            .pBufferInfo = &quadBufferInfo},
-          {.dstSet = descriptorSets[i],
+          {.dstSet = set,
            .dstBinding = 1,
            .dstArrayElement = 0,
            .descriptorCount = 1,
            .descriptorType = vk::DescriptorType::eUniformBuffer,
            .pBufferInfo = &uniformBufferInfo},
-          {.dstSet = descriptorSets[i],
+          {.dstSet = set,
            .dstBinding = 2,
            .dstArrayElement = 0,
            .descriptorCount = 1,
            .descriptorType = vk::DescriptorType::eSampler,
            .pImageInfo = &samplerInfo},
-          {.dstSet = descriptorSets[i],
+          {.dstSet = set,
            .dstBinding = 3,
            .dstArrayElement = 0,
            .descriptorCount = 1,
            .descriptorType = vk::DescriptorType::eStorageBuffer,
            .pBufferInfo = &chunkOffsetBufferInfo},
-          {.dstSet = descriptorSets[i],
+          {.dstSet = set,
            .dstBinding = 11,
            .dstArrayElement = 0,
            .descriptorCount = static_cast<uint32_t>(textureImageInfos.size()),
            .descriptorType = vk::DescriptorType::eSampledImage,
            .pImageInfo = textureImageInfos.data()},
-          {.dstSet = descriptorSets[i],
+          {.dstSet = set,
+           .dstBinding = 5,
+           .dstArrayElement = 0,
+           .descriptorCount = 1,
+           .descriptorType = vk::DescriptorType::eStorageBuffer,
+           .pBufferInfo = &blockFaceBufferInfo},
+          {.dstSet = set,
            .dstBinding = 4,
            .dstArrayElement = 0,
            .descriptorCount = 1,
            .descriptorType = vk::DescriptorType::eStorageBuffer,
            .pBufferInfo = &quadCountBufferInfo},
+          {.dstSet = set,
+           .dstBinding = 6,
+           .dstArrayElement = 0,
+           .descriptorCount = 1,
+           .descriptorType = vk::DescriptorType::eStorageBuffer,
+           .pBufferInfo = &clusterBufferInfo},
       }};
+      // Binding 7 (Hi-Z) is written by writeHzbDescriptors, which runs again whenever the swapchain is rebuilt.
       device.updateDescriptorSets(descriptorWrites, {});
     }
 
@@ -1550,19 +2756,28 @@ private:
                                       .pSetLayouts = computeLayouts.data()});
 
     const vk::DeviceSize coordinateBufferSize = sizeof(world::ChunkLod) * MAX_HORIZONTAL_CHUNK_COUNT;
-    const vk::DeviceSize workBufferSize =
-        sizeof(std::array<int32_t, 2>) * MAX_HORIZONTAL_CHUNK_COUNT * VERTICAL_CHUNK_COUNT;
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-      std::array<vk::DescriptorBufferInfo, 7> bufferInfos{{
+      std::array<vk::DescriptorBufferInfo, 18> bufferInfos{{
           {.buffer = chunkHeightBuffer, .offset = 0, .range = sizeof(int32_t) * MAX_HORIZONTAL_CHUNK_COUNT * 34u * 34u},
           {.buffer = chunkCoordinateBuffers[i], .offset = 0, .range = coordinateBufferSize},
           {.buffer = quadBuffer, .offset = 0, .range = sizeof(uint64_t) * MAX_QUAD_COUNT},
           {.buffer = chunkOffsetBuffer, .offset = 0, .range = sizeof(uint64_t) * MAX_QUAD_COUNT},
-          {.buffer = quadCountBuffer, .offset = 0, .range = sizeof(uint32_t)},
-          {.buffer = meshDrawArgumentsBuffer, .offset = 0, .range = sizeof(vk::DrawMeshTasksIndirectCommandEXT)},
-          {.buffer = chunkWorkBuffers[i], .offset = 0, .range = workBufferSize},
+          {.buffer = quadCountBuffer, .offset = 0, .range = 2u * sizeof(uint32_t)},
+          {.buffer = chunkWorkBuffer, .offset = 0, .range = vk::WholeSize},
+          {.buffer = quadClusterBuffer, .offset = 0, .range = vk::WholeSize},
+          {.buffer = vertexDrawArgumentsBuffer, .offset = 0, .range = sizeof(vk::DrawIndexedIndirectCommand)},
+          {.buffer = chunkNeighborLodBuffers[i], .offset = 0, .range = sizeof(uint32_t) * MAX_HORIZONTAL_CHUNK_COUNT},
+          {.buffer = columnListBuffers[i], .offset = 0, .range = vk::WholeSize},
+          {.buffer = retireListBuffers[i], .offset = 0, .range = vk::WholeSize},
+          {.buffer = quadCompactBuffer, .offset = 0, .range = vk::WholeSize},
+          {.buffer = workPoolBuffer, .offset = 0, .range = vk::WholeSize},
+          {.buffer = freeWorkSlotBuffer, .offset = 0, .range = vk::WholeSize},
+          {.buffer = columnWorkSlotBuffer, .offset = 0, .range = vk::WholeSize},
+          {.buffer = columnHeightRangeBuffer, .offset = 0, .range = vk::WholeSize},
+          {.buffer = slotOwnerBuffer, .offset = 0, .range = vk::WholeSize},
+          {.buffer = relocationScratchBuffer, .offset = 0, .range = vk::WholeSize},
       }};
-      std::array<vk::WriteDescriptorSet, 7> writes{};
+      std::array<vk::WriteDescriptorSet, 18> writes{};
       for (uint32_t binding = 0; binding < writes.size(); ++binding) {
         writes[binding] = {.dstSet = chunkComputeDescriptorSets[i],
                            .dstBinding = binding,
@@ -1660,14 +2875,9 @@ private:
 
 #pragma region Command Recording
   void recordCommandBuffer(uint32_t imageIndex) {
-    Profiler::Scope profile(Profiler::Metric::CommandRecording);
     auto &commandBuffer = commandBuffers[frameIndex];
     commandBuffer.begin({});
-    const uint32_t firstQuery = frameIndex * GPU_TIMESTAMP_COUNT;
-    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
-      commandBuffer.resetQueryPool(*timestampQueryPool, firstQuery, GPU_TIMESTAMP_COUNT);
-      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery);
-    }
+    recordCpuUploads(commandBuffer);
     recordChunkCompute(commandBuffer);
 
     const auto colorOutputStage = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
@@ -1690,6 +2900,13 @@ private:
         vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
         vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
         vk::ImageAspectFlagBits::eDepth);
+    // Depth resolves run in the color attachment output stage with color attachment access.
+    const bool resolveDepth = !useVertexPulling && hzbOcclusionEnabled;
+    if (resolveDepth) {
+      transition_image_layout(
+          *resolvedDepthImages[imageIndex], vk::ImageLayout::eUndefined, vk::ImageLayout::eDepthAttachmentOptimal, {},
+          colorWrite, vk::PipelineStageFlagBits2::eComputeShader, colorOutputStage, vk::ImageAspectFlagBits::eDepth);
+    }
     transition_image_layout(swapChainImages[imageIndex], vk::ImageLayout::eUndefined,
                             vk::ImageLayout::eColorAttachmentOptimal, {}, colorWrite,
                             vk::PipelineStageFlagBits2::eTopOfPipe, colorOutputStage, vk::ImageAspectFlagBits::eColor);
@@ -1727,11 +2944,16 @@ private:
           .storeOp = vk::AttachmentStoreOp::eStore,
           .clearValue = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 0.0f)}}};
 
-    vk::RenderingAttachmentInfo depthAttachmentInfo = {.imageView = depthImageViews[imageIndex],
-                                                       .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
-                                                       .loadOp = vk::AttachmentLoadOp::eClear,
-                                                       .storeOp = vk::AttachmentStoreOp::eStore,
-                                                       .clearValue = clearDepth};
+    // Nothing reads the MSAA depth after the pass; Hi-Z gets the farthest sample per pixel through the resolve.
+    vk::RenderingAttachmentInfo depthAttachmentInfo = {
+        .imageView = depthImageViews[imageIndex],
+        .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+        .resolveMode = resolveDepth ? vk::ResolveModeFlagBits::eMax : vk::ResolveModeFlagBits::eNone,
+        .resolveImageView = resolveDepth ? *resolvedDepthImageViews[imageIndex] : vk::ImageView{},
+        .resolveImageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+        .loadOp = vk::AttachmentLoadOp::eClear,
+        .storeOp = vk::AttachmentStoreOp::eDontCare,
+        .clearValue = clearDepth};
 
     vk::RenderingInfo renderingInfo = {.renderArea = {.offset = {0, 0}, .extent = swapChainExtent},
                                        .layerCount = 1,
@@ -1740,7 +2962,10 @@ private:
                                        .pDepthAttachment = &depthAttachmentInfo};
 
     commandBuffer.beginRendering(renderingInfo);
-    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline);
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                               wireframeEnabled
+                                   ? (useVertexPulling ? *wireframeVertexPullingPipeline : *wireframePipeline)
+                                   : (useVertexPulling ? *vertexPullingPipeline : *graphicsPipeline));
     // Negative height flips Y for Vulkan; see Uniform buffers.
     commandBuffer.setViewport(0, vk::Viewport(0.0f, static_cast<float>(swapChainExtent.height),
                                               static_cast<float>(swapChainExtent.width),
@@ -1748,11 +2973,63 @@ private:
     commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
     commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, *descriptorSets[frameIndex],
                                      nullptr);
-    commandBuffer.drawMeshTasksIndirectEXT(*meshDrawArgumentsBuffer, 0, 1, sizeof(vk::DrawMeshTasksIndirectCommandEXT));
+    const bool debugView = terrainView == TerrainView::Debug;
+    const auto pushGeometry = [&](uint32_t clusterCount, uint32_t debugTint, uint32_t quadBase = 0u,
+                                  uint32_t quadCount = 0u) {
+      const GeometryPushConstants push{clusterCount, debugView ? debugTint : DEBUG_TINT_OFF, quadBase, quadCount};
+      commandBuffer.pushConstants(*pipelineLayout, GEOMETRY_PUSH_STAGES, 0, sizeof(push), &push);
+    };
+    // 32 clusters per task group, spread over x and y to stay under the 65535 group limit per dimension.
+    const auto drawClusters = [&](uint32_t clusterCount, uint32_t debugTint) {
+      if (clusterCount == 0u) {
+        return;
+      }
+      pushGeometry(clusterCount, debugTint);
+      const uint32_t taskGroups = (clusterCount + 31u) / 32u;
+      commandBuffer.drawMeshTasksEXT(std::min(taskGroups, 65535u), (taskGroups + 65534u) / 65535u, 1);
+    };
+    if (useVertexPulling) {
+      commandBuffer.bindIndexBuffer(*quadIndexBuffer, 0, vk::IndexType::eUint16);
+    }
+    // GPU-meshed clipmap (LOD terrain, with the hole the CPU square fills).
+    if (terrainView != TerrainView::RealOnly) {
+      if (useVertexPulling) {
+        pushGeometry(0u, DEBUG_TINT_LOD);
+        commandBuffer.drawIndexedIndirect(*vertexDrawArgumentsBuffer, 0, 1, sizeof(vk::DrawIndexedIndirectCommand));
+      } else {
+        // Work slots are handed out on the GPU: finalizeWork wrote the group count from their high water. Clusters past
+        // it (the folded y/z grid overshoots) are zero, so the bound is just the buffer.
+        pushGeometry(workPoolCapacity * QUAD_CLUSTERS_PER_CHUNK, DEBUG_TINT_LOD);
+        commandBuffer.drawMeshTasksIndirectEXT(*workPoolBuffer, WORK_POOL_TASK_ARGS_OFFSET, 1,
+                                               sizeof(vk::DrawMeshTasksIndirectCommandEXT));
+      }
+    }
+    // CPU-meshed near chunks: same pipelines, their own buffers.
+    if (terrainView != TerrainView::LodOnly && cpuChunkSlots.highWater() != 0u) {
+      commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0,
+                                       *cpuDescriptorSets[frameIndex], nullptr);
+      if (useVertexPulling) {
+        // One draw per visible chunk (hidden chunks keep their quads in the buffer).
+        for (const auto &[columnKey, column] : cpuColumns) {
+          if (!column.visible) {
+            continue;
+          }
+          for (const CpuChunkAllocation &chunk : column.chunks) {
+            for (uint32_t first = 0; first < chunk.quadCount; first += VERTEX_QUADS_PER_INSTANCE) {
+              const uint32_t count = std::min(chunk.quadCount - first, VERTEX_QUADS_PER_INSTANCE);
+              pushGeometry(0u, DEBUG_TINT_CPU, chunk.quadOffset + first, count);
+              commandBuffer.drawIndexed(count * 6u, 1, 0, 0, 0);
+            }
+          }
+        }
+      } else {
+        drawClusters(cpuChunkSlots.highWater() * QUAD_CLUSTERS_PER_CHUNK, DEBUG_TINT_CPU);
+      }
+    }
+    recordOutline(commandBuffer);
     commandBuffer.endRendering();
-    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
-      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool,
-                                    firstQuery + 4u);
+    if (!useVertexPulling && hzbOcclusionEnabled) {
+      recordHzb(commandBuffer, imageIndex);
     }
 
     const auto fragmentStage = vk::PipelineStageFlagBits2::eFragmentShader;
@@ -1792,14 +3069,11 @@ private:
                                 &taaParams);
     commandBuffer.draw(3, 1, 0, 0);
     commandBuffer.endRendering();
-    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
-      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool,
-                                    firstQuery + 5u);
-    }
 
     transition_image_layout(*taaHistoryImages[taaHistoryWriteIndex], vk::ImageLayout::eColorAttachmentOptimal,
                             vk::ImageLayout::eShaderReadOnlyOptimal, colorWrite, vk::AccessFlagBits2::eShaderRead,
                             colorOutputStage, fragmentStage, vk::ImageAspectFlagBits::eColor);
+    recordOverlay(commandBuffer, imageIndex);
     transition_image_layout(swapChainImages[imageIndex], vk::ImageLayout::eColorAttachmentOptimal,
                             vk::ImageLayout::ePresentSrcKHR, colorWrite, {}, colorOutputStage,
                             vk::PipelineStageFlagBits2::eBottomOfPipe, vk::ImageAspectFlagBits::eColor);
@@ -1810,82 +3084,186 @@ private:
   }
 
   void recordChunkCompute(vk::raii::CommandBuffer &commandBuffer) {
-    const uint32_t firstQuery = frameIndex * GPU_TIMESTAMP_COUNT;
-    if (!chunkBuffersDirty) {
-      if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
-        commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 1u);
-        commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 2u);
-        commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 3u);
-      }
+    const bool remesh = chunkBuffersDirty;
+    // A full rebuild starts from an empty buffer, so it leaves nothing to compact.
+    const bool compact = compactQuadsPending && !(remesh && remeshPlan.fullRebuild);
+    compactQuadsPending = false;
+    if (!remesh && !compact) {
       return;
     }
 
     vk::MemoryBarrier2 beforeWrite{
-        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eMeshShaderEXT |
-                        vk::PipelineStageFlagBits2::eDrawIndirect,
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTaskShaderEXT |
+                        vk::PipelineStageFlagBits2::eMeshShaderEXT | vk::PipelineStageFlagBits2::eVertexShader |
+                        vk::PipelineStageFlagBits2::eFragmentShader | vk::PipelineStageFlagBits2::eDrawIndirect,
         .srcAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
                          vk::AccessFlagBits2::eIndirectCommandRead,
         .dstStageMask = vk::PipelineStageFlagBits2::eTransfer | vk::PipelineStageFlagBits2::eComputeShader,
         .dstAccessMask = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite};
     commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &beforeWrite});
-    commandBuffer.fillBuffer(*quadCountBuffer, 0, sizeof(uint32_t), 0);
+    const auto computeAfterCompute = [&] {
+      vk::MemoryBarrier2 barrier{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                                 .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                                 .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                                 .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite};
+      commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+    };
 
-    vk::MemoryBarrier2 counterResetBarrier{.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                                           .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-                                           .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                                           .dstAccessMask =
-                                               vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite};
-    commandBuffer.pipelineBarrier2(
-        vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &counterResetBarrier});
+    if (remesh && remeshPlan.fullRebuild) {
+      // Every slot is new: start from an empty quad buffer and clusters with no quads.
+      commandBuffer.fillBuffer(*quadCountBuffer, 0, 2u * sizeof(uint32_t), 0);
+      commandBuffer.fillBuffer(*quadClusterBuffer, 0, vk::WholeSize, 0);
+      vk::MemoryBarrier2 clearDone{.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                   .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                                   .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                                   .dstAccessMask =
+                                       vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite};
+      commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &clearDone});
+    }
 
     commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *chunkComputePipelineLayout, 0,
                                      *chunkComputeDescriptorSets[frameIndex], nullptr);
-    const ChunkComputeParams computeParams{chunkComputeCount, static_cast<uint32_t>(visibleChunkSet.size())};
+    // Without a remesh this frame, remeshPlan is the last one (already done): run none of its passes.
+    const ChunkComputeParams computeParams{
+        .horizontalChunkCount = remesh ? static_cast<uint32_t>(remeshPlan.newColumns.size()) : 0u,
+        .retireCount = remesh ? static_cast<uint32_t>(remeshPlan.retiredColumns.size()) : 0u,
+        .workPoolCapacity = workPoolCapacity,
+        .unused = 0u,
+        .layerBlocks = terrainLayerBlocks,
+        .layerFillerBlocks = terrainLayerFillerBlocks,
+        .layerDeepBlocks = terrainLayerDeepBlocks,
+        .zBase = 0u};
     commandBuffer.pushConstants(*chunkComputePipelineLayout, vk::ShaderStageFlagBits::eCompute, 0,
                                 sizeof(computeParams), &computeParams);
+    // One item per Z group, split into batches under the device's Z group limit (65535 or more), each pushing its
+    // first item as zBase. Ends with zBase back at 0.
+    const uint32_t maxGroupsZ = std::min(physicalDevice.getProperties().limits.maxComputeWorkGroupCount[2], 65535u);
+    const auto dispatchBatchedZ = [&](uint32_t groupsX, uint32_t groupsY, uint32_t items) {
+      for (uint32_t base = 0; base < items; base += maxGroupsZ) {
+        if (base != 0u) {
+          commandBuffer.pushConstants(*chunkComputePipelineLayout, vk::ShaderStageFlagBits::eCompute,
+                                      offsetof(ChunkComputeParams, zBase), sizeof(uint32_t), &base);
+        }
+        commandBuffer.dispatch(groupsX, groupsY, std::min(items - base, maxGroupsZ));
+      }
+      if (items > maxGroupsZ) {
+        const uint32_t zero = 0u;
+        commandBuffer.pushConstants(*chunkComputePipelineLayout, vk::ShaderStageFlagBits::eCompute,
+                                    offsetof(ChunkComputeParams, zBase), sizeof(uint32_t), &zero);
+      }
+    };
+    // finalizeWork's arguments, read by the next indirect dispatch.
+    const auto indirectAfterCompute = [&] {
+      vk::MemoryBarrier2 barrier{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                                 .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                                 .dstStageMask = vk::PipelineStageFlagBits2::eDrawIndirect |
+                                                 vk::PipelineStageFlagBits2::eComputeShader,
+                                 .dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead |
+                                                  vk::AccessFlagBits2::eShaderRead |
+                                                  vk::AccessFlagBits2::eShaderWrite};
+      commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+    };
 
+    if (remesh && remeshPlan.fullRebuild) {
+      // Every work slot back on the free stack (no column holds one after the clears above).
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *initWorkPoolPipeline);
+      commandBuffer.dispatch((workPoolCapacity + 255u) / 256u, 1, 1);
+      indirectAfterCompute(); // also resets the high water that compactQuads / finalizeWork read
+    }
+    // Retire before allocating: new columns may reuse the freed work slots. Retired clusters drop to zero quads, so
+    // compactQuads (which walks every slot below the high water) skips them.
+    if (computeParams.retireCount != 0u) {
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *retireWorkPipeline);
+      dispatchBatchedZ(QUAD_CLUSTERS_PER_CHUNK, static_cast<uint32_t>(world::kMaxColumnChunks),
+                       computeParams.retireCount);
+      computeAfterCompute();
+    }
+    if (compact) {
+      // QuadCount[0] restarts at 0 and compactQuads bumps it to the packed size; QuadCount[1] (live) is unchanged.
+      vk::MemoryBarrier2 countWritable{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                                       .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                                       .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                       .dstAccessMask = vk::AccessFlagBits2::eTransferWrite};
+      commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &countWritable});
+      commandBuffer.fillBuffer(*quadCountBuffer, 0, sizeof(uint32_t), 0);
+      vk::MemoryBarrier2 countCleared{.srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                      .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                                      .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                                      .dstAccessMask =
+                                          vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite};
+      commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &countCleared});
+      // Pack the live work slots below the live count first, so the high water drops back to it.
+      const uint32_t poolGroups = (workPoolCapacity + 255u) / 256u;
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *collectRelocationsPipeline);
+      commandBuffer.dispatch(poolGroups, 1, 1);
+      computeAfterCompute();
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *relocateSlotsPipeline);
+      commandBuffer.dispatch(poolGroups, 1, 1);
+      computeAfterCompute();
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *rebuildFreeStackPipeline);
+      commandBuffer.dispatch(poolGroups, 1, 1);
+      computeAfterCompute();
+      // Over the work slots below the old high water, as of the last finalizeWork: the ones past the new one are
+      // empty now, so they add nothing.
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *compactQuadsPipeline);
+      commandBuffer.dispatchIndirect(*workPoolBuffer, WORK_POOL_COMPACT_ARGS_OFFSET);
+      computeAfterCompute();
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *copyCompactedQuadsPipeline);
+      commandBuffer.dispatch(COPY_COMPACTED_GROUPS, 1, 1);
+      computeAfterCompute();
+    }
     if (computeParams.horizontalChunkCount != 0u) {
+      // Noise once per column: heights plus their range per group...
       commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *generateHeightsPipeline);
-      commandBuffer.dispatch(5, 5, computeParams.horizontalChunkCount);
-
-      vk::MemoryBarrier2 heightReadyBarrier{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                                            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
-                                            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                                            .dstAccessMask = vk::AccessFlagBits2::eShaderRead};
-      commandBuffer.pipelineBarrier2(
-          vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &heightReadyBarrier});
+      dispatchBatchedZ(HEIGHT_GROUPS_PER_COLUMN, 1, computeParams.horizontalChunkCount);
+      computeAfterCompute();
+      // ...then only the vertical chunks those heights reach get work slots and meshColumns items.
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *allocateWorkPipeline);
+      commandBuffer.dispatch((computeParams.horizontalChunkCount + 63u) / 64u, 1, 1);
+      computeAfterCompute();
     }
-    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
-      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 1u);
-    }
-
-    if (chunkComputeCount != 0u) {
-      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *meshColumnsPipeline);
-      commandBuffer.dispatch(4, 4, chunkComputeCount);
-    }
-    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
-      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 2u);
-    }
-
-    vk::MemoryBarrier2 counterReadyBarrier{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                                           .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
-                                           .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                                           .dstAccessMask = vk::AccessFlagBits2::eShaderRead};
-    commandBuffer.pipelineBarrier2(
-        vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &counterReadyBarrier});
-
-    commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *finalizeMeshPipeline);
+    // Also after a compaction alone: the high water may have dropped, and the relocation counters need resetting.
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *finalizeWorkPipeline);
     commandBuffer.dispatch(1, 1, 1);
-    if (gpuTimestampsEnabled && Profiler::instance().enabled()) {
-      commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *timestampQueryPool, firstQuery + 3u);
+    indirectAfterCompute();
+    if (remesh) {
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *meshColumnsPipeline);
+      // One 8x8-column tile (one QuadCluster) per group. Two or four tiles per group measured the same or slower:
+      // the pass is bound by registers and latency, not by the per-SM group limit.
+      commandBuffer.dispatchIndirect(*workPoolBuffer, WORK_POOL_MESH_ARGS_OFFSET);
     }
+
+    vk::MemoryBarrier2 quadCountReady{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                                      .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                                      .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                                      .dstAccessMask = vk::AccessFlagBits2::eShaderRead};
+    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &quadCountReady});
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *finalizeVertexDrawPipeline);
+    commandBuffer.dispatch(1, 1, 1);
 
     vk::MemoryBarrier2 meshReadyBarrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eMeshShaderEXT | vk::PipelineStageFlagBits2::eDrawIndirect,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTaskShaderEXT | vk::PipelineStageFlagBits2::eMeshShaderEXT |
+                        vk::PipelineStageFlagBits2::eVertexShader | vk::PipelineStageFlagBits2::eDrawIndirect,
         .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eIndirectCommandRead};
     commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &meshReadyBarrier});
+
+    // Quad counts back to the CPU (read once this frame's fence signals) to decide on compaction.
+    vk::MemoryBarrier2 countReadable{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+                                     .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+                                     .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                     .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &countReadable});
+    commandBuffer.copyBuffer(*quadCountBuffer, *quadCountReadbackBuffers[frameIndex],
+                             vk::BufferCopy{0, 0, 2u * sizeof(uint32_t)});
+    commandBuffer.copyBuffer(*workPoolBuffer, *quadCountReadbackBuffers[frameIndex],
+                             vk::BufferCopy{0, 2u * sizeof(uint32_t), 4u * sizeof(uint32_t)});
+    if (compact || (remesh && remeshPlan.fullRebuild)) {
+      ++quadCountEpoch; // counts read back from earlier frames predate this
+    }
+    quadCountReadbackPending[frameIndex] = true;
+    quadCountReadbackEpoch[frameIndex] = quadCountEpoch;
     chunkBuffersDirty = false;
   }
 
@@ -1931,52 +3309,6 @@ private:
     }
   }
 
-  void createTimestampQueryPool() {
-    if (timestampValidBits == 0) {
-      return;
-    }
-
-    timestampQueryPool = vk::raii::QueryPool(
-        device, vk::QueryPoolCreateInfo{.queryType = vk::QueryType::eTimestamp,
-                                        .queryCount = GPU_TIMESTAMP_COUNT * MAX_FRAMES_IN_FLIGHT});
-    gpuTimestampsEnabled = true;
-  }
-
-  void collectGpuTimestamps(uint32_t frame) {
-    if (!gpuTimestampsEnabled || !timestampQueriesPending[frame]) {
-      return;
-    }
-    if (!Profiler::instance().enabled()) {
-      timestampQueriesPending[frame] = false;
-      return;
-    }
-
-    const uint32_t firstQuery = frame * GPU_TIMESTAMP_COUNT;
-    auto [result, timestamps] = timestampQueryPool.getResults<std::uint64_t>(
-        firstQuery, GPU_TIMESTAMP_COUNT, sizeof(std::uint64_t) * GPU_TIMESTAMP_COUNT, sizeof(std::uint64_t),
-        vk::QueryResultFlagBits::e64);
-    if (result != vk::Result::eSuccess) {
-      throw std::runtime_error("failed to read GPU timestamp queries");
-    }
-
-    const std::uint64_t validMask =
-        timestampValidBits == 64 ? std::numeric_limits<std::uint64_t>::max() : (1ull << timestampValidBits) - 1ull;
-    const auto recordElapsed = [&](uint32_t start, uint32_t end, Profiler::Metric metric) {
-      const auto elapsedTicks = (timestamps[end] - timestamps[start]) & validMask;
-      const auto elapsedNanoseconds = static_cast<std::uint64_t>(elapsedTicks * timestampPeriod);
-      Profiler::instance().recordNanoseconds(metric, elapsedNanoseconds);
-    };
-    recordElapsed(0, 3, Profiler::Metric::GpuCompute);
-    if (timestampQueriesHadChunkUpdates[frame]) {
-      recordElapsed(0, 3, Profiler::Metric::GpuComputeUpdate);
-      recordElapsed(0, 1, Profiler::Metric::GpuHeightGeneration);
-      recordElapsed(1, 2, Profiler::Metric::GpuMeshGeneration);
-      recordElapsed(2, 3, Profiler::Metric::GpuFinalize);
-    }
-    recordElapsed(3, 4, Profiler::Metric::GpuScene);
-    recordElapsed(4, 5, Profiler::Metric::GpuTaa);
-    timestampQueriesPending[frame] = false;
-  }
 #pragma endregion
 #pragma endregion
 
@@ -1996,7 +3328,6 @@ private:
 
 #pragma region Uniform Update
   void updateUniformBuffer(uint32_t currentImage) {
-    Profiler::Scope profile(Profiler::Metric::UniformUpdate);
     static auto lastTime = std::chrono::steady_clock::now();
 
     const auto currentTime = std::chrono::steady_clock::now();
@@ -2004,11 +3335,18 @@ private:
     lastTime = currentTime;
 
     UniformBufferObject ubo{};
-    const glm::mat4 view = camera.update(window, deltaTime);
+    camera.updateLook(window);
+    player.update(window, deltaTime, camera, *cpuWorld);
+    const glm::vec3 eye = player.eyePosition();
+    const glm::mat4 view = camera.view(eye);
+    updateBlockBreaking(eye); // before updateCpuWorld, which uploads the remeshed chunks this frame
 
     const glm::mat4 model = glm::mat4(1.0f);
     const bool zoomed = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
+    // LODs and the clipmap use the base FOV; the sprint widening (player.fovMultiplier) only touches the projection,
+    // so its animation doesn't rebuild the clipmap every frame.
     const float fov = zoomed ? 2.0f * std::atan(std::tan(BASE_FOV_RADIANS * 0.5f) * 0.5f) : BASE_FOV_RADIANS;
+    const float projectionFov = fov * player.fovMultiplier();
     if (fov != cachedLodFov || swapChainExtent.width != cachedLodExtent.width ||
         swapChainExtent.height != cachedLodExtent.height) {
       lodDistanceSquared =
@@ -2020,23 +3358,34 @@ private:
     const glm::vec3 cameraRight = glm::normalize(glm::cross(camera.front(), worldUp));
     const glm::vec3 cameraUp = glm::normalize(glm::cross(cameraRight, camera.front()));
     const float aspectRatio = static_cast<float>(swapChainExtent.width) / static_cast<float>(swapChainExtent.height);
-    const ClipmapView clipmapView{{camera.position().x, camera.position().y, camera.position().z},
+    const ClipmapView clipmapView{{eye.x, eye.y, eye.z},
                                   {camera.front().x, camera.front().y, camera.front().z},
                                   {cameraRight.x, cameraRight.y, cameraRight.z},
                                   {cameraUp.x, cameraUp.y, cameraUp.z},
                                   lodDistanceSquared,
                                   fov,
-                                  aspectRatio};
+                                  aspectRatio,
+                                  useVertexPulling,
+                                  cpuAdvertisedCenter};
     updateVisibleClipmap(clipmapView);
+    updateCpuWorld(eye, currentImage);
     if (chunkBuffersDirty) {
-      std::memcpy(chunkCoordinateBuffersMapped[currentImage], visibleChunkSet.data(),
-                  visibleChunkSet.size() * sizeof(world::ChunkLod));
-      std::memcpy(chunkWorkBuffersMapped[currentImage], visibleChunkWork.data(),
-                  visibleChunkWork.size() * sizeof(visibleChunkWork[0]));
+      remeshPlan = chunkSlots.update(visibleChunkSet, visibleChunkNeighborLods, forceFullRebuild);
+      forceFullRebuild = false;
+      // Slot-indexed column data is rewritten whole: this frame's copy is the one the remesh reads.
+      std::memcpy(chunkCoordinateBuffersMapped[currentImage], chunkSlots.slotCoords().data(),
+                  chunkSlots.columnSlotCount() * sizeof(world::ChunkLod));
+      std::memcpy(chunkNeighborLodBuffersMapped[currentImage], chunkSlots.slotNeighborLods().data(),
+                  chunkSlots.columnSlotCount() * sizeof(uint32_t));
+      std::memcpy(columnListBuffersMapped[currentImage], remeshPlan.newColumns.data(),
+                  remeshPlan.newColumns.size() * sizeof(uint32_t));
+      std::memcpy(retireListBuffersMapped[currentImage], remeshPlan.retiredColumns.data(),
+                  remeshPlan.retiredColumns.size() * sizeof(uint32_t));
     }
 
     glm::mat4 proj = glm::perspective(
-        fov, static_cast<float>(swapChainExtent.width) / static_cast<float>(swapChainExtent.height), 0.1f, 1000000.0f);
+        projectionFov, static_cast<float>(swapChainExtent.width) / static_cast<float>(swapChainExtent.height), 0.1f,
+        1000000.0f);
     const uint32_t jitterSample = (taaJitterIndex++ % 8u) + 1u;
     const float jitterX = TAA_ENABLED ? (halton(jitterSample, 2u) - 0.5f) * TAA_JITTER_PIXELS : 0.0f;
     const float jitterY = TAA_ENABLED ? (halton(jitterSample, 3u) - 0.5f) * TAA_JITTER_PIXELS : 0.0f;
@@ -2045,15 +3394,18 @@ private:
     ubo.mvp = proj * view * model;
     ubo.previousMvp = previousMvpValid ? previousMvp : ubo.mvp;
     ubo.renderSize = {static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height)};
-    ubo.quadCount = 0;
+    // Slots are final for this frame here (the remesh, if any, is recorded below in the same frame).
+    ubo.clusterCount = workPoolCapacity * QUAD_CLUSTERS_PER_CHUNK;
     ubo.historyValid = TAA_ENABLED && taaHistoryValid ? 1u : 0u;
     ubo.lodAoLighteningPerLevel = LOD_AO_LIGHTENING_PER_LEVEL;
-    ubo.cameraPosition = glm::vec4(camera.position(), 0.0f);
-    for (size_t blockType = 0; blockType < blockTextureIndices.size(); ++blockType) {
-      for (size_t normal = 0; normal < blockTextureIndices[blockType].size(); ++normal) {
-        ubo.blockFaceTextures[blockType * 2 + normal / 4][normal % 4] = blockTextureIndices[blockType][normal];
-      }
+    ubo.cameraPosition = glm::vec4(eye, 0.0f);
+    ubo.viewRayScale = {1.0f / proj[0][0], 1.0f / proj[1][1], 0.0f, 0.0f};
+    // Only the mesh path builds the Hi-Z; after a vertex-path frame it no longer matches previousMvp.
+    if (useVertexPulling || !hzbOcclusionEnabled) {
+      hzbValid = false;
     }
+    ubo.hzbParams = {static_cast<float>(hzbSize.width), static_cast<float>(hzbSize.height),
+                     static_cast<float>(hzbMipCount), hzbValid ? 1.0f : 0.0f};
 
     memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
     previousMvp = ubo.mvp;
@@ -2063,19 +3415,45 @@ private:
 
 #pragma region Frame Submit
   void drawFrame() {
-    Profiler::Scope frameProfile(Profiler::Metric::Frame);
     // Note: inFlightFences, presentCompleteSemaphores, and commandBuffers are
     // indexed by frameIndex,
     //       while renderFinishedSemaphores is indexed by imageIndex
     vk::Result result;
     uint32_t imageIndex;
     {
-      Profiler::Scope profile(Profiler::Metric::SyncAndAcquire);
       const auto fenceResult = device.waitForFences(*inFlightFences[frameIndex], vk::True, UINT64_MAX);
       if (fenceResult != vk::Result::eSuccess) {
         throw std::runtime_error("failed to wait for fence!");
       }
-      collectGpuTimestamps(frameIndex);
+      if (quadCountReadbackPending[frameIndex]) {
+        quadCountReadbackPending[frameIndex] = false;
+        const uint32_t appended = quadCountReadbackMapped[frameIndex][0];
+        const uint32_t live = quadCountReadbackMapped[frameIndex][1];
+        const uint32_t freeSlots = quadCountReadbackMapped[frameIndex][2];
+        const uint32_t slotHighWater = quadCountReadbackMapped[frameIndex][3];
+        const uint32_t workPoolOverflow = quadCountReadbackMapped[frameIndex][5];
+        const uint32_t liveSlots = workPoolCapacity > freeSlots ? workPoolCapacity - freeSlots : 0u;
+        // Retired slots leave holes the draw and compaction still walk; packing them (with the quads) once they
+        // pass a quarter of the live slots keeps that bounded.
+        const bool slotsSparse = slotHighWater > liveSlots + liveSlots / 4u + 1024u;
+        const uint32_t dead = appended > live ? appended - live : 0u;
+        const uint32_t deadLimit = useVertexPulling ? live / 4u : live;
+        const bool garbageHeavy = dead > deadLimit && dead > REBUILD_MIN_DEAD_QUADS;
+        const bool nearlyFull = appended > MAX_QUAD_COUNT / 4u * 3u && live < MAX_QUAD_COUNT / 2u;
+        if (quadCountReadbackEpoch[frameIndex] != quadCountEpoch) {
+          // Recorded before the last compaction or rebuild: these counts no longer describe QuadBuffer.
+        } else if (workPoolOverflow != 0u) {
+          // allocateWork ran out of work slots and dropped chunks: a bigger pool, and a rebuild to fill it. Failed pops
+          // still took their count off the stack top, so capacity - top (top gone negative) is everything asked for.
+          const int64_t top = static_cast<int32_t>(freeSlots);
+          growWorkPool(static_cast<uint64_t>(std::max<int64_t>(int64_t{workPoolCapacity} - top, 0)));
+        } else if (appended > MAX_QUAD_COUNT) {
+          forceFullRebuild = true;
+          chunkBuffersDirty = true;
+        } else if (garbageHeavy || nearlyFull || slotsSparse) {
+          compactQuadsPending = true;
+        }
+      }
 
       auto [acquireResult, acquiredImageIndex] =
           swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
@@ -2098,7 +3476,6 @@ private:
     device.resetFences(*inFlightFences[frameIndex]);
 
     commandBuffers[frameIndex].reset();
-    timestampQueriesHadChunkUpdates[frameIndex] = chunkBuffersDirty;
     recordCommandBuffer(imageIndex);
 
     vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
@@ -2110,9 +3487,7 @@ private:
                                     .signalSemaphoreCount = 1,
                                     .pSignalSemaphores = &*renderFinishedSemaphores[imageIndex]};
     {
-      Profiler::Scope profile(Profiler::Metric::SubmitAndPresent);
       queue.submit(submitInfo, *inFlightFences[frameIndex]);
-      timestampQueriesPending[frameIndex] = gpuTimestampsEnabled && Profiler::instance().enabled();
 
       const vk::PresentInfoKHR presentInfoKHR{.waitSemaphoreCount = 1,
                                               .pWaitSemaphores = &*renderFinishedSemaphores[imageIndex],

@@ -1,2 +1,3 @@
 ColumnLimit: 120
 ContinuationIndentWidth: 4
+AllowShortFunctionsOnASingleLine: All
