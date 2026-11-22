@@ -3,7 +3,9 @@
 //
 //   elevation     value noise (lattice values +-1, smootherstep), wavelengths 4096..256, +-253: continents and
 //                 ocean basins. Shaped by baseProfile: land into wide plains, ocean into shelf / slope / abyss
-//   hills         4 Perlin octaves of rolling hills on land, faded out at beaches and lakes
+//   hills         4 Perlin octaves of rolling hills on land, faded out at beaches
+//   land floor    where the continent layer (the elevation's 4096 wavelength) says land, the surface is smoothly
+//                 floored at y = 1, so inland basins, gullies and hills never dip below sea level
 //   mountains     grouped into ranges. A gradient-noise field r has long winding zero lines; each is a range
 //                 spine, with mountains in a belt around it and lower foothills to either side. A regional mask
 //                 leaves wide areas with no ranges, and a second noise varies peaks and passes along a range
@@ -47,6 +49,13 @@ static const float SHELF_DEPTH = 30.0f;
 static const float SLOPE_EXTENT = 40.0f; // continental slope: steep drop of SLOPE_DEPTH
 static const float SLOPE_DEPTH = 200.0f;
 static const float ABYSS_DEPTH = 40.0f; // abyssal plain: deepens by this much over the rest of the range
+
+// Land never dips below sea level: only the coarsest elevation layer (the continent, wavelength 4096) decides land vs
+// ocean, and where it says land the surface is smoothly floored at LAND_FLOOR. The floor fades in over COAST_BAND
+// units of continent elevation, on the land side of the coast, so sea level dips only remain right at the coast.
+static const float LAND_FLOOR = 1.0f;
+static const float LAND_FLOOR_SMOOTHING = 4.0f; // blocks over which the floor blends into the surface above it
+static const float COAST_BAND = 24.0f;
 
 static const float EROSION_AMPLITUDE = 128.0f;
 static const float EROSION_MAX_WAVELENGTH = 512.0f;
@@ -141,15 +150,21 @@ float3 binaryNoise(float2 worldPos, float wavelength, uint seed) {
 }
 
 // Sum of binaryNoise layers: wavelength halves and amplitude scales by 0.4 per layer. Layers shorter than two
-// voxels are skipped (the first always runs).
-float3 layeredNoise(float2 worldPos, float wavelength, float amplitude, uint layers, uint seed, int lodScale) {
+// voxels are skipped (the first always runs). firstLayer receives the first layer's value alone.
+float3 layeredNoise(float2 worldPos, float wavelength, float amplitude, uint layers, uint seed, int lodScale,
+                    out float firstLayer) {
   const float minWavelength = 2.0f * float(lodScale);
   float3 sum = 0.0f;
+  firstLayer = 0.0f;
   for (uint i = 0u; i < layers; ++i) {
     if (i > 0u && wavelength < minWavelength) {
       break;
     }
-    sum += amplitude * binaryNoise(worldPos, wavelength, seed + i * SEED_LAYER_STEP);
+    const float3 layer = amplitude * binaryNoise(worldPos, wavelength, seed + i * SEED_LAYER_STEP);
+    if (i == 0u) {
+      firstLayer = layer.x;
+    }
+    sum += layer;
     wavelength *= 0.5f;
     amplitude *= 0.4f;
   }
@@ -313,7 +328,8 @@ float3 mountainRanges(float2 p, int lodScale) {
 float sampleTerrainHeight(int worldX, int worldZ, int lodScale) {
   const float2 p = float2(float(worldX), float(worldZ));
 
-  const float3 elevation = layeredNoise(p, 4096.0f, 153.6f, 5u, SEED_ELEVATION, lodScale);
+  float continentLayer;
+  const float3 elevation = layeredNoise(p, 4096.0f, 153.6f, 5u, SEED_ELEVATION, lodScale, continentLayer);
   const float3 base = baseProfile(elevation.x + ELEVATION_BIAS);
   const float3 mountains = mountainRanges(p, lodScale);
 
@@ -329,7 +345,13 @@ float sampleTerrainHeight(int worldX, int worldZ, int lodScale) {
                             HILL_HEIGHT * (shore.x * hillNoise.yz + hillNoise.x * shore.y * base.z * elevation.yz);
 
   const float erosionAmplitude = EROSION_AMPLITUDE * saturate(mountains.x / MOUNTAIN_HEIGHT * 3.0f);
-  const float surface = erode(p, height, gradHeight, erosionAmplitude, lodScale);
+  const float eroded = erode(p, height, gradHeight, erosionAmplitude, lodScale);
+
+  // Land floor: polynomial smooth max with LAND_FLOOR, faded in from the coast inland.
+  const float landWeight = smoothstepD(0.0f, COAST_BAND, continentLayer + ELEVATION_BIAS).x;
+  const float floorBlend = max(LAND_FLOOR_SMOOTHING - abs(eroded - LAND_FLOOR), 0.0f) / LAND_FLOOR_SMOOTHING;
+  const float floored = max(eroded, LAND_FLOOR) + floorBlend * floorBlend * LAND_FLOOR_SMOOTHING * 0.25f;
+  const float surface = floored * landWeight + eroded * (1.0f - landWeight); // exact floor where landWeight = 1
 
   return clamp(surface, TERRAIN_MIN_HEIGHT, TERRAIN_MAX_HEIGHT);
 }

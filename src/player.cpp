@@ -30,6 +30,18 @@ constexpr double kSneakInputScale = 0.3;
 constexpr double kFlySpeed = 0.05;
 constexpr double kFlyVertical = kFlySpeed * 3.0;
 constexpr double kFlyVerticalDamping = 0.6;
+// Water (vanilla 1.13+ LivingEntity.travel).
+constexpr double kWaterSpeed = 0.02;
+constexpr double kWaterFriction = 0.8;
+constexpr double kSwimFriction = 0.9;
+constexpr double kWaterVerticalDrag = 0.8;
+constexpr double kWaterGravity = 0.005; // kGravity / 16
+constexpr double kWaterVerticalPush = 0.04;
+constexpr double kLedgeJump = 0.3;
+constexpr double kWaterBoxShrink = 0.4;  // grow(0, -0.4, 0)
+constexpr double kEyeWaterOffset = 0.11; // vanilla eye-in-fluid check
+constexpr double kSwimmingHeight = 0.6;
+constexpr float kSwimmingEye = 0.4f;
 constexpr double kDoubleTapSeconds = 0.35; // 7 ticks
 constexpr int kMaxTicksPerFrame = 10;      // after a stall, drop time instead of spiraling
 
@@ -71,7 +83,10 @@ void Player::handleKey(int key, int action) {
   }
 }
 
-double Player::boxHeight() const { return sneaking ? kSneakingHeight : kStandingHeight; }
+double Player::boxHeight() const {
+  if (swimmingPose) return kSwimmingHeight;
+  return sneaking ? kSneakingHeight : kStandingHeight;
+}
 
 glm::vec3 Player::eyePosition() const {
   const double alpha = std::clamp(tickAccumulator / kTickSeconds, 0.0, 1.0);
@@ -99,6 +114,8 @@ void Player::update(GLFWwindow *window, float deltaTime, const Camera &camera, c
     previousPosition = position;
     eyeHeight = kStandingEye;
     fovScale = 1.0f;
+    swimmingPose = false;
+    sneaking = false;
     frozen = false;
     return;
   }
@@ -139,19 +156,39 @@ void Player::update(GLFWwindow *window, float deltaTime, const Camera &camera, c
       break;
     }
     previousPosition = position;
-    tick(input, camera.yaw(), world);
+    tick(input, camera.yaw(), camera.front().y, world);
   }
 
   // Smooth the eye height and FOV toward their targets (per frame, frame-rate independent).
   const float blend = 1.0f - std::exp(-deltaTime * 15.0f);
-  const float targetEye = sneaking && currentMode == Mode::Walking ? kSneakingEye : kStandingEye;
+  const float targetEye = swimmingPose                                ? kSwimmingEye
+                          : sneaking && currentMode == Mode::Walking ? kSneakingEye
+                                                                     : kStandingEye;
   eyeHeight += (targetEye - eyeHeight) * blend;
   const float targetFov = sprinting ? 1.1f : 1.0f;
   fovScale += (targetFov - fovScale) * blend;
 }
 
-void Player::tick(const Input &input, float yawDegrees, const cpuworld::CpuWorld &world) {
+void Player::tick(const Input &input, float yawDegrees, float lookY, const cpuworld::CpuWorld &world) {
   const bool flying = currentMode == Mode::Flying;
+  auto fullBoxFree = [&] {
+    return !boxCollides(position + glm::dvec3(-kHalfWidth, 0.0, -kHalfWidth),
+                        position + glm::dvec3(kHalfWidth, kStandingHeight, kHalfWidth), world);
+  };
+
+  // Water state at the start of the tick: the box shrunk by 0.4 top and bottom (a 0.6 box ends up as [0.2, 0.4]),
+  // and the cell just below the eyes.
+  {
+    double low = position.y + kWaterBoxShrink;
+    double high = position.y + boxHeight() - kWaterBoxShrink;
+    if (low > high) std::swap(low, high);
+    inWater = boxInWater(glm::dvec3(position.x - kHalfWidth, low, position.z - kHalfWidth),
+                         glm::dvec3(position.x + kHalfWidth, high, position.z + kHalfWidth), world);
+    const double eyeY = position.y + static_cast<double>(eyeHeight) - kEyeWaterOffset;
+    eyesInWater = world.isInfiniteSource(static_cast<int>(std::floor(position.x)), static_cast<int>(std::floor(eyeY)),
+                                         static_cast<int>(std::floor(position.z)));
+  }
+  const bool swimPhysics = inWater && !flying;
 
   // Sneaking shrinks the box; standing back up needs room for the full height.
   if (flying) {
@@ -159,16 +196,7 @@ void Player::tick(const Input &input, float yawDegrees, const cpuworld::CpuWorld
   } else if (input.sneak) {
     sneaking = true;
   } else if (sneaking) {
-    const bool blocked = boxCollides(position + glm::dvec3(-kHalfWidth, 0.0, -kHalfWidth),
-                                     position + glm::dvec3(kHalfWidth, kStandingHeight, kHalfWidth), world);
-    sneaking = blocked;
-  }
-
-  double forward = input.forward;
-  double strafe = input.strafe;
-  if (sneaking) {
-    forward *= kSneakInputScale;
-    strafe *= kSneakInputScale;
+    sneaking = !fullBoxFree();
   }
 
   // Sprint: needs forward input; stops on sneaking or running into a wall.
@@ -179,6 +207,22 @@ void Player::tick(const Input &input, float yawDegrees, const cpuworld::CpuWorld
     sprinting = false;
   }
 
+  // Sprint-swim pose: starts when sprinting with the eyes underwater; leaving it needs headroom (else crawl).
+  if (!swimmingPose && sprinting && eyesInWater && !flying) {
+    swimmingPose = true;
+  } else if (swimmingPose && (!sprinting || !inWater || flying)) {
+    swimmingPose = !fullBoxFree();
+  }
+  const bool sprintSwimming = swimmingPose && sprinting && swimPhysics;
+  const bool crawling = swimmingPose && !sprintSwimming && !swimPhysics && !flying;
+
+  double forward = input.forward;
+  double strafe = input.strafe;
+  if ((sneaking && !swimmingPose) || crawling) {
+    forward *= kSneakInputScale;
+    strafe *= kSneakInputScale;
+  }
+
   const double yaw = glm::radians(static_cast<double>(yawDegrees));
   // Camera yaw -90 faces -z; forward is (cos yaw, sin yaw) in x/z, right is (-sin yaw, cos yaw).
   const glm::dvec2 forwardDir(std::cos(yaw), std::sin(yaw));
@@ -187,11 +231,27 @@ void Player::tick(const Input &input, float yawDegrees, const cpuworld::CpuWorld
   if (flying) {
     if (input.sneak) motion.y -= kFlyVertical;
     if (input.jump) motion.y += kFlyVertical;
+  } else if (swimPhysics) {
+    if (input.jump) motion.y += kWaterVerticalPush; // handleFluidJump
+    if (input.sneak) motion.y -= kWaterVerticalPush;
   } else if (input.jump && onGround) {
     motion.y = kJumpVelocity;
     if (sprinting) {
       motion.x += forwardDir.x * kSprintJumpBoost;
       motion.z += forwardDir.y * kSprintJumpBoost;
+    }
+  }
+
+  // Sprint-swimming steers vertically toward the look direction (PlayerEntity.travel). Looking up only pulls you
+  // up while holding Space or with water above the head, so it doesn't launch you out at the surface.
+  if (sprintSwimming) {
+    const double look = static_cast<double>(lookY);
+    const double k = look < -0.2 ? 0.085 : 0.06;
+    const bool waterAbove =
+        world.isInfiniteSource(static_cast<int>(std::floor(position.x)), static_cast<int>(std::floor(position.y + 1.0 - 0.1)),
+                               static_cast<int>(std::floor(position.z)));
+    if (look <= 0.0 || input.jump || waterAbove) {
+      motion.y += (look - motion.y) * k;
     }
   }
 
@@ -201,6 +261,9 @@ void Player::tick(const Input &input, float yawDegrees, const cpuworld::CpuWorld
   if (flying) {
     speed = sprinting ? kFlySpeed * 2.0 : kFlySpeed;
     horizontalFriction = kAirFriction;
+  } else if (swimPhysics) {
+    speed = kWaterSpeed;
+    horizontalFriction = sprintSwimming ? kSwimFriction : kWaterFriction;
   } else if (onGround) {
     const double slipperiness = kGroundSlipperiness * kAirFriction;
     // 0.16277136 / slipperiness^3 == 1 for normal blocks: walking speed comes out as the base movement speed.
@@ -220,24 +283,51 @@ void Player::tick(const Input &input, float yawDegrees, const cpuworld::CpuWorld
     motion.z += forwardDir.y * f + rightDir.y * s;
   }
 
-  move(motion, sneaking && onGround && !flying, world);
+  move(motion, (sneaking || crawling) && onGround && !flying && !inWater, world);
 
   if (flying) {
     motion.y *= kFlyVerticalDamping;
     if (onGround) {
       currentMode = Mode::Walking; // landing ends flight
     }
+  } else if (swimPhysics) {
+    motion.y *= kWaterVerticalDrag;
+    if (!sprintSwimming) {
+      motion.y -= kWaterGravity;
+    }
   } else {
     motion.y = (motion.y - kGravity) * kVerticalDrag;
   }
   motion.x *= horizontalFriction;
   motion.z *= horizontalFriction;
+
+  // Swimming into a ledge: hop out if the box raised by 0.6 (plus this tick's motion) is free and dry.
+  if (swimPhysics && collidedHorizontally) {
+    const glm::dvec3 offset(motion.x, motion.y + 0.6 - (position.y - previousPosition.y), motion.z);
+    const glm::dvec3 boxMin = position + offset + glm::dvec3(-kHalfWidth, 0.0, -kHalfWidth);
+    const glm::dvec3 boxMax = position + offset + glm::dvec3(kHalfWidth, boxHeight(), kHalfWidth);
+    if (!boxCollides(boxMin, boxMax, world) && !boxInWater(boxMin, boxMax, world)) {
+      motion.y = kLedgeJump;
+    }
+  }
+
   // Minecraft zeroes tiny velocities so the player comes to a full stop.
   for (int axis = 0; axis < 3; ++axis) {
     if (std::abs(motion[axis]) < 0.003) {
       motion[axis] = 0.0;
     }
   }
+}
+
+bool Player::overlapsBlock(int x, int y, int z) const {
+  if (currentMode == Mode::Spectator) {
+    return false;
+  }
+  constexpr double eps = 1.0e-7;
+  const glm::dvec3 boxMin = position + glm::dvec3(-kHalfWidth, 0.0, -kHalfWidth);
+  const glm::dvec3 boxMax = position + glm::dvec3(kHalfWidth, boxHeight(), kHalfWidth);
+  return boxMin.x < x + 1 - eps && boxMax.x > x + eps && boxMin.y < y + 1 - eps && boxMax.y > y + eps &&
+         boxMin.z < z + 1 - eps && boxMax.z > z + eps;
 }
 
 bool Player::boxCollides(const glm::dvec3 &minCorner, const glm::dvec3 &maxCorner,
@@ -249,7 +339,20 @@ bool Player::boxCollides(const glm::dvec3 &minCorner, const glm::dvec3 &maxCorne
   for (int y = y0; y <= y1; ++y)
     for (int z = z0; z <= z1; ++z)
       for (int x = x0; x <= x1; ++x)
-        if (world.isSolid(x, y, z)) return true;
+        if (world.isCollidable(x, y, z)) return true;
+  return false;
+}
+
+bool Player::boxInWater(const glm::dvec3 &minCorner, const glm::dvec3 &maxCorner,
+                        const cpuworld::CpuWorld &world) const {
+  constexpr double eps = 1.0e-7;
+  const int x0 = static_cast<int>(std::floor(minCorner.x + eps)), x1 = static_cast<int>(std::floor(maxCorner.x - eps));
+  const int y0 = static_cast<int>(std::floor(minCorner.y + eps)), y1 = static_cast<int>(std::floor(maxCorner.y - eps));
+  const int z0 = static_cast<int>(std::floor(minCorner.z + eps)), z1 = static_cast<int>(std::floor(maxCorner.z - eps));
+  for (int y = y0; y <= y1; ++y)
+    for (int z = z0; z <= z1; ++z)
+      for (int x = x0; x <= x1; ++x)
+        if (world.isInfiniteSource(x, y, z)) return true;
   return false;
 }
 
@@ -292,7 +395,7 @@ void Player::move(glm::dvec3 delta, bool sneakGuard, const cpuworld::CpuWorld &w
     for (int y = y0; y <= y1; ++y)
       for (int z = z0; z <= z1; ++z)
         for (int x = x0; x <= x1; ++x) {
-          if (!world.isSolid(x, y, z)) continue;
+          if (!world.isCollidable(x, y, z)) continue;
           const glm::dvec3 blockMin(x, y, z);
           const glm::dvec3 blockMax = blockMin + 1.0;
           if (d > 0.0 && blockMin[axis] >= boxMax[axis] - eps) {

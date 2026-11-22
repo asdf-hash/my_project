@@ -26,6 +26,9 @@ constexpr float PLAINS_HEIGHT = 70.0f;
 constexpr float PLAINS_SCALE = 180.0f;
 constexpr float BEACH_LIFT = 2.0f; // see terrain_noise.hlsl
 constexpr float ELEVATION_BIAS = 35.0f + BEACH_LIFT * PLAINS_SCALE / PLAINS_HEIGHT;
+constexpr float LAND_FLOOR = 1.0f;
+constexpr float LAND_FLOOR_SMOOTHING = 4.0f;
+constexpr float COAST_BAND = kCoastBand;
 constexpr float HILL_WAVELENGTH = 380.0f;
 constexpr float HILL_HEIGHT = 32.0f;
 constexpr float HILL_SHORE_FADE = 48.0f;
@@ -102,13 +105,18 @@ N3 binaryNoise(const V2 &p, float wavelength, uint32_t seed) {
 }
 
 // lodScale is always 1 on the CPU: minWavelength = 2.
-N3 layeredNoise(const V2 &p, float wavelength, float amplitude, uint32_t layers, uint32_t seed) {
+N3 layeredNoise(const V2 &p, float wavelength, float amplitude, uint32_t layers, uint32_t seed, F8 &firstLayer) {
   N3 sum{0.0f, 0.0f, 0.0f};
+  firstLayer = F8(0.0f);
   for (uint32_t i = 0; i < layers; ++i) {
     if (i > 0u && wavelength < 2.0f) {
       break;
     }
-    sum = sum + F8(amplitude) * binaryNoise(p, wavelength, seed + i * SEED_LAYER_STEP);
+    const N3 layer = F8(amplitude) * binaryNoise(p, wavelength, seed + i * SEED_LAYER_STEP);
+    if (i == 0u) {
+      firstLayer = layer.v;
+    }
+    sum = sum + layer;
     wavelength *= 0.5f;
     amplitude *= 0.4f;
   }
@@ -343,7 +351,8 @@ N3 mountainRanges(const V2 &p) {
 }
 
 F8 sampleTerrainHeight(const V2 &p) {
-  const N3 elevation = layeredNoise(p, 4096.0f, 153.6f, 5u, SEED_ELEVATION);
+  F8 continentLayer;
+  const N3 elevation = layeredNoise(p, 4096.0f, 153.6f, 5u, SEED_ELEVATION, continentLayer);
   const N3 base = baseProfile(elevation.v + F8(ELEVATION_BIAS));
   const N3 mountains = mountainRanges(p);
 
@@ -360,7 +369,14 @@ F8 sampleTerrainHeight(const V2 &p) {
   const F8 erosionAmplitude = F8(EROSION_AMPLITUDE) * simd::saturate(mountains.v / F8(MOUNTAIN_HEIGHT) * 3.0f);
   // Erosion adds wave * mask * amplitude: with zero amplitude in every lane it can't change the height, so skip it
   // (most land has no mountains).
-  const F8 surface = simd::any(erosionAmplitude > F8(0.0f)) ? erode(p, height, gradX, gradZ, erosionAmplitude) : height;
+  const F8 eroded = simd::any(erosionAmplitude > F8(0.0f)) ? erode(p, height, gradX, gradZ, erosionAmplitude) : height;
+
+  // Land floor (terrain_noise.hlsl): polynomial smooth max with LAND_FLOOR, faded in from the coast inland.
+  const F8 landWeight = smoothstepD(0.0f, COAST_BAND, continentLayer + F8(ELEVATION_BIAS)).v;
+  const F8 floorBlend =
+      simd::max(F8(LAND_FLOOR_SMOOTHING) - simd::abs(eroded - F8(LAND_FLOOR)), F8(0.0f)) / F8(LAND_FLOOR_SMOOTHING);
+  const F8 floored = simd::max(eroded, F8(LAND_FLOOR)) + floorBlend * floorBlend * F8(LAND_FLOOR_SMOOTHING) * F8(0.25f);
+  const F8 surface = floored * landWeight + eroded * (F8(1.0f) - landWeight); // exact floor where landWeight = 1
   return simd::clamp(surface, TERRAIN_MIN_HEIGHT, TERRAIN_MAX_HEIGHT);
 }
 
@@ -380,6 +396,10 @@ void sampleDither8(const int32_t *worldX, const int32_t *worldZ, float *out) {
   const I8 h = hashCell(I8::load(worldX), I8::load(worldZ), world::kSeedDitherWhite);
   const F8 speckle = simd::toFloatUnsigned(simd::srl<8>(h)) * (2.0f / 16777216.0f) - 1.0f;
   simd::clamp(F8(0.65f) * wiggle + F8(0.35f) * speckle, -1.0f, 1.0f).store(out);
+}
+
+void sampleContinent8(const int32_t *worldX, const int32_t *worldZ, float *out) {
+  (F8(153.6f) * binaryNoise(positions(worldX, worldZ), 4096.0f, SEED_ELEVATION).v + F8(ELEVATION_BIAS)).store(out);
 }
 
 float sampleHeight(int32_t worldX, int32_t worldZ) {

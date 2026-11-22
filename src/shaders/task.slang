@@ -14,7 +14,7 @@ groupshared TaskPayload taskPayload;
 groupshared uint laneRunCount[CLUSTERS_PER_TASK];
 groupshared uint laneMeshletCount[CLUSTERS_PER_TASK];
 
-// Conservative: true only when all 8 corners are outside the same clip plane (Vulkan depth 0..w).
+// Conservative: true only when all 8 corners are outside the same clip plane (reverse-Z: near at z = w, far at 0).
 bool boxOutsideFrustum(float3 boundsMin, float3 boundsMax) {
   bool allLeft = true, allRight = true, allBelow = true, allAbove = true, allNear = true, allFar = true;
   [unroll]
@@ -26,8 +26,8 @@ bool boxOutsideFrustum(float3 boundsMin, float3 boundsMax) {
     allRight = allRight && c.x > c.w;
     allBelow = allBelow && c.y < -c.w;
     allAbove = allAbove && c.y > c.w;
-    allNear = allNear && c.z < 0.0f;
-    allFar = allFar && c.z > c.w;
+    allNear = allNear && c.z > c.w;
+    allFar = allFar && c.z < 0.0f;
   }
   return allLeft || allRight || allBelow || allAbove || allNear || allFar;
 }
@@ -41,7 +41,7 @@ bool boxOccluded(float3 boundsMin, float3 boundsMax) {
   }
   float2 uvMin = float2(1.0f, 1.0f);
   float2 uvMax = float2(0.0f, 0.0f);
-  float nearestDepth = 1.0f;
+  float nearestDepth = 0.0f; // reverse-Z: nearer is larger
   [unroll]
   for (uint i = 0u; i < 8u; ++i) {
     const float3 corner = float3((i & 1u) != 0u ? boundsMax.x : boundsMin.x, (i & 2u) != 0u ? boundsMax.y : boundsMin.y,
@@ -54,7 +54,7 @@ bool boxOccluded(float3 boundsMin, float3 boundsMax) {
     const float2 uv = float2(c.x / c.w * 0.5f + 0.5f, 0.5f - c.y / c.w * 0.5f);
     uvMin = min(uvMin, uv);
     uvMax = max(uvMax, uv);
-    nearestDepth = min(nearestDepth, c.z / c.w);
+    nearestDepth = max(nearestDepth, c.z / c.w);
   }
   // Only boxes fully on screen last frame are tested. The off-screen part of a box has no depth to test against
   // and can turn into view this frame, so clamping it to the screen made tiles pop in while the camera turned.
@@ -69,13 +69,13 @@ bool boxOccluded(float3 boundsMin, float3 boundsMax) {
   const int2 levelSize = max(int2(ubo.hzbParams.xy) >> int(level), int2(1, 1));
   const int2 first = int2(uvMin * float2(levelSize));
   const int2 last = min(int2(uvMax * float2(levelSize)), levelSize - 1);
-  float farthest = 0.0f;
+  float farthest = 1.0f;
   for (int y = first.y; y <= last.y; ++y) {
     for (int x = first.x; x <= last.x; ++x) {
-      farthest = max(farthest, Hzb.Load(int3(x, y, int(level))));
+      farthest = min(farthest, Hzb.Load(int3(x, y, int(level))));
     }
   }
-  return nearestDepth > farthest;
+  return nearestDepth < farthest;
 }
 
 [shader("amplification")]
@@ -97,8 +97,11 @@ void taskMain(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID) 
                                               cluster.counts23 & 0xffffu, cluster.counts23 >> 16u,
                                               cluster.counts45 & 0xffffu, cluster.counts45 >> 16u };
       // Same order as the runs. Conservative: a run survives if any face plane in the tile could face the camera.
-      const bool facing[RUNS_PER_CLUSTER] = { camera.y > boundsMin.y, camera.x < boundsMax.x, camera.x > boundsMin.x,
-                                              camera.z < boundsMax.z, camera.z > boundsMin.z, camera.y < boundsMax.y };
+      // The translucent pass draws both sides (the water surface is seen from below too).
+      const bool bothSides = drawParams.pass == GEOMETRY_PASS_TRANSLUCENT;
+      const bool facing[RUNS_PER_CLUSTER] = { bothSides || camera.y > boundsMin.y, bothSides || camera.x < boundsMax.x,
+                                              bothSides || camera.x > boundsMin.x, bothSides || camera.z < boundsMax.z,
+                                              bothSides || camera.z > boundsMin.z, bothSides || camera.y < boundsMax.y };
       uint cursor = cluster.base;
       [unroll]
       for (uint d = 0u; d < RUNS_PER_CLUSTER; ++d) {

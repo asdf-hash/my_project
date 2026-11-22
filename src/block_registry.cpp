@@ -97,9 +97,6 @@ private:
     if (std::ranges::any_of(registry_.blocks, [&](const Block &block) { return block.name == name; })) {
       fail("duplicate block '" + name + "'");
     }
-    if (registry_.blocks.size() >= kMaxBlockCount) {
-      fail("too many blocks (max " + std::to_string(kMaxBlockCount) + ")");
-    }
     registry_.blocks.push_back({.name = name});
     definedFaces_ = 0;
     hasLodTint_ = false;
@@ -110,7 +107,24 @@ private:
     if (registry_.blocks.empty()) {
       return;
     }
-    const Block &block = registry_.blocks.back();
+    Block &block = registry_.blocks.back();
+    const auto blockError = [&](const std::string &message) {
+      return std::runtime_error(path_ + ":" + std::to_string(blockLine_) + ": " + message);
+    };
+    if (block.opaque) {
+      if (opaqueCount_ >= kMaxOpaqueBlocks) {
+        throw blockError("too many opaque blocks (max " + std::to_string(kMaxOpaqueBlocks) + ")");
+      }
+      block.id = static_cast<std::uint32_t>(opaqueCount_++);
+    } else {
+      if (nonOpaqueCount_ >= kMaxNonOpaqueBlocks) {
+        throw blockError("too many non-opaque blocks (max " + std::to_string(kMaxNonOpaqueBlocks) + ")");
+      }
+      block.id = kNonOpaqueBit + static_cast<std::uint32_t>(nonOpaqueCount_++);
+    }
+    if (block.fluid != Fluid::None && block.opaque) {
+      throw blockError("block '" + block.name + "' is a fluid, so it must set opaque = false");
+    }
     if (definedFaces_ != kAllFaces) {
       throw std::runtime_error(path_ + ":" + std::to_string(blockLine_) + ": block '" + block.name +
                                "' must give every face a texture (use all/side/top/bottom)");
@@ -147,17 +161,31 @@ private:
         face.hasLodTexture = true;
       });
     } else if (key == "lod_tint") {
-      const auto words = splitWords(value);
-      if (words.size() != 3) {
-        fail("lod_tint expects three numbers (r g b)");
-      }
-      for (std::size_t i = 0; i < 3; ++i) {
-        const auto [end, error] = std::from_chars(words[i].data(), words[i].data() + words[i].size(), block.lodTint[i]);
-        if (error != std::errc{} || end != words[i].data() + words[i].size()) {
-          fail("invalid number '" + std::string(words[i]) + "' in lod_tint");
-        }
-      }
+      parseColor(key, value, block.lodTint);
       hasLodTint_ = true;
+    } else if (key == "frame_time") {
+      const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), block.frameTime);
+      if (error != std::errc{} || end != value.data() + value.size() || !(block.frameTime > 0.0f)) {
+        fail("frame_time expects a positive number of seconds");
+      }
+    } else if (key == "tint") {
+      parseColor(key, value, block.tint);
+    } else if (key == "fluid") {
+      if (value == "none") {
+        block.fluid = Fluid::None;
+      } else if (value == "ocean") {
+        block.fluid = Fluid::Ocean;
+      } else {
+        fail("fluid expects none or ocean");
+      }
+    } else if (key == "opaque") {
+      if (value == "true") {
+        block.opaque = true;
+      } else if (value == "false") {
+        block.opaque = false;
+      } else {
+        fail("opaque expects true or false");
+      }
     } else if (key == "random_rotation") {
       for (const std::string_view word : splitWords(value)) {
         const auto faces = parseFaceSelector(word);
@@ -168,6 +196,19 @@ private:
       }
     } else {
       fail("unknown key '" + std::string(key) + "'");
+    }
+  }
+
+  void parseColor(std::string_view key, std::string_view value, std::array<float, 3> &color) const {
+    const auto words = splitWords(value);
+    if (words.size() != 3) {
+      fail(std::string(key) + " expects three numbers (r g b)");
+    }
+    for (std::size_t i = 0; i < 3; ++i) {
+      const auto [end, error] = std::from_chars(words[i].data(), words[i].data() + words[i].size(), color[i]);
+      if (error != std::errc{} || end != words[i].data() + words[i].size()) {
+        fail("invalid number '" + std::string(words[i]) + "' in " + std::string(key));
+      }
     }
   }
 
@@ -197,6 +238,8 @@ private:
   std::size_t blockLine_ = 0;
   FaceMask definedFaces_ = 0;
   bool hasLodTint_ = false;
+  std::size_t opaqueCount_ = 0;
+  std::size_t nonOpaqueCount_ = 0;
 };
 
 } // namespace
@@ -206,7 +249,15 @@ std::uint32_t Registry::idOf(std::string_view name) const {
   if (it == blocks.end()) {
     throw std::runtime_error("unknown block '" + std::string(name) + "'");
   }
-  return static_cast<std::uint32_t>(it - blocks.begin());
+  return it->id;
+}
+
+std::uint32_t Registry::maxId() const {
+  std::uint32_t id = 0;
+  for (const Block &block : blocks) {
+    id = std::max(id, block.id);
+  }
+  return id;
 }
 
 Registry loadRegistry(const std::string &path, const std::string &textureDirectory) {

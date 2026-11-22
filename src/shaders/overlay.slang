@@ -9,8 +9,8 @@ static const uint OVERLAY_TEXT_WORDS = OVERLAY_LINES * OVERLAY_COLUMNS / 4u;
 // Matches OverlayParams in renderer.cpp.
 struct OverlayParams {
   float2 screenSize;
-  float scale;  // screen pixels per font pixel
-  uint columns; // longest line; shorter lines are left-padded with spaces by the renderer
+  float scale;                   // screen pixels per font pixel
+  uint columns;                  // longest line; shorter lines are left-padded with spaces by the renderer
   uint text[OVERLAY_TEXT_WORDS]; // OVERLAY_LINES x OVERLAY_COLUMNS glyph indices, one byte each
 };
 
@@ -70,14 +70,38 @@ static const float2 CELL = float2(6.0f, 9.0f); // 5x7 glyph + spacing, in font p
 static const float PADDING = 3.0f;             // font pixels around the text
 static const float MARGIN = 8.0f;              // screen pixels from the window edge
 
+[[vk::binding(2, 0)]]
+SamplerState selectedTextureSampler;
+[[vk::binding(11, 0)]]
+Texture2D selectedTextures[];
+
+[shader("vertex")]
+float4 selectedTextureVertexMain(uint vertexID: SV_VertexID) : SV_Position {
+  const uint corner = vertexID < 3u ? vertexID : vertexID - 2u;
+  const float2 unit = float2(float(corner & 1u), float(corner >> 1u));
+  const float2 size = float2(64.0f * params.scale);
+  const float2 origin = params.screenSize - size - float2(MARGIN * params.scale);
+  const float2 pixel = origin + unit * size;
+  return float4(pixel / params.screenSize * 2.0f - 1.0f, 0.0f, 1.0f);
+}
+
+[shader("fragment")]
+float4 selectedTextureFragmentMain(float4 position: SV_Position) : SV_Target0 {
+  const float2 size = float2(64.0f * params.scale);
+  const float2 origin = params.screenSize - size - float2(MARGIN * params.scale);
+  const float2 local = position.xy - origin;
+  const float2 uv = saturate(local / size);
+  const float4 color = selectedTextures[NonUniformResourceIndex(params.columns)].Sample(selectedTextureSampler,
+                                                                                        float2(uv.x, uv.y));
+  return color;
+}
+
 float2 boxSize() {
   return (float2(float(params.columns), float(OVERLAY_LINES)) * CELL - float2(1.0f, 2.0f) + 2.0f * PADDING) *
          params.scale;
 }
 
-float2 boxOrigin() {
-  return float2(params.screenSize.x - MARGIN - boxSize().x, MARGIN);
-}
+float2 boxOrigin() { return float2(params.screenSize.x - MARGIN - boxSize().x, MARGIN); }
 
 [shader("vertex")]
 float4 overlayVertexMain(uint vertexID: SV_VertexID) : SV_Position {
@@ -133,6 +157,4 @@ float4 crosshairVertexMain(uint vertexID: SV_VertexID) : SV_Position {
 }
 
 [shader("fragment")]
-float4 crosshairFragmentMain() : SV_Target0 {
-  return float4(1.0f, 1.0f, 1.0f, 1.0f);
-}
+float4 crosshairFragmentMain() : SV_Target0 { return float4(1.0f, 1.0f, 1.0f, 1.0f); }

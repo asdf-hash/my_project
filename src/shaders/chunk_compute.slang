@@ -9,6 +9,9 @@ static const uint VERTEX_QUADS_PER_INSTANCE = 16384u;
 // world::kMinTerrainHeight / kMaxTerrainHeight.
 static const int MIN_TERRAIN_HEIGHT = -400;
 static const int MAX_TERRAIN_HEIGHT = 1100;
+// Ocean surface (world::kSeaLevel): empty cells below it are ocean. The GPU clipmap draws only the surface: one +Y
+// quad on the cell below sea level, into the translucent WaterClusters.
+static const int SEA_LEVEL = 0;
 // Most vertical chunks one column can need (LOD 0 over the whole envelope): world::kMaxColumnChunks.
 static const uint MAX_COLUMN_CHUNKS = 48u;
 static const uint INVALID_WORK_SLOT = 0xffffffffu;
@@ -50,7 +53,7 @@ struct DispatchParams {
   uint horizontalChunkCount; // entries in ColumnList (new columns this remesh)
   uint retireCount;          // entries in RetireList (column slots that left)
   uint workPoolCapacity;     // work slots in FreeWorkSlots / Clusters (initWorkPool)
-  uint unused;
+  uint oceanBlock;           // block ID of the ocean surface quads
   // Block ID per height layer, from world::kTerrainLayerBlocks (one more entry than TRANSITION_HEIGHTS), and the
   // block used below a column's top block (world::kTerrainLayerFillerBlocks).
   uint4 layerBlocks;
@@ -72,6 +75,10 @@ groupshared uint topFaceKey[64];
 // Length of the x-merged top face run starting at each lane (0: none starts there), for merging runs along z.
 groupshared uint topRunLength[64];
 // Lowest face bottom / highest face top of the group's columns (chunk-local cells), for tight cluster bounds.
+groupshared uint waterRunLength[64]; // ocean surface: x-run length at a run's first lane, else 0
+groupshared uint waterFlag[64];      // ocean surface on this lane's column
+groupshared uint waterQuadCount;
+groupshared uint waterOutputBase;
 groupshared int tileFaceLow;
 groupshared int tileFaceHigh;
 groupshared uint groupOutputBase;
@@ -141,6 +148,10 @@ RWStructuredBuffer<uint> SlotOwner;
 // collectRelocations output: holes at [0, capacity), movers at [capacity, 2 * capacity).
 [[vk::binding(17, 0)]]
 RWStructuredBuffer<uint> RelocationScratch;
+// Per work slot, like Clusters: the translucent ocean surface quads of each tile (+Y run only), drawn in the blended
+// pass. Their quads live in QuadBuffer like any other cluster's.
+[[vk::binding(18, 0)]]
+RWStructuredBuffer<QuadCluster> WaterClusters;
 
 uint heightIndex(uint columnIndex, uint x, uint z) { return columnIndex * HEIGHTS_PER_CHUNK + z * HEIGHT_STRIDE + x; }
 
@@ -530,7 +541,11 @@ void allocateWork(uint3 dispatchThreadID: SV_DispatchThreadID) {
   const int envelopeLow = floorDivide(MIN_TERRAIN_HEIGHT, scale);
   const int envelopeHigh = -floorDivide(-MAX_TERRAIN_HEIGHT, scale);
   const int firstChunkY = max(floorDivide(low, int(CHUNK_SIZE)) - 1, floorDivide(envelopeLow, int(CHUNK_SIZE)));
-  const int lastChunkY = min(floorDivide(high - 1, int(CHUNK_SIZE)) + 1, floorDivide(envelopeHigh - 1, int(CHUNK_SIZE)));
+  // Columns below sea level also need the chunk holding the ocean surface cell.
+  const int seaCell = floorDivide(SEA_LEVEL, scale);
+  const int surfaceChunkY = low < seaCell ? floorDivide(seaCell - 1, int(CHUNK_SIZE)) : int(0x80000000u);
+  const int lastChunkY = min(max(floorDivide(high - 1, int(CHUNK_SIZE)) + 1, surfaceChunkY),
+                             floorDivide(envelopeHigh - 1, int(CHUNK_SIZE)));
   int count = clamp(lastChunkY - firstChunkY + 1, 0, int(MAX_COLUMN_CHUNKS));
 
   // Pop count slots. Pops and pushes (retireWork) never share a pass, so the stack holds exactly [0, top).
@@ -646,6 +661,8 @@ void relocateSlots(uint3 dispatchThreadID: SV_DispatchThreadID) {
   for (uint c = 0u; c < 16u; ++c) {
     Clusters[to * 16u + c] = Clusters[from * 16u + c];
     Clusters[from * 16u + c] = empty;
+    WaterClusters[to * 16u + c] = WaterClusters[from * 16u + c];
+    WaterClusters[from * 16u + c] = empty;
   }
   ColumnWorkSlots[owner] = to;
   SlotOwner[to] = owner;
@@ -889,6 +906,62 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
                    chunkCoord, height, cachedMaterialHeight, dither);
     }
   }
+
+  // Ocean surface: columns lower than sea level get a +Y quad on the cell below it, merged into x runs and then
+  // stacked along z (no AO, one block), written to this tile's WaterClusters entry.
+  const int seaCell = floorDivide(SEA_LEVEL, scale);
+  const int surfaceCell = seaCell - 1;
+  const bool hasWater = height < seaCell && surfaceCell >= chunkBottom && surfaceCell < chunkTop;
+  waterFlag[lane] = hasWater ? 1u : 0u;
+  if (lane == 0u) {
+    waterQuadCount = 0u;
+  }
+  GroupMemoryBarrierWithGroupSync();
+  uint waterLength = 0u;
+  if (hasWater && (groupThreadID.x == 0u || waterFlag[lane - 1u] == 0u)) {
+    waterLength = 1u;
+    while (groupThreadID.x + waterLength < 8u && waterFlag[lane + waterLength] != 0u) {
+      ++waterLength;
+    }
+  }
+  waterRunLength[lane] = waterLength;
+  GroupMemoryBarrierWithGroupSync();
+  uint waterWidth = 0u;
+  uint waterSlot = 0u;
+  if (waterLength != 0u && !(groupThreadID.y > 0u && waterRunLength[lane - 8u] == waterLength)) {
+    waterWidth = 1u;
+    while (groupThreadID.y + waterWidth < 8u && waterRunLength[lane + 8u * waterWidth] == waterLength) {
+      ++waterWidth;
+    }
+    InterlockedAdd(waterQuadCount, 1u, waterSlot);
+  }
+  GroupMemoryBarrierWithGroupSync();
+  if (lane == 0u) {
+    uint base = 0u;
+    if (waterQuadCount != 0u) {
+      InterlockedAdd(QuadCount[0], waterQuadCount, base);
+      InterlockedAdd(QuadCount[1], waterQuadCount);
+    }
+    waterOutputBase = base;
+    const float tileScale = float(chunkCoord.w);
+    const float3 boundsMin = float3(float(chunkCoord.x * int(CHUNK_SIZE)) + float(tileX * 8u) * tileScale,
+                                    float(surfaceCell) * tileScale,
+                                    float(chunkCoord.y * int(CHUNK_SIZE)) + float(tileZ * 8u) * tileScale);
+    QuadCluster cluster;
+    cluster.base = base;
+    cluster.counts01 = waterQuadCount; // +Y run only
+    cluster.counts23 = 0u;
+    cluster.counts45 = 0u;
+    cluster.boundsMin = float4(boundsMin, 0.0f);
+    cluster.boundsMax = float4(boundsMin + float3(8.0f, 1.0f, 8.0f) * tileScale, 0.0f);
+    WaterClusters[workSlot * 16u + groupID.x] = cluster;
+  }
+  GroupMemoryBarrierWithGroupSync();
+  if (waterWidth != 0u) {
+    // Like top faces: written at the run's last row (faceV points toward -z).
+    writeQuad(waterOutputBase + waterSlot, x, uint(surfaceCell - chunkBottom), z + waterWidth - 1u, 2u, 0u,
+              dispatchParams.oceanBlock, waterLength, waterWidth, chunkY, chunkCoord);
+  }
 }
 
 // Retires the work slots of columns that left the clipmap: their quads stay in QuadBuffer (reclaimed by compaction or
@@ -914,12 +987,20 @@ void retireWork(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID
   for (uint i = groupThreadID.x; i < written; i += 64u) {
     QuadBuffer[cluster.base + i] = QuadBuffer[cluster.base + i] | (7ull << 15u);
   }
+  // The tile's ocean surface quads (+Y run only).
+  const QuadCluster water = WaterClusters[clusterIndex];
+  const uint waterTotal = water.counts01 & 0xffffu;
+  const uint waterWritten = water.base >= MAX_QUAD_COUNT ? 0u : min(waterTotal, MAX_QUAD_COUNT - water.base);
+  for (uint i = groupThreadID.x; i < waterWritten; i += 64u) {
+    QuadBuffer[water.base + i] = QuadBuffer[water.base + i] | (7ull << 15u);
+  }
   GroupMemoryBarrierWithGroupSync(); // every lane has read the cluster before it is cleared
   if (groupThreadID.x == 0u) {
-    InterlockedAdd(QuadCount[1], 0u - total);
+    InterlockedAdd(QuadCount[1], 0u - total - waterTotal);
     Clusters[clusterIndex].counts01 = 0u;
     Clusters[clusterIndex].counts23 = 0u;
     Clusters[clusterIndex].counts45 = 0u;
+    WaterClusters[clusterIndex].counts01 = 0u;
     // After an overflow the stack is stale until the rebuild; leave it alone.
     if (groupID.x == 0u && WorkPool[WORK_POOL_OVERFLOW] == 0) {
       SlotOwner[workSlot] = INVALID_WORK_SLOT;
@@ -935,6 +1016,7 @@ void retireWork(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID
 // Dispatched indirectly (finalizeWork) as (16 clusters, work slots below the high water folded into y / z). Cluster order in the output doesn't matter: each cluster keeps its
 // quads contiguous (six runs by direction), which is all taskMain and retireWork rely on.
 groupshared uint compactBase;
+groupshared uint compactWaterBase;
 [numthreads(64, 1, 1)]
 [shader("compute")]
 void compactQuads(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID) {
@@ -946,18 +1028,27 @@ void compactQuads(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThread
   const QuadCluster cluster = Clusters[clusterIndex];
   const uint total = (cluster.counts01 & 0xffffu) + (cluster.counts01 >> 16u) + (cluster.counts23 & 0xffffu) +
                      (cluster.counts23 >> 16u) + (cluster.counts45 & 0xffffu) + (cluster.counts45 >> 16u);
+  const QuadCluster water = WaterClusters[clusterIndex];
+  const uint waterTotal = water.counts01 & 0xffffu; // +Y run only
   if (groupThreadID.x == 0u) {
     InterlockedAdd(QuadCount[0], total, compactBase);
+    InterlockedAdd(QuadCount[0], waterTotal, compactWaterBase);
   }
-  GroupMemoryBarrierWithGroupSync(); // also: every lane has read the cluster before lane 0 rewrites its base
+  GroupMemoryBarrierWithGroupSync(); // also: every lane has read the clusters before lane 0 rewrites their bases
   const uint base = compactBase;
+  const uint waterBase = compactWaterBase;
   // The CPU falls back to a full rebuild once QuadBuffer overflowed, so every live run is complete and in range.
   for (uint i = groupThreadID.x; i < total; i += 64u) {
     CompactScratch[base + i] = QuadBuffer[cluster.base + i];
     CompactScratch[MAX_QUAD_COUNT + base + i] = ChunkOffsets[cluster.base + i];
   }
+  for (uint i = groupThreadID.x; i < waterTotal; i += 64u) {
+    CompactScratch[waterBase + i] = QuadBuffer[water.base + i];
+    CompactScratch[MAX_QUAD_COUNT + waterBase + i] = ChunkOffsets[water.base + i];
+  }
   if (groupThreadID.x == 0u) {
     Clusters[clusterIndex].base = base;
+    WaterClusters[clusterIndex].base = waterBase;
   }
 }
 

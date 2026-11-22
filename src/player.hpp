@@ -5,6 +5,8 @@
 //
 // Controls: WASD move, Space jump (double-tap: toggle flight), Shift sneak (fly: descend), Ctrl or double-tap W
 // sprint, Z toggles freecam (the old free-fly camera; E cycles its speed).
+// In water: Space swims up, Shift sinks; sprinting while submerged sprint-swims (fast, follows the look pitch, in a
+// 0.6-block box that fits 1-block gaps).
 
 #include <glm/glm.hpp>
 
@@ -32,7 +34,10 @@ public:
   float fovMultiplier() const { return fovScale; }
   Mode mode() const { return currentMode; }
   bool waitingForTerrain() const { return frozen; }
+  bool swimming() const { return swimmingPose; }
   const glm::dvec3 &feetPosition() const { return position; }
+  // The player's box overlaps block (x, y, z) (touching a face doesn't count): placing it there would trap them.
+  bool overlapsBlock(int x, int y, int z) const;
 
 private:
   struct Input {
@@ -43,10 +48,13 @@ private:
     bool sprint = false;
   };
 
-  void tick(const Input &input, float yawDegrees, const cpuworld::CpuWorld &world);
+  // lookY: vertical component of the camera's look direction (steers sprint-swimming).
+  void tick(const Input &input, float yawDegrees, float lookY, const cpuworld::CpuWorld &world);
   // Moves by `motion` with collision (Y, then X, then Z, like Minecraft); updates onGround / collision flags.
   void move(glm::dvec3 motion, bool sneakGuard, const cpuworld::CpuWorld &world);
   bool boxCollides(const glm::dvec3 &minCorner, const glm::dvec3 &maxCorner, const cpuworld::CpuWorld &world) const;
+  // Any cell the box overlaps is ocean (same cell loop as boxCollides).
+  bool boxInWater(const glm::dvec3 &minCorner, const glm::dvec3 &maxCorner, const cpuworld::CpuWorld &world) const;
   double boxHeight() const;
 
   Mode currentMode = Mode::Walking;
@@ -57,6 +65,9 @@ private:
   bool collidedHorizontally = false;
   bool sprinting = false;
   bool sneaking = false;
+  bool swimmingPose = false; // sprint-swimming (or crawling under a ceiling after it)
+  bool inWater = false;
+  bool eyesInWater = false;
   bool frozen = true;
   double tickAccumulator = 0.0;
   float fovScale = 1.0f;

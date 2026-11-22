@@ -21,6 +21,11 @@
 },
 {
   "directory": "/mnt/NvME/my_project-main",
+  "arguments": ["/usr/bin/clang++", "-c", "-Qunused-arguments", "-m64", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-O3", "-mavx2", "-mfma", "-std=c++20", "-DNDEBUG", "-o", "build/.objs/terrain_tests/linux/x86_64/release/src/block_registry.cpp.o", "src/block_registry.cpp"],
+  "file": "src/block_registry.cpp"
+},
+{
+  "directory": "/mnt/NvME/my_project-main",
   "arguments": ["/usr/bin/clang++", "-c", "-Qunused-arguments", "-m64", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-O3", "-mavx2", "-mfma", "-std=c++20", "-include", "src/pch.hpp", "-DVULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1", "-DVULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1", "-DVULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS", "-DVULKAN_HPP_NO_SPACESHIP_OPERATOR", "-DVULKAN_HPP_NO_SMART_HANDLE", "-DNDEBUG", "-o", "build/.objs/engine/linux/x86_64/release/src/main.cpp.o", "src/main.cpp"],
   "file": "src/main.cpp"
 },

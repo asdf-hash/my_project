@@ -28,6 +28,9 @@ inline constexpr int32_t kCpuChunkRadius = 8;
 inline constexpr float kCpuSeamBias = 0.02f;
 // ClipmapResult::neighborLods: set in an edge's byte when CPU-owned columns lie across it.
 inline constexpr uint32_t kNeighborCpuFlag = 0x8u;
+// Ocean surface: every cell below this height that the terrain leaves empty is ocean (the land floor in
+// terrain_noise.hlsl keeps inland ground above it). Must match SEA_LEVEL in chunk_compute.slang.
+inline constexpr int32_t kSeaLevel = 0;
 // Conservative world-space height envelope for the height function in terrain_noise.hlsl.
 inline constexpr int32_t kMinTerrainHeight = -400;
 inline constexpr int32_t kMaxTerrainHeight = 1100;

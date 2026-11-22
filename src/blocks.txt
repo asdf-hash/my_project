@@ -4,6 +4,14 @@
 #   all, side (the four horizontal faces), top, bottom,
 #   positive_x, negative_x, positive_y, negative_y, positive_z, negative_z
 # Optional:
+#   opaque = false                 non-opaque block (glass, leaves): its ID gets bit 9 (512+) and it is meshed
+#                                  separately from the binary mesher; texture alpha < 0.5 is cut out
+#   tint = <r> <g> <b>             color multiplier for every face at every LOD (e.g. per-liquid color of the shared
+#                                  grayscale fluid texture)
+#   frame_time = <seconds>         seconds per frame of animated textures (default 0.1). A texture 16 px wide and
+#                                  16 * N tall is a strip of N animation frames, top first
+#   fluid = ocean                  the ocean: fills empty cells below sea level, an infinite source that only
+#                                  placing a block removes; drawn translucent (needs opaque = false)
 #   random_rotation = <faces...>   rotate these faces' textures by a per-face hash to break up tiling
 #   lod_<faces> = <texture>        texture used instead on coarse LOD chunks
 #   lod_tint = <r> <g> <b>         color multiplier applied with the lod_ texture
@@ -28,3 +36,12 @@ all = sand.png
 
 [snow]
 all = snow.png
+
+# The ocean: one of several liquids sharing fluid_still.png, told apart by tint (and their own IDs).
+[ocean]
+all = fluid_still.png
+opaque = false
+fluid = ocean
+# = WATER_FOG_COLOR in slang.slang / fluid_still.png's average (0.694 gray): the surface matches the water fog.
+tint = 0.086 0.259 0.49
+frame_time = 0.1

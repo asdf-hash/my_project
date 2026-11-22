@@ -64,14 +64,32 @@ public:
   std::vector<ColumnMeshEvent> takeMeshEvents();
 
   // Main thread. Unloaded columns count as air.
+  // Opaque block (bit 9 of the id clear): what meshing and AO see.
   bool isSolid(int32_t x, int32_t y, int32_t z) const;
-  // First solid block along the ray within maxDistance blocks (voxel DDA). `direction` need not be normalized.
+  // Any block but air and ocean, opaque or not: what collision and targeting see.
+  bool isCollidable(int32_t x, int32_t y, int32_t z) const;
+  // Air or ocean: a block may be placed into it.
+  bool isReplaceable(uint16_t id) const { return id == kAir || id == ids_.ocean; }
+  // Ocean: scooping (buckets, pipes) takes water without ever changing the cell; only placeBlock removes it.
+  bool isInfiniteSource(int32_t x, int32_t y, int32_t z) const;
+  // Block id at a cell (kAir when unloaded, kBuriedTerrain for unstored cells below the surface).
+  uint16_t blockId(int32_t x, int32_t y, int32_t z) const;
+  // First non-air block along the ray within maxDistance blocks (voxel DDA). `direction` need not be normalized.
   std::optional<BlockHit> raycast(const std::array<float, 3> &origin, const std::array<float, 3> &direction,
                                   float maxDistance) const;
-  // Main thread. Turns a solid block of a loaded column into air and remeshes the touched chunks on this thread (the
-  // partial events come out of takeMeshEvents). Edits live only in the loaded column: one that unloads regenerates unedited (no saving yet).
-  // Returns false if the block is air or its column isn't loaded.
+  // Main thread. Turns a block of a loaded column into air and remeshes the touched chunks on this thread (the
+  // partial events come out of takeMeshEvents). Edits (broken or placed blocks) live only in the loaded column: one
+  // that unloads regenerates unedited (no saving yet). Returns false if the block is air or its column isn't loaded.
   bool breakBlock(int32_t x, int32_t y, int32_t z);
+  // Main thread. Puts block `id` into an air or ocean cell of a loaded column (replacing the ocean), like breakBlock.
+  // Returns false if the cell isn't replaceable, its column isn't loaded, `id` is air, or y is outside the world's
+  // height range.
+  bool placeBlock(int32_t x, int32_t y, int32_t z, uint16_t id);
+  // Main thread, once per frame. Every kOceanFlowSeconds, ocean flows one block into air cells below sea level that
+  // touch it (cells that became air through an edit, then their air neighbors), remeshing once per step.
+  void tickFluids(double now);
+  static constexpr double kOceanFlowSeconds = 0.25;
+  static constexpr size_t kOceanFlowCellsPerStep = 4096;
   bool columnLoaded(int32_t cx, int32_t cz) const;
   // Main thread; null if not loaded. Edits replace the column, so don't keep the pointer across them.
   std::shared_ptr<const Column> column(int32_t cx, int32_t cz) const {
@@ -103,6 +121,8 @@ private:
   const Column *loadedColumn(int32_t cx, int32_t cz, const EditBatch &batch) const;
   Column &editableColumn(int32_t cx, int32_t cz, EditBatch &batch);
   void setCell(Column &column, int32_t lx, int32_t y, int32_t lz, uint16_t id) const;
+  // One-cell edit batch: copies the column, sets the cell, remeshes what reads it.
+  void editCell(int32_t x, int32_t y, int32_t z, uint16_t id);
   // After cell (x, y, z) changed: gives its six neighbors voxel storage (a face may now show on them) and marks every
   // chunk whose mesh reads the cell (meshes see one cell beyond their chunk).
   void touchCell(int32_t x, int32_t y, int32_t z, EditBatch &batch);
@@ -124,6 +144,8 @@ private:
   std::optional<ChunkXZ> readyCenter_;
   std::vector<ChunkXZ> pinnedCenters_;
   std::vector<ColumnMeshEvent> events_;
+  std::vector<BlockXYZ> flowCandidates_; // air cells below sea level the ocean may flow into on the next step
+  double nextFlowTime_ = 0.0;
 
   // Shared with the workers.
   mutable std::mutex mutex_;

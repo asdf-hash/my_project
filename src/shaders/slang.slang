@@ -4,11 +4,15 @@ struct BlockFace {
   uint texture;
   uint lodTexture;
   uint flags;
-  uint padding;
+  uint animation; // frames of texture (bits 0-7) and lodTexture (8-15), ms per frame (16-31)
   float4 lodTint;
+  float4 tint; // every LOD
 };
 static const uint BLOCK_FACE_RANDOM_ROTATION = 1u << 0u;
 static const uint BLOCK_FACE_HAS_LOD_TEXTURE = 1u << 1u;
+static const uint BLOCK_FACE_FLUID = 1u << 2u;
+// Bit 9 of a block ID marks a non-opaque block (blocks::kNonOpaqueBit): its texture alpha is cut out.
+static const uint NON_OPAQUE_BIT = 0x200u;
 
 #include "geometry_shared.hlsl"
 #include "quad_decode.hlsl"
@@ -172,7 +176,7 @@ void meshMain(out vertices MeshVertex verts[128], out indices uint3 triangles[64
   const bool active = lane < quadCount;
   // Inactive lanes decode the meshlet's first quad so every lane takes part in the compaction below.
   const DecodedQuad quad = decodeQuad(firstQuad + (active ? lane : 0u));
-  const bool visible = active && quad.frontFacing;
+  const bool visible = active && (quad.frontFacing || drawParams.pass == GEOMETRY_PASS_TRANSLUCENT);
 
   // Compact the surviving quads to the front of the meshlet. When one subgroup spans the whole group (NVIDIA
   // wave32, AMD wave64) this is two wave intrinsics; narrower subgroups (e.g. Intel SIMD8/16) use shared memory.
@@ -241,7 +245,13 @@ MeshVertex vertMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID) 
     return dead; // retired by retireWork; reclaimed at the next full rebuild
   }
   // Back faces still cost their invocations, but skip the transforms and attribute exports.
-  if (!quad.frontFacing) {
+  if (!quad.frontFacing && drawParams.pass != GEOMETRY_PASS_TRANSLUCENT) {
+    return dead;
+  }
+  // The GPU clipmap's vertex draw covers all of its quads in both passes: each pass keeps its own (liquids are
+  // translucent).
+  const bool liquid = (BlockFaces[(quad.material & 0x3ffu) * 6u + quad.normalIndex].flags & BLOCK_FACE_FLUID) != 0u;
+  if (liquid != (drawParams.pass == GEOMETRY_PASS_TRANSLUCENT)) {
     return dead;
   }
   // The index buffer has a fixed winding, so flipped faces mirror corners 1 <-> 3 instead:
@@ -274,8 +284,25 @@ struct SceneFragmentOutput {
   float4 motion : SV_Target1;
 };
 
-[shader("fragment")]
-SceneFragmentOutput fragMain(FragmentInput input) {
+// Water fog: color and the distance through water at which it is opaque. The ocean's tint in blocks.txt makes the
+// surface this color too; the clear color while underwater (renderer.cpp) matches it.
+static const float3 WATER_FOG_COLOR = float3(0.06f, 0.18f, 0.34f);
+static const float WATER_FOG_DISTANCE = 48.0f;
+
+// This frame's opaque depth (the farthest MSAA sample per pixel, reverse-Z), resolved by the opaque pass (renderer.cpp
+// recordCommandBuffer). Only fragWater reads it, so the opaque pass, which writes it, never does.
+[[vk::binding(8, 0)]]
+Texture2D<float> SceneDepth;
+
+// View depth (clip w) from a reverse-Z depth (1 at the near plane, 0 at the far plane): w = n f / (n (1 - d) + f d).
+float viewDepthFromDepth(float depth) {
+  return ubo.nearPlane * ubo.farPlane / (ubo.nearPlane * (1.0f - depth) + ubo.farPlane * depth);
+}
+
+// Shared body of fragMain (opaque pass) and fragWater (water pass). waterPass is a constant at each entry point, so
+// fragMain compiles without the water fog and never touches SceneDepth.
+[ForceInline]
+SceneFragmentOutput shadeFragment(FragmentInput input, bool waterPass) {
   const uint aoBits = input.lighting & 0xffu;
   const float skylight = float((input.lighting >> 8u) & 0xfu) / 15.0f;
   const uint coloredLightBits = (input.lighting >> 12u) & 0xfffu;
@@ -288,7 +315,11 @@ SceneFragmentOutput fragMain(FragmentInput input) {
   const uint greedyWidth = (input.material >> 23u) & 0xfu;
   const BlockFace face = BlockFaces[blockType * 6u + normalIndex];
   const bool useLodTexture = chunkLod > 0u && (face.flags & BLOCK_FACE_HAS_LOD_TEXTURE) != 0u;
-  const uint textureIndex = useLodTexture ? face.lodTexture : face.texture;
+  // Frame strips: frame k of a texture lives at its slot + k.
+  const uint frameCount = max((face.animation >> (useLodTexture ? 8u : 0u)) & 0xffu, 1u);
+  const float frameSeconds = float(face.animation >> 16u) * 0.001f;
+  const uint frame = uint(ubo.cameraPosition.w / frameSeconds) % frameCount;
+  const uint textureIndex = (useLodTexture ? face.lodTexture : face.texture) + frame;
   // Merged quads cover several cells (uv spans 0..length on the merged axis). Each cell's rotation hashes the block
   // it belongs to and the face direction, so remeshing (a broken block re-merging its neighbors) never changes it.
   const float2 cell = floor(input.uv);
@@ -324,6 +355,11 @@ SceneFragmentOutput fragMain(FragmentInput input) {
   float4 color = textures[NonUniformResourceIndex(textureIndex)].SampleGrad(
       sampler, textureUv, textureUvDx * gradientScale, textureUvDy * gradientScale);
 
+  // Alpha cutout for non-opaque blocks (glass, leaves); opaque blocks skip the test.
+  if ((blockType & NON_OPAQUE_BIT) != 0u && color.a < 0.5f) {
+    discard;
+  }
+  color.rgb *= face.tint.rgb;
   if (useLodTexture) {
     color.rgb *= face.lodTint.rgb;
   }
@@ -355,15 +391,38 @@ SceneFragmentOutput fragMain(FragmentInput input) {
   const float2 currentUv = input.pos.xy / ubo.renderSize;
   const float2 previousNdc = input.previousClip.xy / input.previousClip.w;
   const float2 previousUv = float2(previousNdc.x * 0.5f + 0.5f, 0.5f - previousNdc.y * 0.5f);
-  const float fogStart = 1200.0f;
-  const float fogEnd = 12000.0f;
+  // Underwater (camera in an ocean cell): short water fog over the whole view distance. Must match the clear colors
+  // in renderer.cpp.
+  const bool underwater = ubo.viewRayScale.z > 0.5f;
+  const float fogStart = underwater ? 0.0f : 1200.0f;
+  const float fogEnd = underwater ? WATER_FOG_DISTANCE : 12000.0f;
   const float2 ndc = currentUv * 2.0f - 1.0f;
   const float cameraDistance = input.viewDepth * length(float3(ndc * ubo.viewRayScale.xy, 1.0f));
   const float fogAmount = saturate((cameraDistance - fogStart) / (fogEnd - fogStart));
-  const float3 skyColor = float3(0.55f, 0.72f, 0.9f);
+  const float3 skyColor = underwater ? WATER_FOG_COLOR : float3(0.55f, 0.72f, 0.9f);
   SceneFragmentOutput output;
-  const float3 litColor = color.rgb * coloredLight * aoFactor * shading;
+  float3 litColor = color.rgb * coloredLight * aoFactor * shading;
+  // Seen from outside the water (water pass only): the same water fog over the stretch of the view ray between this
+  // liquid face and the terrain behind it, so the sea floor fades into the water color with depth and distance.
+  // Only drawn water surfaces add it, so dry pits below sea level stay clear.
+  if (waterPass && !underwater && (face.flags & BLOCK_FACE_FLUID) != 0u) {
+    const float sceneW = viewDepthFromDepth(SceneDepth.Load(int3(int2(input.pos.xy), 0)));
+    // View-depth difference to distance along the view ray: distances scale with w along a ray.
+    const float submerged = max(sceneW - input.viewDepth, 0.0f) * cameraDistance / max(input.viewDepth, 1e-3f);
+    const float waterFog = saturate(submerged / WATER_FOG_DISTANCE);
+    // Composite: the texture (alpha) over fogged terrain (fog fraction of the fog color), as straight alpha.
+    const float3 premultiplied = color.a * litColor + (1.0f - color.a) * waterFog * WATER_FOG_COLOR;
+    color.a = 1.0f - (1.0f - color.a) * (1.0f - waterFog);
+    litColor = premultiplied / max(color.a, 1e-4f);
+  }
   output.color = float4(lerp(litColor, skyColor, fogAmount), color.a);
   output.motion = float4(previousUv - currentUv, input.previousClip.z / input.previousClip.w, input.pos.z);
   return output;
 }
+
+[shader("fragment")]
+SceneFragmentOutput fragMain(FragmentInput input) { return shadeFragment(input, false); }
+
+// The water pipelines (translucent pass): adds the water fog behind liquid faces.
+[shader("fragment")]
+SceneFragmentOutput fragWater(FragmentInput input) { return shadeFragment(input, true); }

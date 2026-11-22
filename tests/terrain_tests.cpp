@@ -1,4 +1,5 @@
 // CPU terrain checks: mesher output vs brute force, a height checksum (compare AVX2 and scalar builds), timings.
+#include "../src/block_registry.hpp"
 #include "../src/cpu_mesher.hpp"
 #include "../src/cpu_world.hpp"
 #include "../src/simd.hpp"
@@ -9,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <fstream>
+#include <limits>
 #include <map>
 #include <thread>
 #include <tuple>
@@ -29,7 +32,8 @@ int failures = 0;
     }                                                                                                                  \
   } while (0)
 
-const TerrainBlockIds kIds{{0, 1, 2, 3}, {4, 5, 2, 3}, {4, 2, 2, 3}};
+constexpr uint16_t kOcean = blocks::kNonOpaqueBit + 2; // glass / leaves in the edit tests use + 0 / + 1
+const TerrainBlockIds kIds{{0, 1, 2, 3}, {4, 5, 2, 3}, {4, 2, 2, 3}, kOcean};
 
 struct Brute {
   const Neighborhood &nb;
@@ -44,8 +48,33 @@ struct Brute {
     }
     return worldY < nb.center().borderHeight(x, z);
   }
+  uint16_t id(int32_t x, int32_t y, int32_t z) const { // chunk-local, x/z in -1..32
+    const int32_t dx = x < 0 ? -1 : (x >= 32 ? 1 : 0);
+    const int32_t dz = z < 0 ? -1 : (z >= 32 ? 1 : 0);
+    const Column *c = nb.columns[dz + 1][dx + 1];
+    const int32_t worldY = chunkY * 32 + y;
+    if (c) {
+      return c->blockId(x - dx * 32, worldY, z - dz * 32);
+    }
+    return worldY < nb.center().borderHeight(x, z) ? kBuriedTerrain : nb.center().emptyCell(worldY);
+  }
+  // Opaque cells show a face toward any non-opaque cell; non-opaque blocks (not air) toward any non-opaque cell
+  // holding a different block.
+  bool face(int32_t x, int32_t y, int32_t z, int32_t ox, int32_t oy, int32_t oz) const {
+    if (solid(x + ox, y + oy, z + oz)) {
+      return false;
+    }
+    if (solid(x, y, z)) {
+      return true;
+    }
+    const uint16_t self = id(x, y, z);
+    return self != kAir && self != id(x + ox, y + oy, z + oz);
+  }
   uint32_t vertexAo(bool a, bool b, bool c) const { return a && b ? 3u : uint32_t(a) + uint32_t(b) + uint32_t(c); }
   uint32_t ao(int32_t x, int32_t y, int32_t z, uint32_t n) const {
+    if (id(x, y, z) == kOcean) {
+      return 0u; // water is lit flat
+    }
     static const int u[6][3] = {{0, 0, 1}, {0, 0, 1}, {1, 0, 0}, {1, 0, 0}, {1, 0, 0}, {1, 0, 0}};
     static const int v[6][3] = {{0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, {0, 1, 0}};
     static const int o[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
@@ -66,18 +95,27 @@ void checkChunk(const Neighborhood &nb, int32_t chunkY, const ChunkMesh &mesh,
   Brute brute{nb, chunkY};
   static const int o[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
   std::map<std::tuple<int, int, int, int>, int> covered;
+  // Opaque clusters' quads first, then the translucent (ocean) clusters' quads.
   uint32_t clusterQuads = 0;
-  for (const QuadCluster &cluster : mesh.clusters) {
-    CHECK(cluster.base == clusterQuads, "cluster base %u != %u", cluster.base, clusterQuads);
-    clusterQuads += (cluster.counts01 & 0xffff) + (cluster.counts01 >> 16) + (cluster.counts23 & 0xffff) +
-                    (cluster.counts23 >> 16) + (cluster.counts45 & 0xffff) + (cluster.counts45 >> 16);
-  }
+  auto sumClusters = [&](const std::array<QuadCluster, kClustersPerChunk> &clusters) {
+    for (const QuadCluster &cluster : clusters) {
+      const uint32_t count = (cluster.counts01 & 0xffff) + (cluster.counts01 >> 16) + (cluster.counts23 & 0xffff) +
+                             (cluster.counts23 >> 16) + (cluster.counts45 & 0xffff) + (cluster.counts45 >> 16);
+      CHECK(count == 0 || cluster.base == clusterQuads, "cluster base %u != %u", cluster.base, clusterQuads);
+      clusterQuads += count;
+    }
+  };
+  sumClusters(mesh.clusters);
+  const uint32_t opaqueQuads = clusterQuads;
+  sumClusters(mesh.translucentClusters);
   CHECK(clusterQuads == mesh.quads.size(), "cluster total %u != %zu", clusterQuads, mesh.quads.size());
-  for (const uint64_t q : mesh.quads) {
+  for (size_t qi = 0; qi < mesh.quads.size(); ++qi) {
+    const uint64_t q = mesh.quads[qi];
     const uint32_t p = uint32_t(q), meta = uint32_t(q >> 32);
     const int x = p & 31, y = (p >> 5) & 31, z = (p >> 10) & 31, n = (p >> 15) & 7;
     const uint32_t ao = (p >> 18) & 0xff, length = ((p >> 26) & 31) + 1, width = ((meta >> 26) & 7) + 1;
     const uint32_t block = meta & 0x3ff;
+    CHECK((block == kOcean) == (qi >= opaqueQuads), "quad %zu (block %u) in the wrong cluster set", qi, block);
     for (uint32_t a = 0; a < length; ++a) {
       for (uint32_t b = 0; b < width; ++b) {
         int cx = x, cy = y, cz = z;
@@ -105,7 +143,7 @@ void checkChunk(const Neighborhood &nb, int32_t chunkY, const ChunkMesh &mesh,
       for (int x = 0; x < 32; ++x)
         for (int n = 0; n < 6; ++n) {
           if (only && !only(x, y, z)) continue;
-          const bool face = brute.solid(x, y, z) && !brute.solid(x + o[n][0], y + o[n][1], z + o[n][2]);
+          const bool face = brute.face(x, y, z, o[n][0], o[n][1], o[n][2]);
           const auto it = covered.find({x, y, z, n});
           const int count = it == covered.end() ? 0 : it->second;
           CHECK(count == (face ? 1 : 0), "face %d %d %d n%d covered %d times, expected %d (chunk %d %d %d)", x, y, z,
@@ -117,13 +155,21 @@ void checkChunk(const Neighborhood &nb, int32_t chunkY, const ChunkMesh &mesh,
 void checkFill(const Column &column) {
   for (size_t i = 0; i < column.chunks.size(); ++i) {
     const int32_t chunkY = column.firstChunkY + int32_t(i);
+    if (column.chunks[i] == nullptr) {
+      // Unstored slot: only allowed for chunks that are entirely ocean (no faces inside).
+      for (int z = 0; z < 32; ++z)
+        for (int x = 0; x < 32; ++x)
+          CHECK(column.height(x, z) <= chunkY * 32 && (chunkY + 1) * 32 <= world::kSeaLevel,
+                "unstored chunk %d is not fully ocean", chunkY);
+      continue;
+    }
     for (int z = 0; z < 32; ++z)
       for (int x = 0; x < 32; ++x) {
         const int h = column.height(x, z);
         const float dither = column.dither[z * 32 + x];
         for (int y = 0; y < 32; ++y) {
           const int wy = chunkY * 32 + y;
-          uint16_t expected = kAir;
+          uint16_t expected = wy < world::kSeaLevel ? kOcean : kAir;
           if (wy < h) {
             int t[3];
             bool near = false;
@@ -139,6 +185,8 @@ void checkFill(const Column &column) {
           }
           CHECK(column.chunks[i]->ids[VoxelChunk::index(x, y, z)] == expected, "fill mismatch");
           CHECK(((column.chunks[i]->solid[z * 32 + x] >> y) & 1u) == (wy < h ? 1u : 0u), "solid mask mismatch");
+          CHECK(((column.chunks[i]->ocean[z * 32 + x] >> y) & 1u) == (wy >= h && wy < world::kSeaLevel ? 1u : 0u),
+                "ocean mask mismatch");
         }
       }
   }
@@ -174,8 +222,58 @@ int main() {
   }
   std::printf("height checksum %016llx (range %.1f .. %.1f)\n", (unsigned long long)checksum, minH, maxH);
 
+  // Land floor: wherever the continent layer says land (>= kCoastBand), the surface stays above sea level.
+  {
+    size_t land = 0, ocean = 0;
+    float lowestLand = 1e9f;
+    for (int32_t i = 0; i < 20000; ++i) {
+      int32_t xs[8], zs[8];
+      float h[8], c[8];
+      for (int l = 0; l < 8; ++l) {
+        xs[l] = (i * 8 + l) * 389 % 400000 - 200000;
+        zs[l] = (i * 8 + l) * 7919 % 400000 - 200000;
+      }
+      terrain::sampleHeights8(xs, zs, h);
+      terrain::sampleContinent8(xs, zs, c);
+      for (int l = 0; l < 8; ++l) {
+        if (c[l] >= terrain::kCoastBand) {
+          ++land;
+          lowestLand = std::min(lowestLand, h[l]);
+          CHECK(h[l] >= 1.0f, "land at %d %d below the floor: %.2f (continent %.1f)", xs[l], zs[l], h[l], c[l]);
+        } else if (c[l] < 0.0f) {
+          ++ocean;
+        }
+      }
+    }
+    std::printf("land floor: %zu land / %zu ocean samples, lowest land %.2f\n", land, ocean, lowestLand);
+  }
+
   // Mesher vs brute force on a spread of columns (plains, coasts, mountains), with and without neighbors.
-  const int32_t samples[][2] = {{0, 0}, {3, -7}, {40, 12}, {-120, 75}, {300, -260}, {-900, 410}, {1500, 1500}, {77, 333}};
+  std::vector<std::array<int32_t, 2>> samples = {{0, 0},      {3, -7},     {40, 12},    {-120, 75},
+                                                 {300, -260}, {-900, 410}, {1500, 1500}, {77, 333}};
+  // Plus ocean columns: a deep one (unstored fully-ocean chunks between seabed and surface) and a coast.
+  {
+    bool deep = false, coast = false;
+    for (int32_t i = 0; i < 4000 && !(deep && coast); ++i) {
+      const int32_t cx = i * 7 - 9000, cz = i * 3 - 5000;
+      float lo = 1e9f, hi = -1e9f;
+      for (const int32_t d : {0, 31}) {
+        for (const int32_t e : {0, 31}) {
+          const float h = terrain::sampleHeight(cx * 32 + d, cz * 32 + e);
+          lo = std::min(lo, h);
+          hi = std::max(hi, h);
+        }
+      }
+      if (!deep && hi < -70.0f) {
+        samples.push_back({cx, cz});
+        deep = true;
+      } else if (!coast && lo < -2.0f && hi > 2.0f) {
+        samples.push_back({cx, cz});
+        coast = true;
+      }
+    }
+    CHECK(deep && coast, "no deep ocean / coast sample found");
+  }
   size_t chunksChecked = 0, quads = 0;
   for (const auto &s : samples) {
     std::shared_ptr<Column> cols[3][3];
@@ -205,6 +303,7 @@ int main() {
     CpuWorld world(kIds, 4);
     std::map<std::tuple<int32_t, int32_t, int32_t>, ChunkMesh> meshes;
     int32_t top = 0;
+    int32_t regionLow = 0, regionHigh = 0; // world y range checkAround compares against brute force
     auto pump = [&](ChunkXZ center) {
       for (int i = 0; i < 20000 && !(world.squareLoaded(center) && world.readyCenter() == center); ++i) {
         world.update(center, {});
@@ -241,7 +340,7 @@ int main() {
             // Near the shaft only: borders elsewhere may have been meshed before a neighbor loaded (border heights).
             const auto nearShaft = [&](int x, int y, int z) {
               const int32_t wx = cx * 32 + x, wy = cy * 32 + y, wz = cz * 32 + z;
-              return wx >= 29 && wx <= 34 && wz >= -3 && wz <= 2 && wy >= top - 83 && wy <= top + 5;
+              return wx >= 29 && wx <= 34 && wz >= -3 && wz <= 2 && wy >= regionLow && wy <= regionHigh;
             };
             checkChunk(nb, cy, it != meshes.end() ? it->second : ChunkMesh{}, nearShaft);
             ++checked;
@@ -252,6 +351,8 @@ int main() {
 
     pump({0, 0});
     top = world.column(0, -1)->height(31, 31);
+    regionLow = top - 83;
+    regionHigh = top + 5;
     const int32_t firstBefore = world.column(0, -1)->firstChunkY;
     int broken = 0;
     for (int32_t y = top + 2; y > top - 80; --y)
@@ -284,6 +385,179 @@ int main() {
     CHECK(regenerated, "unloaded side not regenerated");
     CHECK(open, "loaded side lost its edits");
     checkAround("after reload");
+
+    // Block placing on top of the same corner: an opaque pillar from the surface past the stored chunks (new chunks
+    // above), non-opaque blocks beside it (bit 9 ids), same-id glass touching (shared face culled) and two different
+    // non-opaque ids touching (both faces shown).
+    constexpr uint16_t kStone = 2, kGlass = blocks::kNonOpaqueBit, kLeaves = blocks::kNonOpaqueBit + 1;
+    int32_t base = std::numeric_limits<int32_t>::min();
+    for (int32_t x = 30; x <= 33; ++x)
+      for (int32_t z = -2; z <= 1; ++z) {
+        int32_t y = top + 120;
+        while (y > top - 200 && !world.isCollidable(x, y, z)) --y;
+        base = std::max(base, y + 1);
+      }
+    const int32_t storedTop = (world.column(0, -1)->firstChunkY + int32_t(world.column(0, -1)->chunks.size())) * 32;
+    const int32_t pillarTop = std::max(base + 40, storedTop + 8);
+    bool placed = true;
+    for (int32_t y = base; y < pillarTop; ++y) placed = placed && world.placeBlock(31, y, -1, kStone);
+    for (int32_t y = base; y < base + 6; ++y) {
+      placed = placed && world.placeBlock(32, y, -1, kGlass) && world.placeBlock(33, y, -1, kGlass) &&
+               world.placeBlock(32, y, 0, kLeaves);
+    }
+    CHECK(placed, "a placement into air failed");
+    CHECK(!world.placeBlock(31, base, -1, kStone), "placed into an occupied cell");
+    CHECK(!world.placeBlock(31, pillarTop, -1, kAir), "placed air");
+    CHECK(world.isCollidable(32, base, -1) && !world.isSolid(32, base, -1), "glass should collide but not be opaque");
+    CHECK(world.blockId(32, base, 0) == kLeaves, "leaves id not stored");
+    const auto hit = world.raycast({32.5f, base + 10.5f, -0.5f}, {0.0f, -1.0f, 0.0f}, 20.0f);
+    CHECK(hit && hit->block == (BlockXYZ{32, base + 5, -1}), "raycast should stop at the top glass block");
+    pump({0, 0});
+    regionLow = base - 3;
+    regionHigh = pillarTop + 3;
+    checkAround("after placing");
+    CHECK(world.breakBlock(32, base + 2, -1), "could not break glass");
+    CHECK(world.blockId(32, base + 2, -1) == kAir, "broken glass not air");
+    pump({0, 0});
+    checkAround("after breaking placed glass");
+  }
+
+  // Ocean edits: placing into ocean, breaking it back (ocean flows in on the next flow step), the raycast passing
+  // through water, and a dry tunnel under the seabed flooding one block per step once a shaft connects it.
+  {
+    const std::array<int32_t, 2> coast = samples.back();
+    const ChunkXZ center{coast[0], coast[1]};
+    CpuWorld world(kIds, 4);
+    std::map<std::tuple<int32_t, int32_t, int32_t>, ChunkMesh> meshes;
+    auto pump = [&] {
+      for (int i = 0; i < 20000 && !(world.squareLoaded(center) && world.readyCenter() == center); ++i) {
+        world.update(center, {});
+        for (ColumnMeshEvent &e : world.takeMeshEvents())
+          for (ChunkMesh &m : e.chunks) meshes[{e.cx, m.cy, e.cz}] = std::move(m);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      world.update(center, {});
+      for (ColumnMeshEvent &e : world.takeMeshEvents())
+        for (ChunkMesh &m : e.chunks) meshes[{e.cx, m.cy, e.cz}] = std::move(m);
+    };
+    pump();
+    auto heightAt = [&](int32_t x, int32_t z) {
+      const int32_t cx = floorDiv(x, 32), cz = floorDiv(z, 32);
+      return world.column(cx, cz)->height(x - cx * 32, z - cz * 32);
+    };
+    // A seabed cell no lower than its 8 neighbors (so a shaft down from it is walled by terrain), with room for a
+    // tunnel toward +x.
+    int32_t sx = 0, sz = 0, sh = 0;
+    bool found = false;
+    for (int32_t z = center[1] * 32 - 24; z < center[1] * 32 + 56 && !found; ++z)
+      for (int32_t x = center[0] * 32 - 24; x < center[0] * 32 + 48 && !found; ++x) {
+        const int32_t h = heightAt(x, z);
+        if (h > -6) continue;
+        bool walled = true;
+        for (int dz = -1; dz <= 1; ++dz)
+          for (int dx = -1; dx <= 1; ++dx) walled = walled && heightAt(x + dx, z + dz) >= h;
+        if (walled) {
+          sx = x, sz = z, sh = h;
+          found = true;
+        }
+      }
+    CHECK(found, "no seabed cell for the ocean edit test");
+    if (found) {
+      double t = 1000.0;
+      auto step = [&] {
+        t += 1.0;
+        world.tickFluids(t);
+      };
+      const int32_t surfaceY = world::kSeaLevel - 1;
+      CHECK(world.blockId(sx, surfaceY, sz) == kOcean && world.isInfiniteSource(sx, surfaceY, sz), "no ocean at surface");
+      CHECK(!world.isCollidable(sx, surfaceY, sz) && !world.isSolid(sx, surfaceY, sz), "ocean collides");
+      const auto hit = world.raycast({sx + 0.5f, 5.5f, sz + 0.5f}, {0.0f, -1.0f, 0.0f}, 200.0f);
+      CHECK(hit && hit->block == (BlockXYZ{sx, sh - 1, sz}), "raycast did not pass through the ocean to the seabed");
+      CHECK(!world.breakBlock(sx, surfaceY, sz), "broke ocean");
+      CHECK(world.placeBlock(sx, surfaceY, sz, 2), "could not place into ocean");
+      CHECK(world.blockId(sx, surfaceY, sz) == 2 && world.isCollidable(sx, surfaceY, sz), "placed block missing");
+      CHECK(world.breakBlock(sx, surfaceY, sz), "could not break the placed block");
+      CHECK(world.blockId(sx, surfaceY, sz) == kAir, "broken cell not air before the flow step");
+      step();
+      CHECK(world.blockId(sx, surfaceY, sz) == kOcean, "ocean did not flow back in");
+      for (int i = 0; i < 100; ++i) CHECK(world.isInfiniteSource(sx, surfaceY, sz), "ocean source changed");
+
+      // Tunnel 3 below the lowest surrounding seabed, 6 long toward +x, dug first (stays dry), then a shaft from
+      // the seabed down to it: the ocean floods shaft then tunnel, exactly one cell per step.
+      int32_t lowest = sh;
+      for (int32_t x = sx - 1; x <= sx + 6; ++x)
+        for (int32_t z = sz - 1; z <= sz + 1; ++z) lowest = std::min(lowest, heightAt(x, z));
+      const int32_t depth = lowest - 3;
+      std::vector<BlockXYZ> path;
+      for (int32_t y = sh - 1; y > depth; --y) path.push_back({sx, y, sz});
+      for (int32_t x = sx; x < sx + 6; ++x) path.push_back({x, depth, sz});
+      for (int32_t x = sx; x < sx + 6; ++x) CHECK(world.breakBlock(x, depth, sz), "tunnel dig failed");
+      for (int i = 0; i < 3; ++i) step();
+      bool dry = true;
+      for (int32_t x = sx; x < sx + 6; ++x) dry = dry && world.blockId(x, depth, sz) == kAir;
+      CHECK(dry, "unconnected tunnel flooded");
+      for (int32_t y = sh - 1; y > depth; --y) CHECK(world.breakBlock(sx, y, sz), "shaft dig failed");
+      for (size_t k = 1; k <= path.size(); ++k) {
+        step();
+        CHECK(world.blockId(path[k - 1][0], path[k - 1][1], path[k - 1][2]) == kOcean, "path cell %zu not flooded at step %zu", k - 1, k);
+        if (k < path.size())
+          CHECK(world.blockId(path[k][0], path[k][1], path[k][2]) == kAir, "path cell %zu flooded early at step %zu", k, k);
+      }
+      std::printf("ocean edits: seabed %d at %d %d, flooded %zu-cell shaft + tunnel one per step\n", sh, sx, sz,
+                  path.size());
+
+      // Meshes around the edits against brute force.
+      pump();
+      const int before = failures;
+      for (int32_t cz = floorDiv(sz - 2, 32); cz <= floorDiv(sz + 2, 32); ++cz)
+        for (int32_t cx = floorDiv(sx - 2, 32); cx <= floorDiv(sx + 8, 32); ++cx) {
+          std::shared_ptr<const Column> keep[3][3];
+          Neighborhood nb;
+          for (int dz = -1; dz <= 1; ++dz)
+            for (int dx = -1; dx <= 1; ++dx) {
+              keep[dz + 1][dx + 1] = world.column(cx + dx, cz + dz);
+              nb.columns[dz + 1][dx + 1] = keep[dz + 1][dx + 1].get();
+            }
+          for (int32_t cy = floorDiv(depth - 2, 32); cy <= floorDiv(surfaceY + 1, 32); ++cy) {
+            const auto it = meshes.find({cx, cy, cz});
+            const auto near = [&](int x, int y, int z) {
+              const int32_t wx = cx * 32 + x, wy = cy * 32 + y, wz = cz * 32 + z;
+              return wx >= sx - 2 && wx <= sx + 7 && wz >= sz - 2 && wz <= sz + 2 && wy >= depth - 2 && wy <= surfaceY + 1;
+            };
+            checkChunk(nb, cy, it != meshes.end() ? it->second : ChunkMesh{}, near);
+          }
+        }
+      std::printf("ocean edits: meshes%s\n", failures == before ? " match" : " FAILED");
+    }
+  }
+
+  // Registry: opaque blocks numbered from 0, non-opaque ones from 512 (bit 9), each in file order.
+  {
+    const char *path = "terrain_tests_blocks.txt";
+    {
+      std::ofstream file(path);
+      file << "[a]\nall = a.png\n[glass]\nall = g.png\nopaque = false\n[b]\nall = b.png\n[leaves]\nopaque = false\n"
+              "all = l.png\n";
+    }
+    const blocks::Registry registry = blocks::loadRegistry(path, "");
+    CHECK(registry.idOf("a") == 0 && registry.idOf("b") == 1, "opaque ids not 0, 1");
+    CHECK(registry.idOf("glass") == 512 && registry.idOf("leaves") == 513, "non-opaque ids not 512, 513");
+    CHECK(registry.maxId() == 513, "maxId %u", registry.maxId());
+    CHECK(blocks::isOpaque(registry.idOf("b")) && !blocks::isOpaque(registry.idOf("glass")) && !blocks::isOpaque(kAir),
+          "isOpaque");
+    {
+      std::ofstream file(path);
+      file << "[a]\nall = a.png\nopaque = maybe\n";
+    }
+    bool threw = false;
+    try {
+      blocks::loadRegistry(path, "");
+    } catch (const std::exception &) {
+      threw = true;
+    }
+    CHECK(threw, "opaque = maybe accepted");
+    std::remove(path);
+    std::printf("registry: id ranges checked\n");
   }
 
   // Timings.

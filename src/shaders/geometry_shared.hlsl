@@ -13,7 +13,10 @@ struct GeometryPushConstants {
   uint debugTint;
   uint quadBase;  // vertex path: first quad of this draw
   uint quadCount; // vertex path: quads in this draw (0: up to QuadCount[0])
+  uint pass;      // GEOMETRY_PASS_*
 };
+static const uint GEOMETRY_PASS_OPAQUE = 0u;
+static const uint GEOMETRY_PASS_TRANSLUCENT = 1u; // blended water: no back-face culling
 [[vk::push_constant]]
 ConstantBuffer<GeometryPushConstants> drawParams;
 

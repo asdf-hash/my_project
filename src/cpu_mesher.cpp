@@ -40,6 +40,39 @@ struct PaddedMasks {
   }
 };
 
+// The same pre-shifted columns for ocean cells (Column::ocean32; border heights where a neighbor isn't loaded).
+void buildOceanMasks(const Neighborhood &nb, int32_t chunkY, PaddedMasks &masks) {
+  const Column &center = nb.center();
+  for (int32_t pz = -1; pz <= N; ++pz) {
+    const int32_t dz = pz < 0 ? -1 : (pz >= N ? 1 : 0);
+    for (int32_t px = -1; px <= N; ++px) {
+      const int32_t dx = px < 0 ? -1 : (px >= N ? 1 : 0);
+      const Column *column = nb.columns[dz + 1][dx + 1];
+      uint32_t below, self, above;
+      if (column != nullptr) {
+        const int32_t lx = px - dx * N;
+        const int32_t lz = pz - dz * N;
+        below = column->ocean32(lx, lz, chunkY - 1);
+        self = column->ocean32(lx, lz, chunkY);
+        above = column->ocean32(lx, lz, chunkY + 1);
+      } else if (center.oceanId != kAir) {
+        const int32_t h = center.borderHeight(px, pz);
+        below = Column::oceanMask(h, chunkY - 1);
+        self = Column::oceanMask(h, chunkY);
+        above = Column::oceanMask(h, chunkY + 1);
+      } else {
+        below = self = above = 0u;
+      }
+      const uint64_t m = static_cast<uint64_t>(below >> 31u) | (static_cast<uint64_t>(self) << 1u) |
+                         (static_cast<uint64_t>(above & 1u) << 33u);
+      const int32_t i = (pz + 1) * kPad + (px + 1);
+      masks.shifted[0][i] = static_cast<uint32_t>(m);
+      masks.shifted[1][i] = static_cast<uint32_t>(m >> 1u);
+      masks.shifted[2][i] = static_cast<uint32_t>(m >> 2u);
+    }
+  }
+}
+
 void buildMasks(const Neighborhood &nb, int32_t chunkY, PaddedMasks &masks) {
   const Column &center = nb.center();
   for (int32_t pz = -1; pz <= N; ++pz) {
@@ -121,6 +154,26 @@ void computePlanes(const PaddedMasks &masks, uint32_t normal, int32_t tileX, int
       lo[k].store(reinterpret_cast<int32_t *>(&planes.aoLo[k][row * TILE]));
       hi[k].store(reinterpret_cast<int32_t *>(&planes.aoHi[k][row * TILE]));
     }
+  }
+}
+
+// Ocean faces of one tile in one direction: an ocean cell beside a cell that is neither opaque nor ocean (air, other
+// non-opaque blocks). No AO: water is lit flat.
+void computeOceanPlanes(const PaddedMasks &solidMasks, const PaddedMasks &oceanMasks, uint32_t normal, int32_t tileX,
+                        int32_t tileZ, TilePlanes &planes) {
+  const Int3 o = kNormals[normal];
+  const Int3 zero{0, 0, 0};
+  for (int32_t row = 0; row < TILE; ++row) {
+    const int32_t x = tileX * TILE;
+    const int32_t z = tileZ * TILE + row;
+    const I8 ocean = oceanMasks.load(zero, x, z);
+    const I8 covered = solidMasks.load(o, x, z) | oceanMasks.load(o, x, z);
+    // andnot(a, b) = a & ~b: ocean cells whose neighbor is neither opaque nor ocean.
+    simd::andnot(ocean, covered).store(reinterpret_cast<int32_t *>(&planes.face[row * TILE]));
+  }
+  for (int k = 0; k < 4; ++k) {
+    planes.aoLo[k].fill(0u);
+    planes.aoHi[k].fill(0u);
   }
 }
 
@@ -283,6 +336,67 @@ uint32_t emitSide(const TilePlanes &planes, const VoxelChunk &voxels, uint32_t n
   return count;
 }
 
+// Opaque bit of chunk-local cell (x, y, z), x / z in -1..32, y in -1..32, from the padded masks.
+bool opaqueAt(const PaddedMasks &masks, int32_t x, int32_t y, int32_t z) {
+  const int32_t i = (z + 1) * kPad + (x + 1);
+  // shifted[0] has the cell at y in bit y + 1, shifted[2] in bit y - 1 (reaches y = 32).
+  return y <= 30 ? (masks.shifted[0][i] >> (y + 1)) & 1u : (masks.shifted[2][i] >> (y - 1)) & 1u;
+}
+
+// Block id of chunk-local cell (x, y, z), x / z in -1..32 (neighbor columns; border heights where not loaded).
+uint16_t neighborId(const Neighborhood &nb, int32_t chunkY, int32_t x, int32_t y, int32_t z) {
+  const int32_t dx = x < 0 ? -1 : (x >= N ? 1 : 0);
+  const int32_t dz = z < 0 ? -1 : (z >= N ? 1 : 0);
+  const int32_t worldY = chunkY * N + y;
+  if (const Column *column = nb.columns[dz + 1][dx + 1]) {
+    return column->blockId(x - dx * N, worldY, z - dz * N);
+  }
+  return worldY < nb.center().borderHeight(x, z) ? kBuriedTerrain : nb.center().emptyCell(worldY);
+}
+
+uint32_t vertexAo(bool a, bool b, bool corner) { return a && b ? 3u : uint32_t(a) + uint32_t(b) + uint32_t(corner); }
+
+// Non-opaque blocks (id bit 9 set): the binary masks leave them out, so they get their own per-cell pass. Full
+// cubes for now: a face shows unless the neighbor is opaque or the same block, as a 1x1 quad with the binary
+// mesher's AO (from opaque neighbors). nonOpaque holds the chunk's non-opaque cells as column bits.
+uint32_t emitNonOpaque(const PaddedMasks &masks, const Neighborhood &nb, const VoxelChunk &voxels,
+                       const std::array<uint32_t, N * N> &nonOpaque, int32_t chunkY, uint32_t normal, int32_t tileX,
+                       int32_t tileZ, std::vector<uint64_t> &quads, TileBounds &bounds) {
+  const Int3 o = kNormals[normal];
+  const Int3 u = kU[normal];
+  const Int3 v = kV[normal];
+  uint32_t count = 0;
+  for (int32_t row = 0; row < TILE; ++row) {
+    for (int32_t col = 0; col < TILE; ++col) {
+      const int32_t x = tileX * TILE + col;
+      const int32_t z = tileZ * TILE + row;
+      uint32_t bits = nonOpaque[z * N + x];
+      while (bits != 0u) {
+        const int32_t y = std::countr_zero(bits);
+        bits &= bits - 1u;
+        const Int3 out{x + o.x, y + o.y, z + o.z};
+        if (opaqueAt(masks, out.x, out.y, out.z)) {
+          continue;
+        }
+        const uint16_t id = voxels.ids[VoxelChunk::index(x, y, z)];
+        if (neighborId(nb, chunkY, out.x, out.y, out.z) == id) {
+          continue;
+        }
+        const auto at = [&](Int3 d) { return opaqueAt(masks, out.x + d.x, out.y + d.y, out.z + d.z); };
+        const Int3 zero{0, 0, 0};
+        const bool u0 = at(zero - u), u1 = at(u), v0 = at(zero - v), v1 = at(v);
+        const uint32_t ao = vertexAo(u0, v0, at(zero - u - v)) | (vertexAo(u1, v0, at(u - v)) << 2u) |
+                            (vertexAo(u1, v1, at(u + v)) << 4u) | (vertexAo(u0, v1, at(v - u)) << 6u);
+        quads.push_back(packQuad(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z), normal,
+                                 ao, id & 0x3ffu, 1u, 1u));
+        ++count;
+        bounds.add(y, y + 1);
+      }
+    }
+  }
+  return count;
+}
+
 } // namespace
 
 uint64_t packQuad(uint32_t x, uint32_t y, uint32_t z, uint32_t normalIndex, uint32_t ao, uint32_t blockType,
@@ -310,6 +424,7 @@ void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
   out.quads.clear();
   out.chunkOffset = packChunkOffset(center.cx, chunkY, center.cz);
   out.clusters = {};
+  out.translucentClusters = {};
   if (voxels == nullptr) {
     return;
   }
@@ -317,6 +432,18 @@ void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
   thread_local PaddedMasks masks;
   thread_local TilePlanes planes;
   buildMasks(nb, chunkY, masks);
+  thread_local std::array<uint32_t, N * N> nonOpaque;
+  const bool hasNonOpaque = voxels->nonOpaqueCount != 0;
+  if (hasNonOpaque) {
+    for (int32_t column = 0; column < N * N; ++column) {
+      uint32_t bits = 0;
+      for (int32_t y = 0; y < N; ++y) {
+        const uint16_t id = voxels->ids[static_cast<size_t>(column * N + y)];
+        bits |= (id != kAir && id != center.oceanId && !blocks::isOpaque(id) ? 1u : 0u) << y;
+      }
+      nonOpaque[static_cast<size_t>(column)] = bits;
+    }
+  }
 
   for (int32_t tileZ = 0; tileZ < N / TILE; ++tileZ) {
     for (int32_t tileX = 0; tileX < N / TILE; ++tileX) {
@@ -327,6 +454,45 @@ void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
       for (int run = 0; run < 6; ++run) {
         const uint32_t normal = kRunNormals[run];
         computePlanes(masks, normal, tileX, tileZ, planes);
+        counts[run] = normal == 2u || normal == 3u
+                          ? emitHorizontal(planes, *voxels, normal, tileX, tileZ, out.quads, bounds)
+                          : emitSide(planes, *voxels, normal, tileX, tileZ, out.quads, bounds);
+        if (hasNonOpaque) {
+          counts[run] += emitNonOpaque(masks, nb, *voxels, nonOpaque, chunkY, normal, tileX, tileZ, out.quads, bounds);
+        }
+      }
+      cluster.counts01 = counts[0] | (counts[1] << 16u);
+      cluster.counts23 = counts[2] | (counts[3] << 16u);
+      cluster.counts45 = counts[4] | (counts[5] << 16u);
+      const int32_t faceLow = bounds.low <= bounds.high ? bounds.low : 0;
+      const int32_t faceHigh = bounds.low <= bounds.high ? bounds.high : N;
+      const float minX = static_cast<float>(center.cx * N + tileX * TILE);
+      const float minY = static_cast<float>(chunkY * N + faceLow);
+      const float minZ = static_cast<float>(center.cz * N + tileZ * TILE);
+      cluster.boundsMin = {minX, minY, minZ, 0.0f};
+      cluster.boundsMax = {minX + TILE, minY + static_cast<float>(faceHigh - faceLow), minZ + TILE, 0.0f};
+    }
+  }
+
+  // Ocean faces into the translucent clusters, after every opaque quad.
+  bool hasOcean = false;
+  for (const uint32_t bits : voxels->ocean) {
+    hasOcean = hasOcean || bits != 0u;
+  }
+  if (!hasOcean) {
+    return; // translucentClusters stay zero (no quads)
+  }
+  thread_local PaddedMasks oceanMasks;
+  buildOceanMasks(nb, chunkY, oceanMasks);
+  for (int32_t tileZ = 0; tileZ < N / TILE; ++tileZ) {
+    for (int32_t tileX = 0; tileX < N / TILE; ++tileX) {
+      QuadCluster &cluster = out.translucentClusters[static_cast<size_t>(tileZ * 4 + tileX)];
+      cluster.base = static_cast<uint32_t>(out.quads.size());
+      std::array<uint32_t, 6> counts{};
+      TileBounds bounds;
+      for (int run = 0; run < 6; ++run) {
+        const uint32_t normal = kRunNormals[run];
+        computeOceanPlanes(masks, oceanMasks, normal, tileX, tileZ, planes);
         counts[run] = normal == 2u || normal == 3u
                           ? emitHorizontal(planes, *voxels, normal, tileX, tileZ, out.quads, bounds)
                           : emitSide(planes, *voxels, normal, tileX, tileZ, out.quads, bounds);
