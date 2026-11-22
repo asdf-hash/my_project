@@ -18,12 +18,21 @@
 #include <utility>
 #include <vector>
 
+// Every point within this distance of the camera (nearest-point, 3D) is covered by a clipmap tile; beyond it the
+// clipmap ends. The border fog in fragMain is opaque before it (renderer.cpp, ubo.viewRayScale.w).
+inline constexpr float kClipmapRadius =
+    static_cast<float>(world::kRenderDistance * CHUNK_SIZE * (1u << (MAX_LOD - 1u)));
+
 struct ClipmapView {
   std::array<float, 3> position;
   std::array<float, 3> forward;
   std::array<float, 3> right;
   std::array<float, 3> up;
+  // LOD distances inside the view frustum (from the current FOV), and outside it (from the base FOV). They differ only
+  // while zoomed: the narrow FOV doubles the distances, and applying that to the whole ring meshed ~3x the quads, all
+  // but a sliver of them off screen (it overflowed QuadBuffer). Outside the frustum the zoom changes nothing.
   std::array<float, MAX_LOD> lodDistanceSquared;
+  std::array<float, MAX_LOD> outsideLodDistanceSquared;
   float verticalFovRadians;
   float aspectRatio;
   // Drop tiles outside the (margin-padded) view frustum. Only the vertex-pulling path sets this: the mesh path
@@ -65,7 +74,7 @@ inline ClipmapResult buildVisibleClipmap(const ClipmapView &view) {
   // envelope's top or bottom (sea level, ocean floor, peaks) to coarser LODs.
   const float deltaY = std::max({static_cast<float>(world::kMinTerrainHeight) - view.position[1], 0.0f,
                                  view.position[1] - static_cast<float>(world::kMaxTerrainHeight)});
-  const float maxRadius = static_cast<float>(world::kRenderDistance * CHUNK_SIZE * (1u << (MAX_LOD - 1u)));
+  const float maxRadius = kClipmapRadius;
   constexpr float motionMargin = static_cast<float>(CHUNK_SIZE * 2);
   const float paddedMaxRadius = maxRadius + motionMargin;
   const float maxRadiusSquared = paddedMaxRadius * paddedMaxRadius;
@@ -139,7 +148,8 @@ inline ClipmapResult buildVisibleClipmap(const ClipmapView &view) {
       return;
     }
 
-    if (lod > 0 && (selectLodSquared(distanceSquared, view.lodDistanceSquared) < lod ||
+    const std::array<float, MAX_LOD> &lodDistances = visible ? view.lodDistanceSquared : view.outsideLodDistanceSquared;
+    if (lod > 0 && (selectLodSquared(distanceSquared, lodDistances) < lod ||
                     overlapsCpuSquare(chunkX, chunkZ, scale, 1))) {
       const int32_t childScale = scale / 2;
       self(self, chunkX, chunkZ, lod - 1);

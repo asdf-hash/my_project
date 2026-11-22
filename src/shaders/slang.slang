@@ -73,7 +73,7 @@ float2 rotateUvGradient(float2 gradient, uint rotation) {
 }
 
 DecodedQuad decodeQuad(uint quadIndex) {
-  return decodePackedQuad(QuadBuffer[quadIndex], ChunkOffsets[quadIndex], ubo.cameraPosition.xyz);
+  return decodePackedQuad(QuadBuffer[quadIndex], ChunkOffsets[quadIndex], ubo.cullCameraPosition.xyz);
 }
 
 MeshVertex makeVertex(DecodedQuad quad, uint corner, float3 worldPos, float4 clipPos) {
@@ -391,14 +391,21 @@ SceneFragmentOutput shadeFragment(FragmentInput input, bool waterPass) {
   const float2 currentUv = input.pos.xy / ubo.renderSize;
   const float2 previousNdc = input.previousClip.xy / input.previousClip.w;
   const float2 previousUv = float2(previousNdc.x * 0.5f + 0.5f, 0.5f - previousNdc.y * 0.5f);
-  // Underwater (camera in an ocean cell): short water fog over the whole view distance. Must match the clear colors
-  // in renderer.cpp.
+  // Underwater (camera in an ocean cell): short linear water fog. Must match the clear colors in renderer.cpp.
+  // Air, two layers combined:
+  // - a weak linear haze from the camera on, reaching AIR_FOG_HAZE at the border fog's end;
+  // - a strong border fog over the last AIR_FOG_BORDER_WIDTH of the view (smoothstep, opaque at its end), which hides
+  //   the clipmap's edge. Its end comes from the renderer (ubo.viewRayScale.w), inside the clipmap's radius.
   const bool underwater = ubo.viewRayScale.z > 0.5f;
-  const float fogStart = underwater ? 0.0f : 1200.0f;
-  const float fogEnd = underwater ? WATER_FOG_DISTANCE : 12000.0f;
   const float2 ndc = currentUv * 2.0f - 1.0f;
   const float cameraDistance = input.viewDepth * length(float3(ndc * ubo.viewRayScale.xy, 1.0f));
-  const float fogAmount = saturate((cameraDistance - fogStart) / (fogEnd - fogStart));
+  const float AIR_FOG_HAZE = 0.3f;
+  const float AIR_FOG_BORDER_WIDTH = 0.15f; // of the border fog's end distance
+  const float borderFogEnd = ubo.viewRayScale.w;
+  const float haze = AIR_FOG_HAZE * saturate(cameraDistance / borderFogEnd);
+  const float border = smoothstep(borderFogEnd * (1.0f - AIR_FOG_BORDER_WIDTH), borderFogEnd, cameraDistance);
+  const float fogAmount = underwater ? saturate(cameraDistance / WATER_FOG_DISTANCE)
+                                     : 1.0f - (1.0f - haze) * (1.0f - border);
   const float3 skyColor = underwater ? WATER_FOG_COLOR : float3(0.55f, 0.72f, 0.9f);
   SceneFragmentOutput output;
   float3 litColor = color.rgb * coloredLight * aoFactor * shading;

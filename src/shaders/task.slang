@@ -21,7 +21,7 @@ bool boxOutsideFrustum(float3 boundsMin, float3 boundsMax) {
   for (uint i = 0u; i < 8u; ++i) {
     const float3 corner = float3((i & 1u) != 0u ? boundsMax.x : boundsMin.x, (i & 2u) != 0u ? boundsMax.y : boundsMin.y,
                                  (i & 4u) != 0u ? boundsMax.z : boundsMin.z);
-    const float4 c = mul(ubo.mvp, float4(corner, 1.0));
+    const float4 c = mul(ubo.cullMvp, float4(corner, 1.0));
     allLeft = allLeft && c.x < -c.w;
     allRight = allRight && c.x > c.w;
     allBelow = allBelow && c.y < -c.w;
@@ -46,7 +46,7 @@ bool boxOccluded(float3 boundsMin, float3 boundsMax) {
   for (uint i = 0u; i < 8u; ++i) {
     const float3 corner = float3((i & 1u) != 0u ? boundsMax.x : boundsMin.x, (i & 2u) != 0u ? boundsMax.y : boundsMin.y,
                                  (i & 4u) != 0u ? boundsMax.z : boundsMin.z);
-    const float4 c = mul(ubo.previousMvp, float4(corner, 1.0));
+    const float4 c = mul(ubo.cullPreviousMvp, float4(corner, 1.0));
     if (c.w <= 0.1f) {
       return false;
     }
@@ -92,7 +92,7 @@ void taskMain(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID) 
     const float3 boundsMin = cluster.boundsMin.xyz;
     const float3 boundsMax = cluster.boundsMax.xyz;
     if (!boxOutsideFrustum(boundsMin, boundsMax) && !boxOccluded(boundsMin, boundsMax)) {
-      const float3 camera = ubo.cameraPosition.xyz;
+      const float3 camera = ubo.cullCameraPosition.xyz;
       const uint counts[RUNS_PER_CLUSTER] = { cluster.counts01 & 0xffffu, cluster.counts01 >> 16u,
                                               cluster.counts23 & 0xffffu, cluster.counts23 >> 16u,
                                               cluster.counts45 & 0xffffu, cluster.counts45 >> 16u };

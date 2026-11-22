@@ -5,6 +5,7 @@
 // heightmap and store nothing.
 
 #include "block_registry.hpp"
+#include "vegetation.hpp"
 #include "world.hpp"
 
 #include <algorithm>
@@ -33,6 +34,9 @@ struct TerrainBlockIds {
   std::array<uint16_t, 4> deep{};
   // Ocean block (non-opaque): fills empty cells below world::kSeaLevel. kAir disables the ocean.
   uint16_t ocean = 0xffffu;
+  // Tree blocks (world::kTreeLogBlock opaque, world::kTreeLeavesBlock non-opaque). kAir in either disables trees.
+  uint16_t log = 0xffffu;
+  uint16_t leaves = 0xffffu;
 };
 
 struct VoxelChunk {
@@ -57,6 +61,10 @@ struct Column {
   // Interior column tops in blocks (first air block), as generateHeights computes them at LOD 0.
   std::array<int32_t, CHUNK_SIZE * CHUNK_SIZE> heights{};
   std::array<float, CHUNK_SIZE * CHUNK_SIZE> dither{};
+  // One tree candidate per 8x8 cell (index cellZ * 4 + cellX), ground set, trunkHeight 0 where there is none
+  // (vegetation_shared.hlsl). Every tree lies inside its cell, so inside this column.
+  static constexpr int32_t kTreeCellsPerSide = CHUNK_SIZE >> vegetation::TREE_CELL_SHIFT;
+  std::array<vegetation::TreeInstance, kTreeCellsPerSide * kTreeCellsPerSide> trees{};
   // Block id of ocean cells (TerrainBlockIds::ocean); unstored cells between the column top and sea level are ocean.
   uint16_t oceanId = kAir;
   // Voxel chunks cover chunkY in [firstChunkY, firstChunkY + chunks.size()); null slots are unstored (follow the

@@ -4,6 +4,7 @@
 #include "../src/cpu_world.hpp"
 #include "../src/simd.hpp"
 #include "../src/terrain_cpu.hpp"
+#include "../src/vegetation.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -558,6 +559,135 @@ int main() {
     CHECK(threw, "opaque = maybe accepted");
     std::remove(path);
     std::printf("registry: id ranges checked\n");
+  }
+
+  // Trees (shaders/vegetation_shared.hlsl, shared with the GPU).
+  {
+    using namespace vegetation;
+    // Every tree block lies inside its 8x8 cell and within TREE_MAX_ABOVE of the ground, for every hash outcome.
+    uint32_t state = 12345u;
+    auto next = [&] { return state = state * 1664525u + 1013904223u; };
+    uint64_t treeChecksum = 1469598103934665603ull;
+    size_t accepted = 0;
+    for (int i = 0; i < 20000; ++i) {
+      const int2 cell(int32_t(next() >> 8) - (1 << 23), int32_t(next() >> 8) - (1 << 23));
+      TreeInstance tree = treeCandidate(cell);
+      accepted += tree.trunkHeight != 0;
+      treeChecksum = (treeChecksum ^ uint32_t(tree.trunkX) ^ (uint64_t(uint32_t(tree.trunkHeight)) << 32)) * 1099511628211ull;
+      tree.trunkHeight = 4 + i % 3; // check the shape of rejected candidates too
+      tree.ground = int32_t(next() % 200u) + 3;
+      const int32_t x0 = cell.x * 8, z0 = cell.y * 8;
+      for (int32_t z = z0 - 4; z < z0 + 12; ++z)
+        for (int32_t x = x0 - 4; x < x0 + 12; ++x)
+          for (int32_t y = tree.ground - 2; y < tree.ground + TREE_MAX_ABOVE + 2; ++y) {
+            if (treeBlockAt(tree, x, y, z) == TREE_NONE) continue;
+            CHECK(x >= x0 && x < x0 + 8 && z >= z0 && z < z0 + 8, "tree block %d %d outside cell %d %d", x, z, cell.x,
+                  cell.y);
+            CHECK(y >= tree.ground && y < tree.ground + TREE_MAX_ABOVE, "tree block y %d outside [%d, +%d)", y,
+                  tree.ground, TREE_MAX_ABOVE);
+          }
+    }
+    std::printf("trees: candidate checksum %016llx (%zu of 20000 pass the density)\n",
+                (unsigned long long)treeChecksum, accepted);
+
+    // LOD 1-2 table: every variant has a trunk capped by leaves (no log cell with open sky above it).
+    {
+      const std::vector<uint32_t> lodTable = buildTreeLodTable();
+      for (const int scale : {2, 4}) {
+        const int perCell = 8 / scale;
+        for (uint32_t offset = 0; offset < 16u; ++offset) {
+          for (uint32_t heightIndex = 0; heightIndex < 3u; ++heightIndex) {
+            const int trunkX = (TREE_RADIUS + int(offset & 3u)) / scale, trunkZ = (TREE_RADIUS + int(offset >> 2u)) / scale;
+            int trunks = 0;
+            for (int cz = 0; cz < perCell; ++cz) {
+              for (int cx = 0; cx < perCell; ++cx) {
+                const uint32_t entry = lodTable[treeLodTableIndex(scale, offset, heightIndex, uint32_t(cx), uint32_t(cz))];
+                const uint32_t logs = (entry >> 4u) & 0xfu;
+                if (logs == 0u) continue;
+                ++trunks;
+                CHECK(cx == trunkX && cz == trunkZ, "LOD table: log outside the trunk column (scale %d)", scale);
+                CHECK(((entry >> logs) & 1u) != 0u, "LOD table: trunk not capped by leaves (scale %d, offset %u, h %u)",
+                      scale, offset, 4u + heightIndex);
+              }
+            }
+            CHECK(trunks == 1, "LOD table: %d trunk columns (scale %d)", trunks, scale);
+          }
+        }
+      }
+      std::printf("trees: LOD table checked\n");
+    }
+
+    // Stamped voxels against the placement rule written plainly, on columns that have trees; then the mesher.
+    // Leaves non-opaque (cutout) and opaque (blocks.txt without `opaque = false`).
+    size_t treeColumns = 0, treesSeen = 0, treeChunks = 0;
+    for (const uint16_t leavesId : {uint16_t(blocks::kNonOpaqueBit + 1), uint16_t(7)}) {
+    TerrainBlockIds treeIds = kIds;
+    treeIds.log = 6;
+    treeIds.leaves = leavesId;
+    const size_t columnLimit = treeColumns + 6;
+    for (int32_t i = 0; i < 400 && treeColumns < columnLimit; ++i) {
+      const int32_t cx = i * 13 - 2600, cz = i * 7 + 900;
+      auto column = generateColumn(cx, cz, treeIds);
+      size_t trees = 0;
+      for (const TreeInstance &t : column->trees) trees += t.trunkHeight != 0;
+      if (trees < 2) continue;
+      ++treeColumns;
+      treesSeen += trees;
+      const auto bare = generateColumn(cx, cz, kIds);
+      for (int32_t z = 0; z < 32; ++z)
+        for (int32_t x = 0; x < 32; ++x) {
+          const int32_t wx = cx * 32 + x, wz = cz * 32 + z;
+          TreeInstance tree = treeCandidate(int2(wx >> 3, wz >> 3));
+          if (tree.trunkHeight != 0) {
+            const int32_t lx = tree.trunkX - cx * 32, lz = tree.trunkZ - cz * 32;
+            tree.ground = column->height(lx, lz);
+            if (!treeGroundOk(tree.ground, column->height(lx - 1, lz), column->height(lx + 1, lz),
+                              column->height(lx, lz - 1), column->height(lx, lz + 1))) {
+              tree.trunkHeight = 0;
+            }
+          }
+          for (int32_t wy = column->firstChunkY * 32; wy < (column->firstChunkY + int32_t(column->chunks.size())) * 32;
+               ++wy) {
+            const uint32_t block = treeBlockAt(tree, wx, wy, wz);
+            const bool placed = block != TREE_NONE && wy >= column->height(x, z);
+            const uint16_t expected =
+                placed ? (block == TREE_LOG ? treeIds.log : treeIds.leaves) : bare->blockId(x, wy, z);
+            CHECK(column->blockId(x, wy, z) == expected, "tree fill mismatch at %d %d %d", wx, wy, wz);
+            CHECK(column->isSolid(x, wy, z) == (placed ? blocks::isOpaque(expected) : bare->isSolid(x, wy, z)),
+                  "tree solid mask mismatch at %d %d %d", wx, wy, wz);
+          }
+          // Nothing above the stored range: tree chunks must be stored.
+          const int32_t top = (column->firstChunkY + int32_t(column->chunks.size())) * 32;
+          for (int32_t wy = top; wy < top + TREE_MAX_ABOVE; ++wy) {
+            CHECK(tree.trunkHeight == 0 || treeBlockAt(tree, wx, wy, wz) == TREE_NONE, "tree above stored chunks");
+          }
+        }
+      for (const auto &chunk : column->chunks) {
+        if (chunk == nullptr) continue;
+        uint16_t nonOpaque = 0;
+        for (const uint16_t id : chunk->ids) nonOpaque += id != kAir && id != kOcean && !blocks::isOpaque(id);
+        CHECK(chunk->nonOpaqueCount == nonOpaque, "nonOpaqueCount %u != %u", chunk->nonOpaqueCount, nonOpaque);
+      }
+      std::shared_ptr<Column> cols[3][3];
+      for (int dz = -1; dz <= 1; ++dz)
+        for (int dx = -1; dx <= 1; ++dx) cols[dz + 1][dx + 1] = generateColumn(cx + dx, cz + dz, treeIds);
+      for (int withNeighbors = 0; withNeighbors < 2; ++withNeighbors) {
+        Neighborhood nb;
+        for (int dz = 0; dz < 3; ++dz)
+          for (int dx = 0; dx < 3; ++dx)
+            nb.columns[dz][dx] = (withNeighbors || (dz == 1 && dx == 1)) ? cols[dz][dx].get() : nullptr;
+        for (size_t c = 0; c < cols[1][1]->chunks.size(); ++c) {
+          ChunkMesh mesh;
+          const int32_t chunkY = cols[1][1]->firstChunkY + int32_t(c);
+          meshChunk(nb, chunkY, mesh);
+          checkChunk(nb, chunkY, mesh);
+          ++treeChunks;
+        }
+      }
+    }
+    }
+    CHECK(treeColumns >= 6, "only %zu columns with trees found", treeColumns);
+    std::printf("trees: %zu columns (%zu trees) checked, %zu chunks meshed\n", treeColumns, treesSeen, treeChunks);
   }
 
   // Timings.

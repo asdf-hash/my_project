@@ -18,6 +18,9 @@ struct HzbParams {
   uint2 mip0Size;
   uint2 depthSize;
   uint mipCount;
+  // Reverse-Z depth of HZB_IGNORE_NEAR_DISTANCE (renderer.cpp): nearer samples are stored as the far plane (0), so
+  // geometry right in front of the camera, which disoccludes fast, never culls anything.
+  float ignoreNearerDepth;
 };
 
 [[vk::push_constant]]
@@ -34,7 +37,10 @@ RWTexture2D<float> Mips[MAX_HZB_MIPS];
 
 uint2 mipSize(uint mip) { return max(params.mip0Size >> mip, uint2(1u, 1u)); }
 
-float farthestSample(uint2 pixel) { return Depth.Load(int3(int2(pixel), 0)); }
+float farthestSample(uint2 pixel) {
+  const float depth = Depth.Load(int3(int2(pixel), 0));
+  return depth > params.ignoreNearerDepth ? 0.0f : depth;
+}
 
 // Farthest depth over the depth pixels covered by mip 0 texel `texel`, rounding outward so nothing is missed.
 float farthestDepth(uint2 texel) {

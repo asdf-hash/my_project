@@ -3,7 +3,7 @@
 static const uint CHUNK_SIZE = 32u;
 static const uint HEIGHT_STRIDE = 34u;
 static const uint HEIGHTS_PER_CHUNK = HEIGHT_STRIDE * HEIGHT_STRIDE;
-static const uint MAX_QUAD_COUNT = 1u << 23u;
+static const uint MAX_QUAD_COUNT = 1u << 24u;
 // Must match VERTEX_QUADS_PER_INSTANCE in slang.slang and renderer.cpp.
 static const uint VERTEX_QUADS_PER_INSTANCE = 16384u;
 // world::kMinTerrainHeight / kMaxTerrainHeight.
@@ -61,6 +61,8 @@ struct DispatchParams {
   uint4 layerDeepBlocks;  // world::kTerrainLayerDeepBlocks, deeper than FILLER_DEPTH below the top
   // Dispatches with more items than the Z group limit (65535) run in batches; the item is groupID.z + zBase.
   uint zBase;
+  uint logBlock;    // world::kTreeLogBlock
+  uint leavesBlock; // world::kTreeLeavesBlock
 };
 
 // Heights for one 8x8 meshColumns group plus a 1-column border (AO and neighbor faces reach +-1).
@@ -83,6 +85,12 @@ groupshared int tileFaceLow;
 groupshared int tileFaceHigh;
 groupshared uint groupOutputBase;
 groupshared int heightTile[TILE_SIZE * TILE_SIZE];
+// Trees over each column of the group (index lane), in this LOD's cells (see computeTreeColumn): log cells
+// [treeLogLo, treeLogHi), leaf cells treeLeafBase + i for each bit i of treeLeafMask.
+groupshared int treeLogLo[64];
+groupshared int treeLogHi[64];
+groupshared int treeLeafBase[64];
+groupshared uint treeLeafMask[64];
 
 [[vk::push_constant]]
 ConstantBuffer<DispatchParams> dispatchParams;
@@ -152,6 +160,9 @@ RWStructuredBuffer<uint> RelocationScratch;
 // pass. Their quads live in QuadBuffer like any other cluster's.
 [[vk::binding(18, 0)]]
 RWStructuredBuffer<QuadCluster> WaterClusters;
+// Downsampled trees for LOD 1-2 (vegetation.hpp buildTreeLodTable), read by computeTreeColumn.
+[[vk::binding(19, 0)]]
+StructuredBuffer<uint> TreeLodTable;
 
 uint heightIndex(uint columnIndex, uint x, uint z) { return columnIndex * HEIGHTS_PER_CHUNK + z * HEIGHT_STRIDE + x; }
 
@@ -214,6 +225,16 @@ bool isNearLayerTransition(int blockWorldY, int scale, float dither) {
 }
 
 uint calculateAo(int2 tileOrigin, int x, int y, int z, int chunkY, uint normalIndex) {
+  return calculateAoWith(tileOrigin, x, y, z, chunkY, normalIndex, false);
+}
+
+// Opaque for AO: terrain, plus opaque tree blocks when includeTrees (as on the CPU).
+bool aoOpaqueAt(int2 tileOrigin, int x, int y, int z, int chunkY, bool includeTrees) {
+  return isSolidAt(tileOrigin, x, y, z, chunkY) ||
+         (includeTrees && treeBlockOpaque(treeBlockAtColumn(tileOrigin, x, chunkY * int(CHUNK_SIZE) + y, z)));
+}
+
+uint calculateAoWith(int2 tileOrigin, int x, int y, int z, int chunkY, uint normalIndex, bool includeTrees) {
   const int3 uAxes[6] = { int3(0, 0, 1), int3(0, 0, 1), int3(1, 0, 0), int3(1, 0, 0), int3(1, 0, 0), int3(1, 0, 0) };
   const int3 vAxes[6] = { int3(0, 1, 0), int3(0, 1, 0), int3(0, 0, -1), int3(0, 0, 1), int3(0, 1, 0), int3(0, 1, 0) };
   const int3 normalAxes[6] = { int3(1, 0, 0),  int3(-1, 0, 0), int3(0, 1, 0),
@@ -222,18 +243,18 @@ uint calculateAo(int2 tileOrigin, int x, int y, int z, int chunkY, uint normalIn
   const int3 u = uAxes[normalIndex];
   const int3 v = vAxes[normalIndex];
 
-  const bool sideU0 = isSolidAt(tileOrigin, outside.x - u.x, outside.y - u.y, outside.z - u.z, chunkY);
-  const bool sideU1 = isSolidAt(tileOrigin, outside.x + u.x, outside.y + u.y, outside.z + u.z, chunkY);
-  const bool sideV0 = isSolidAt(tileOrigin, outside.x - v.x, outside.y - v.y, outside.z - v.z, chunkY);
-  const bool sideV1 = isSolidAt(tileOrigin, outside.x + v.x, outside.y + v.y, outside.z + v.z, chunkY);
+  const bool sideU0 = aoOpaqueAt(tileOrigin, outside.x - u.x, outside.y - u.y, outside.z - u.z, chunkY, includeTrees);
+  const bool sideU1 = aoOpaqueAt(tileOrigin, outside.x + u.x, outside.y + u.y, outside.z + u.z, chunkY, includeTrees);
+  const bool sideV0 = aoOpaqueAt(tileOrigin, outside.x - v.x, outside.y - v.y, outside.z - v.z, chunkY, includeTrees);
+  const bool sideV1 = aoOpaqueAt(tileOrigin, outside.x + v.x, outside.y + v.y, outside.z + v.z, chunkY, includeTrees);
   const bool corner0 =
-      isSolidAt(tileOrigin, outside.x - u.x - v.x, outside.y - u.y - v.y, outside.z - u.z - v.z, chunkY);
+      aoOpaqueAt(tileOrigin, outside.x - u.x - v.x, outside.y - u.y - v.y, outside.z - u.z - v.z, chunkY, includeTrees);
   const bool corner1 =
-      isSolidAt(tileOrigin, outside.x + u.x - v.x, outside.y + u.y - v.y, outside.z + u.z - v.z, chunkY);
+      aoOpaqueAt(tileOrigin, outside.x + u.x - v.x, outside.y + u.y - v.y, outside.z + u.z - v.z, chunkY, includeTrees);
   const bool corner2 =
-      isSolidAt(tileOrigin, outside.x + u.x + v.x, outside.y + u.y + v.y, outside.z + u.z + v.z, chunkY);
+      aoOpaqueAt(tileOrigin, outside.x + u.x + v.x, outside.y + u.y + v.y, outside.z + u.z + v.z, chunkY, includeTrees);
   const bool corner3 =
-      isSolidAt(tileOrigin, outside.x - u.x + v.x, outside.y - u.y + v.y, outside.z - u.z + v.z, chunkY);
+      aoOpaqueAt(tileOrigin, outside.x - u.x + v.x, outside.y - u.y + v.y, outside.z - u.z + v.z, chunkY, includeTrees);
   return vertexAo(sideU0, sideV0, corner0) | (vertexAo(sideU1, sideV0, corner1) << 2u) |
          (vertexAo(sideU1, sideV1, corner2) << 4u) | (vertexAo(sideU0, sideV1, corner3) << 6u);
 }
@@ -461,6 +482,225 @@ int columnCellHeight(uint columnIndex, uint localX, uint localZ) {
     cells = int(floor(sampleTerrainHeight(worldX, worldZ, scale) / float(scale)));
   }
   return max(cells, minimumHeight);
+}
+
+// ---- Trees (placement shared with the CPU: vegetation_shared.hlsl) ----
+// Each column of a meshColumns group gets a small vertical description of the tree blocks over it (treeLog* /
+// treeLeaf*). Every tree lies inside one 8x8-block cell and every tile is a whole number of cells, so a tile's trees
+// never reach past it: neighbours outside the tile count as no tree (their faces toward it may be drawn twice,
+// hidden behind leaves).
+//
+// LOD 0 (tile == one cell): the exact blocks the CPU stamps (cpu_world.cpp stampTrees), grounded on the trunk column
+// and its neighbours from heightTile.
+// LOD 1-2 (scale 2, 4): the tree downsampled into this LOD's cells (TreeLodTable, see vegetation_shared.hlsl),
+// standing on the trunk column's coarse ground, with the slope check done in coarse cells.
+// LOD 3 (scale 8): the column is one tree cell; filled (one leaf cell on its own ground) for half of the trees
+// (TREE_LOD3_FILL_CHANCE).
+// LOD 4+ (scale 16+): filled with the probability that LOD 3 fills one of the column's cells (treeFarColumn).
+struct TreeColumn {
+  int logLo;
+  int logHi;
+  int leafBase;
+  uint leafMask;
+};
+
+// LOD 3's rule for one cell: an accepted tree that wins the fill hash.
+bool treeCellFilledAtLod3(int2 cell) {
+  return treeCandidate(cell).trunkHeight != 0 && (hashCell(cell, SEED_TREE_LOD) & 0xffu) < TREE_LOD3_FILL_CHANCE;
+}
+
+// LOD 4+: the column at world block (columnX, columnZ) (its low corner) of size scale is filled when its own hash
+// falls below the share of its cells LOD 3 fills, sampled on an evenly spaced grid of at most 4x4 cells.
+bool treeFarColumn(int columnX, int columnZ, int scale) {
+  const int cellsPerSide = scale >> TREE_CELL_SHIFT;
+  const int samples = min(cellsPerSide, TREE_FAR_SAMPLES);
+  const int stride = cellsPerSide / samples;
+  const int2 firstCell = int2(columnX >> TREE_CELL_SHIFT, columnZ >> TREE_CELL_SHIFT);
+  uint filled = 0u;
+  for (int sz = 0; sz < samples; ++sz) {
+    for (int sx = 0; sx < samples; ++sx) {
+      // Middle cell of each stride block, so the sample grid is centred in the column.
+      filled += treeCellFilledAtLod3(firstCell + int2(sx * stride + stride / 2, sz * stride + stride / 2)) ? 1u : 0u;
+    }
+  }
+  const uint roll = hashCell(int2(floorDivide(columnX, scale), floorDivide(columnZ, scale)), SEED_TREE_LOD ^ uint(scale)) & 0xffu;
+  return roll * uint(samples * samples) < filled * 256u;
+}
+
+// Coarse LODs: the height band (TREE_MIN_GROUND .. TREE_MAX_GROUND) checked against the real surface at a world
+// position, like LOD 0, instead of the column's rounded-down cells. Near sea level those round to y = 0 while the top
+// face still shows grass (materials near layer boundaries come from the real height too, columnMaterialHeight), and
+// a check on the cells dropped every tree there. One noise sample: callers run their hash checks first.
+bool treeBandOkAt(int worldX, int worldZ, int scale) {
+  const int ground = int(floor(sampleTerrainHeight(worldX, worldZ, scale))); // first air block, as LOD 0 stores it
+  return ground >= TREE_MIN_GROUND && ground <= TREE_MAX_GROUND;
+}
+
+TreeColumn computeTreeColumn(int2 tileOrigin, uint x, uint z, int4 chunkCoord, int height) {
+  TreeColumn column = { 0, 0, 0, 0u };
+  const int scale = chunkCoord.w;
+  if (scale > (1 << TREE_MAX_LOD)) {
+    return column;
+  }
+  const int originX = chunkCoord.x * int(CHUNK_SIZE);
+  const int originZ = chunkCoord.y * int(CHUNK_SIZE);
+  const int centerX = originX + int(x) * scale + scale / 2;
+  const int centerZ = originZ + int(z) * scale + scale / 2;
+  if (scale > (1 << TREE_CELL_SHIFT)) {
+    // Wider than a tree cell: one leaf cell on the column's own ground, in the height band.
+    if (!treeFarColumn(originX + int(x) * scale, originZ + int(z) * scale, scale) ||
+        !treeBandOkAt(centerX, centerZ, scale)) {
+      return column;
+    }
+    column.leafBase = height;
+    column.leafMask = 1u;
+    return column;
+  }
+  const int2 cell = int2(centerX >> TREE_CELL_SHIFT, centerZ >> TREE_CELL_SHIFT);
+  TreeInstance tree = treeCandidate(cell);
+  if (tree.trunkHeight == 0) {
+    return column;
+  }
+  const int dx = centerX - tree.trunkX;
+  const int dz = centerZ - tree.trunkZ;
+  if (scale == 1) {
+    if (abs(dx) > TREE_RADIUS || abs(dz) > TREE_RADIUS) {
+      return column;
+    }
+    const int trunkX = tree.trunkX - originX;
+    const int trunkZ = tree.trunkZ - originZ;
+    tree.ground = tileHeight(tileOrigin, trunkX, trunkZ);
+    if (!treeGroundOk(tree.ground, tileHeight(tileOrigin, trunkX - 1, trunkZ), tileHeight(tileOrigin, trunkX + 1, trunkZ),
+                      tileHeight(tileOrigin, trunkX, trunkZ - 1), tileHeight(tileOrigin, trunkX, trunkZ + 1))) {
+      return column;
+    }
+    column.leafBase = tree.ground + tree.trunkHeight - 2;
+    [unroll]
+    for (uint i = 0u; i < 4u; ++i) {
+      if (treeBlockAt(tree, centerX, column.leafBase + int(i), centerZ) == TREE_LEAVES) {
+        column.leafMask |= 1u << i;
+      }
+    }
+    if (dx == 0 && dz == 0) {
+      column.logLo = tree.ground;
+      column.logHi = tree.ground + tree.trunkHeight;
+    }
+    return column;
+  }
+  if (scale >= (1 << TREE_CELL_SHIFT)) {
+    if ((hashCell(cell, SEED_TREE_LOD) & 0xffu) >= TREE_LOD3_FILL_CHANCE || !treeBandOkAt(tree.trunkX, tree.trunkZ, scale)) {
+      return column;
+    }
+    column.leafBase = height;
+    column.leafMask = 1u;
+    return column;
+  }
+  // Scale 2 or 4: the trunk's coarse column (inside this tile: cells never cross tiles) gives the ground cell.
+  const int trunkColumnX = (tree.trunkX - originX) / scale;
+  const int trunkColumnZ = (tree.trunkZ - originZ) / scale;
+  const int groundCell = tileHeight(tileOrigin, trunkColumnX, trunkColumnZ);
+  if (!treeBandOkAt(tree.trunkX, tree.trunkZ, scale) ||
+      abs(tileHeight(tileOrigin, trunkColumnX - 1, trunkColumnZ) - groundCell) > 1 ||
+      abs(tileHeight(tileOrigin, trunkColumnX + 1, trunkColumnZ) - groundCell) > 1 ||
+      abs(tileHeight(tileOrigin, trunkColumnX, trunkColumnZ - 1) - groundCell) > 1 ||
+      abs(tileHeight(tileOrigin, trunkColumnX, trunkColumnZ + 1) - groundCell) > 1) {
+    return column;
+  }
+  const int cellOriginX = cell.x << TREE_CELL_SHIFT;
+  const int cellOriginZ = cell.y << TREE_CELL_SHIFT;
+  const uint trunkOffset = uint(tree.trunkX - cellOriginX - TREE_RADIUS) + 4u * uint(tree.trunkZ - cellOriginZ - TREE_RADIUS);
+  const uint entry = TreeLodTable[treeLodTableIndex(scale, trunkOffset, uint(tree.trunkHeight - 4),
+                                                    uint((originX + int(x) * scale - cellOriginX) / scale),
+                                                    uint((originZ + int(z) * scale - cellOriginZ) / scale))];
+  column.leafBase = groundCell;
+  column.leafMask = entry & 0xfu;
+  const int logCells = int((entry >> 4u) & 0xfu);
+  if (logCells != 0) {
+    column.logLo = groundCell;
+    column.logHi = groundCell + logCells;
+  }
+  return column;
+}
+
+// Tree block of the group's column `lane` at world cell y; cells below the column's terrain top are terrain (it wins).
+uint treeCellBlock(uint lane, int y, int columnHeight) {
+  if (y < columnHeight) {
+    return TREE_NONE;
+  }
+  if (y >= treeLogLo[lane] && y < treeLogHi[lane]) {
+    return TREE_LOG;
+  }
+  const int i = y - treeLeafBase[lane];
+  return i >= 0 && i < 4 && ((treeLeafMask[lane] >> uint(i)) & 1u) != 0u ? TREE_LEAVES : TREE_NONE;
+}
+
+// Tree block (TREE_*) whose block id is opaque (bit 9 clear, see blocks.txt): logs, and leaves unless
+// `opaque = false`.
+bool treeBlockOpaque(uint block) {
+  const uint blockType = block == TREE_LOG ? dispatchParams.logBlock : dispatchParams.leavesBlock;
+  return block != TREE_NONE && (blockType & 0x200u) == 0u;
+}
+
+// Tree block at chunk-local column (x, z), world cell y. Columns outside the group's tile hold no tree blocks here.
+uint treeBlockAtColumn(int2 tileOrigin, int x, int y, int z) {
+  const int tx = x - tileOrigin.x - 1;
+  const int tz = z - tileOrigin.y - 1;
+  if (tx < 0 || tx >= 8 || tz < 0 || tz >= 8) {
+    return TREE_NONE;
+  }
+  return treeCellBlock(uint(tz * 8 + tx), y, tileHeight(tileOrigin, x, z));
+}
+
+// World cells [x, y) that may hold tree blocks over the group's column `lane` (empty if none).
+int2 treeCellRange(uint lane) {
+  const bool hasLog = treeLogLo[lane] < treeLogHi[lane];
+  const bool hasLeaves = treeLeafMask[lane] != 0u;
+  const int leafHi = treeLeafBase[lane] + 4;
+  if (hasLog && hasLeaves) {
+    return int2(min(treeLogLo[lane], treeLeafBase[lane]), max(treeLogHi[lane], leafHi));
+  }
+  return hasLog ? int2(treeLogLo[lane], treeLogHi[lane]) : (hasLeaves ? int2(treeLeafBase[lane], leafHi) : int2(0, 0));
+}
+
+// The tree faces of this lane's column within the chunk, as 1x1 quads in the cluster's direction runs (+Y, -X, +X,
+// -Z, +Z, -Y). A face shows unless the neighbour is terrain, an opaque tree block, or the same block (like the
+// CPU's binary mesher and emitNonOpaque). Counts into counts[run]; with write, also writes each quad at runBase[run] + counts[run].
+void treeFaces(bool write, int2 tileOrigin, uint lane, uint x, uint z, int height, int chunkY, int4 chunkCoord,
+               uint runBase[6], inout uint counts[6]) {
+  const int chunkBottom = chunkY * int(CHUNK_SIZE);
+  const int2 range = treeCellRange(lane);
+  const int yBegin = max(max(range.x, height), chunkBottom);
+  const int yEnd = min(range.y, chunkBottom + int(CHUNK_SIZE));
+  const uint runNormals[6] = { 2u, 1u, 0u, 5u, 4u, 3u };
+  const int3 normalAxes[6] = { int3(1, 0, 0),  int3(-1, 0, 0), int3(0, 1, 0),
+                               int3(0, -1, 0), int3(0, 0, 1),  int3(0, 0, -1) };
+  for (int y = yBegin; y < yEnd; ++y) {
+    const uint block = treeCellBlock(lane, y, height);
+    if (block == TREE_NONE) {
+      continue;
+    }
+    const uint blockType = block == TREE_LOG ? dispatchParams.logBlock : dispatchParams.leavesBlock;
+    [unroll]
+    for (uint run = 0u; run < 6u; ++run) {
+      const int3 n = normalAxes[runNormals[run]];
+      const int nx = int(x) + n.x;
+      const int ny = y + n.y;
+      const int nz = int(z) + n.z;
+      if (ny < tileHeight(tileOrigin, nx, nz)) {
+        continue; // terrain
+      }
+      const uint neighbor = treeBlockAtColumn(tileOrigin, nx, ny, nz);
+      if (treeBlockOpaque(neighbor) || neighbor == block) {
+        continue;
+      }
+      if (write) {
+        const uint ao = calculateAoWith(tileOrigin, int(x), y - chunkBottom, int(z), chunkY, runNormals[run], true);
+        writeQuad(runBase[run] + counts[run], x, uint(y - chunkBottom), z, runNormals[run], ao, blockType, 1u, 1u,
+                  chunkY, chunkCoord);
+      }
+      ++counts[run];
+    }
+  }
 }
 
 // Lowest / highest stored height of this generateHeights group's cells, for allocateWork.
@@ -732,6 +972,13 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
                                         chunkCoord.y * int(CHUNK_SIZE) + int(z) * scale + scale / 2, scale);
   int cachedMaterialHeight = NO_MATERIAL_HEIGHT;
 
+  // This column's trees, for the whole group (read across lanes after the barrier below).
+  const TreeColumn treeColumn = computeTreeColumn(tileOrigin, x, z, chunkCoord, height);
+  treeLogLo[lane] = treeColumn.logLo;
+  treeLogHi[lane] = treeColumn.logHi;
+  treeLeafBase[lane] = treeColumn.leafBase;
+  treeLeafMask[lane] = treeColumn.leafMask;
+
   // Top faces merge along x within the group's 8-column rows: a column whose left neighbour has an identical top
   // face (height, block, AO constant along x) is covered by that neighbour's quad.
   const bool hasTop = height > chunkBottom && height <= chunkTop;
@@ -754,6 +1001,15 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
   if (height > chunkBottom && columnLow < chunkTop) {
     InterlockedMin(tileFaceLow, clamp(columnLow, chunkBottom, chunkTop) - chunkBottom);
     InterlockedMax(tileFaceHigh, clamp(height, chunkBottom, chunkTop) - chunkBottom);
+  }
+  {
+    const int2 treeRange = treeCellRange(lane);
+    const int treeLow = max(max(treeRange.x, height), chunkBottom);
+    const int treeHigh = min(treeRange.y, chunkTop);
+    if (treeLow < treeHigh) {
+      InterlockedMin(tileFaceLow, treeLow - chunkBottom);
+      InterlockedMax(tileFaceHigh, treeHigh - chunkBottom);
+    }
   }
   const uint mergeableTop = (1u << 19u) | (1u << 18u);
   const uint myTopKey = topFaceKey[lane];
@@ -831,10 +1087,16 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
   // (overhangs, caves). Count them here and write them at faceRunOffsets[5] below.
   const uint negYCount = 0u;
 
+  // Tree faces go after this lane's terrain faces in each run.
+  const uint noRunBase[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
+  uint treeCounts[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
+  treeFaces(false, tileOrigin, lane, x, z, height, chunkY, chunkCoord, noRunBase, treeCounts);
+
   // The group's quads are laid out as one run per direction so the per-frame cull can drop a whole run at once.
   // Two directions share a uint (16 bits each): a run holds at most 64 columns * 32 quads, so fields never carry.
-  const uint packedCounts[3] = { topCount | (negXCount << 16u), posXCount | (negZCount << 16u),
-                                 posZCount | (negYCount << 16u) };
+  const uint packedCounts[3] = { (topCount + treeCounts[0]) | ((negXCount + treeCounts[1]) << 16u),
+                                 (posXCount + treeCounts[2]) | ((negZCount + treeCounts[3]) << 16u),
+                                 (posZCount + treeCounts[4]) | ((negYCount + treeCounts[5]) << 16u) };
   uint packedLanePrefix[3];
   [unroll]
   for (uint k = 0u; k < 3u; ++k) {
@@ -905,6 +1167,17 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
                    faceNormalIndices[f + 1u], max(sideNeighbor[f], chunkBottom), min(height, chunkTop), chunkY,
                    chunkCoord, height, cachedMaterialHeight, dither);
     }
+  }
+
+  {
+    const uint terrainCounts[6] = { topCount, negXCount, posXCount, negZCount, posZCount, negYCount };
+    uint treeRunBase[6];
+    [unroll]
+    for (uint d = 0u; d < 6u; ++d) {
+      treeRunBase[d] = chunkBase + faceRunOffsets[d] + terrainCounts[d];
+    }
+    uint written[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
+    treeFaces(true, tileOrigin, lane, x, z, height, chunkY, chunkCoord, treeRunBase, written);
   }
 
   // Ocean surface: columns lower than sea level get a +Y quad on the cell below it, merged into x runs and then

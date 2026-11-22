@@ -34,7 +34,7 @@ struct QuadCluster {
 [[vk::binding(6, 0)]]
 StructuredBuffer<QuadCluster> Clusters;
 
-static const uint MAX_QUAD_COUNT = 1u << 23u; // matches chunk_compute.slang
+static const uint MAX_QUAD_COUNT = 1u << 24u; // matches chunk_compute.slang and renderer.cpp
 static const uint MAX_LOD_LEVELS = 8u;          // MAX_LOD in lod.hpp
 
 // Task -> mesh hand-off. One task group covers CLUSTERS_PER_TASK clusters; each meshlet is up to

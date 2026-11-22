@@ -7,11 +7,13 @@
 #include "lod.hpp"
 #include "player.hpp"
 #include "terrain_cpu.hpp"
+#include "vegetation.hpp"
 #include "world.hpp"
 
 #include <algorithm>
 #include <array>
 #include <assert.h>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -24,7 +26,6 @@
 #include <glm/ext/matrix_float4x4.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/ext/vector_float3.hpp>
-#include <bit>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -76,7 +77,11 @@ struct alignas(16) UniformBufferObject {
   float farPlane;
   alignas(16) glm::vec4 cameraPosition;
   glm::vec4 viewRayScale; // xy: 1 / proj[0][0], 1 / proj[1][1]; view ray per NDC unit, for fog distance. z: underwater
+                          // w: border fog end (camera distance where the air fog is opaque)
   glm::vec4 hzbParams;    // xy: Hi-Z mip 0 size, z: mip count, w: 1 when it holds last frame's depth
+  glm::mat4 cullMvp;      // task-shader frustum test: mvp, or the frozen one while LOD freeze (G) is on
+  glm::vec4 cullCameraPosition; // run / quad facing tests: camera, or the frozen eye
+  glm::mat4 cullPreviousMvp;    // Hi-Z test: the matrices the Hi-Z was built with (frozen with it under G)
 };
 static_assert(offsetof(UniformBufferObject, previousMvp) == 64);
 static_assert(offsetof(UniformBufferObject, renderSize) == 128);
@@ -88,7 +93,10 @@ static_assert(offsetof(UniformBufferObject, farPlane) == 152);
 static_assert(offsetof(UniformBufferObject, cameraPosition) == 160);
 static_assert(offsetof(UniformBufferObject, viewRayScale) == 176);
 static_assert(offsetof(UniformBufferObject, hzbParams) == 192);
-static_assert(sizeof(UniformBufferObject) == 208);
+static_assert(offsetof(UniformBufferObject, cullMvp) == 208);
+static_assert(offsetof(UniformBufferObject, cullCameraPosition) == 272);
+static_assert(offsetof(UniformBufferObject, cullPreviousMvp) == 288);
+static_assert(sizeof(UniformBufferObject) == 352);
 
 struct ChunkComputeParams {
   uint32_t horizontalChunkCount; // new columns this remesh (ColumnList entries)
@@ -101,11 +109,14 @@ struct ChunkComputeParams {
   std::array<uint32_t, world::kTerrainLayerBlocks.size()> layerDeepBlocks; // kTerrainLayerDeepBlocks
   // First item of a batched dispatch (see dispatchBatchedZ): item = groupID.z + zBase.
   uint32_t zBase;
+  uint32_t logBlock;    // world::kTreeLogBlock (tree placement: shaders/vegetation_shared.hlsl)
+  uint32_t leavesBlock; // world::kTreeLeavesBlock
 };
 static_assert(offsetof(ChunkComputeParams, layerBlocks) == 16);
 static_assert(offsetof(ChunkComputeParams, layerFillerBlocks) == 32);
 static_assert(offsetof(ChunkComputeParams, layerDeepBlocks) == 48);
 static_assert(offsetof(ChunkComputeParams, zBase) == 64);
+static_assert(offsetof(ChunkComputeParams, leavesBlock) == 72);
 
 // One entry per (block, face), indexed blockId * 6 + normalIndex. Matches BlockFace in slang.slang.
 struct GpuBlockFace {
@@ -137,9 +148,9 @@ constexpr uint32_t GEOMETRY_PASS_TRANSLUCENT = 1u; // blended water: no back-fac
 constexpr uint32_t DEBUG_TINT_OFF = 0u;
 constexpr uint32_t DEBUG_TINT_LOD = 1u;
 constexpr uint32_t DEBUG_TINT_CPU = 2u;
-constexpr vk::ShaderStageFlags GEOMETRY_PUSH_STAGES = vk::ShaderStageFlagBits::eTaskEXT |
-                                                     vk::ShaderStageFlagBits::eMeshEXT |
-                                                     vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+constexpr vk::ShaderStageFlags GEOMETRY_PUSH_STAGES =
+    vk::ShaderStageFlagBits::eTaskEXT | vk::ShaderStageFlagBits::eMeshEXT | vk::ShaderStageFlagBits::eVertex |
+    vk::ShaderStageFlagBits::eFragment;
 
 // What the scene pass draws; X cycles through them.
 enum class TerrainView { Both, LodOnly, RealOnly, Debug };
@@ -250,11 +261,21 @@ private:
   static constexpr uint32_t MAX_HZB_MIPS = 16u;        // MAX_HZB_MIPS in hzb.slang
   static constexpr uint32_t HZB_LOW_MIPS = 5u;         // mips written by hzbBuildLow (LOW_MIPS)
   static constexpr uint32_t HZB_MAX_MIP0_SIDE = 2048u; // hzbBuildHigh holds mip 5 (<= 64x64) in shared memory
+  // Depth closer than this (view depth, blocks) is left out of the Hi-Z: near geometry disoccludes within a frame or
+  // two of camera motion, and last frame's depth of it would cull what is newly visible behind it.
+  static constexpr float HZB_IGNORE_NEAR_DISTANCE = 20.0f;
   struct HzbPushParams {
     std::array<uint32_t, 2> mip0Size;
     std::array<uint32_t, 2> depthSize;
     uint32_t mipCount;
+    float ignoreNearerDepth; // reverse-Z depth at HZB_IGNORE_NEAR_DISTANCE: samples above it count as far
   };
+  static constexpr float NEAR_PLANE = 0.1f;
+  static constexpr float FAR_PLANE = 1000000.0f;
+  // Reverse-Z depth (1 at NEAR_PLANE, 0 at FAR_PLANE) of view depth d: linear in 1 / d.
+  static constexpr float reverseZDepth(float d) {
+    return NEAR_PLANE * (FAR_PLANE - d) / (d * (FAR_PLANE - NEAR_PLANE));
+  }
 #pragma endregion
 
 #pragma region Image State
@@ -295,8 +316,12 @@ private:
   std::array<uint32_t, world::kTerrainLayerBlocks.size()> terrainLayerBlocks{};
   std::array<uint32_t, world::kTerrainLayerBlocks.size()> terrainLayerFillerBlocks{};
   std::array<uint32_t, world::kTerrainLayerBlocks.size()> terrainLayerDeepBlocks{};
+  uint32_t treeLogBlock = 0;
+  uint32_t treeLeavesBlock = 0;
   vk::raii::Buffer blockFaceBuffer = nullptr;
   vk::raii::DeviceMemory blockFaceBufferMemory = nullptr;
+  vk::raii::Buffer treeLodTableBuffer = nullptr; // chunk compute binding 19 (vegetation::buildTreeLodTable)
+  vk::raii::DeviceMemory treeLodTableBufferMemory = nullptr;
   vk::raii::Sampler textureSampler = nullptr;
   vk::raii::Sampler taaSampler = nullptr;
 #pragma endregion
@@ -306,7 +331,7 @@ private:
   std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
   std::vector<void *> uniformBuffersMapped;
 
-  static constexpr uint32_t MAX_QUAD_COUNT = 1u << 23u;
+  static constexpr uint32_t MAX_QUAD_COUNT = 1u << 24u;
   // Quads covered by one instance of the vertex-pulling draw. 4 vertices per quad must fit a uint16 index.
   // Must match VERTEX_QUADS_PER_INSTANCE in slang.slang and chunk_compute.slang.
   static constexpr uint32_t VERTEX_QUADS_PER_INSTANCE = 16384u;
@@ -401,6 +426,8 @@ private:
   std::vector<void *> retireListBuffersMapped;
   std::array<float, MAX_LOD> lodDistanceSquared =
       initializeLodDistanceSquared(TARGET_SCREEN_PERCENTAGE, BASE_FOV_RADIANS, {WIDTH, HEIGHT});
+  std::array<float, MAX_LOD> baseLodDistanceSquared = lodDistanceSquared; // base FOV: tiles outside the frustum
+  bool quadOverflowWarned = false;
   float cachedLodFov = BASE_FOV_RADIANS;
   vk::Extent2D cachedLodExtent{WIDTH, HEIGHT};
 
@@ -435,7 +462,7 @@ private:
     uint32_t slot;
     uint32_t quadOffset;
     uint32_t quadCount;
-    std::array<cpuworld::QuadCluster, cpuworld::kClustersPerChunk> clusters; // rebased onto quadOffset
+    std::array<cpuworld::QuadCluster, cpuworld::kClustersPerChunk> clusters;            // rebased onto quadOffset
     std::array<cpuworld::QuadCluster, cpuworld::kClustersPerChunk> translucentClusters; // rebased too
     uint32_t opaqueQuadCount; // quads [0, opaqueQuadCount) are opaque, the rest translucent (vertex path)
   };
@@ -451,6 +478,14 @@ private:
   std::deque<cpuworld::ColumnMeshEvent> cpuPendingEvents; // waiting for staging space
   // Center offered to the clipmap: the CPU's ready center, once all of its geometry is uploaded.
   std::optional<cpuworld::ChunkXZ> cpuAdvertisedCenter;
+  // Debug (G): while set, the clipmap and the CPU world are driven by this frozen view / eye instead of the camera,
+  // so LOD tiles and CPU chunks keep their quality and positions while the camera flies around them.
+  bool lodFreezeRequested = false;
+  std::optional<ClipmapView> frozenLodView;
+  glm::vec3 frozenLodEye{0.0f};
+  glm::mat4 frozenCullMvp{1.0f}; // set on the first frozen frame, from that frame's mvp
+  glm::mat4 frozenHzbMvp{1.0f};  // the previousMvp of that frame: the view the (no longer rebuilt) Hi-Z holds
+  bool frozenCullMvpValid = false;
   // This frame's CPU geometry transfers, recorded by recordCpuUploads.
   std::vector<vk::BufferCopy> cpuQuadCopies;
   std::vector<vk::BufferCopy> cpuOffsetCopies;
@@ -554,7 +589,7 @@ private:
   double nextPlaceTime = 0.0;
   size_t selectedBlockIndex = 0;
   uint16_t oceanBlockId = cpuworld::kAir;
-  bool cameraUnderwater = false; // set by updateUniformBuffer
+  bool cameraUnderwater = false;                   // set by updateUniformBuffer
   std::optional<cpuworld::BlockXYZ> outlineTarget; // block under the crosshair, outlined by recordOutline
 #pragma endregion
 
@@ -650,6 +685,10 @@ private:
       app->useVertexPulling = !app->useVertexPulling;
       std::clog << "Quad path: " << (app->useVertexPulling ? "vertex shader (vertex pulling)" : "mesh shader") << '\n';
     }
+    if (key == GLFW_KEY_G) {
+      app->lodFreezeRequested = !app->lodFreezeRequested;
+      std::clog << "LOD / chunk updates " << (app->lodFreezeRequested ? "frozen" : "unfrozen") << '\n';
+    }
   }
 #pragma endregion
 
@@ -675,6 +714,7 @@ private:
     createTextureSampler();
     createTaaSampler();
     createBlockFaceBuffer();
+    createTreeLodTableBuffer();
     createUniformBuffers();
     createChunkBuffers();
     createCpuChunkBuffers();
@@ -1207,7 +1247,10 @@ private:
                                                             static_cast<uint32_t>(colorBlendAttachments.size()),
                                                         .pAttachments = colorBlendAttachments.data()};
 
-    std::vector<vk::DynamicState> dynamicStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+    // Cull mode is dynamic so the LOD freeze (G) can turn off hardware backface culling: the frozen view's
+    // shader-side culling then decides alone which faces are drawn.
+    std::vector<vk::DynamicState> dynamicStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor,
+                                                   vk::DynamicState::eCullMode};
     vk::PipelineDynamicStateCreateInfo dynamicState{.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()),
                                                     .pDynamicStates = dynamicStates.data()};
 
@@ -1272,8 +1315,7 @@ private:
         .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
                           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
     const vk::PipelineColorBlendAttachmentState waterMotionBlend{.blendEnable = vk::False, .colorWriteMask = {}};
-    const std::array<vk::PipelineColorBlendAttachmentState, 2> waterBlendAttachments{waterColorBlend,
-                                                                                     waterMotionBlend};
+    const std::array<vk::PipelineColorBlendAttachmentState, 2> waterBlendAttachments{waterColorBlend, waterMotionBlend};
     colorBlending.pAttachments = waterBlendAttachments.data();
     shaderStages[2].pName = "fragWater";
     vertexPullingStages[1].pName = "fragWater";
@@ -1344,11 +1386,11 @@ private:
                                                   .offset = 0,
                                                   .size = sizeof(OverlayParams)};
     const vk::DescriptorSetLayout setLayout = descriptorSetLayout;
-    overlayPipelineLayout = vk::raii::PipelineLayout(
-        device, vk::PipelineLayoutCreateInfo{.setLayoutCount = 1,
-                                             .pSetLayouts = &setLayout,
-                                             .pushConstantRangeCount = 1,
-                                             .pPushConstantRanges = &pushConstantRange});
+    overlayPipelineLayout =
+        vk::raii::PipelineLayout(device, vk::PipelineLayoutCreateInfo{.setLayoutCount = 1,
+                                                                      .pSetLayouts = &setLayout,
+                                                                      .pushConstantRangeCount = 1,
+                                                                      .pPushConstantRanges = &pushConstantRange});
     overlayPipeline = createOverlayStylePipeline(shaderModule, "overlayVertexMain", "overlayFragmentMain",
                                                  vk::BlendFactor::eSrcAlpha, vk::BlendFactor::eOneMinusSrcAlpha);
     selectedTexturePipeline =
@@ -1496,7 +1538,8 @@ private:
     return index == std::string_view::npos ? 0u : static_cast<uint8_t>(index);
   }
 
-  // Top-right debug text: FPS, the active geometry path, terrain view and player block coordinates. Drawn on top of the presented image (after TAA).
+  // Top-right debug text: FPS, the active geometry path, terrain view and player block coordinates. Drawn on top of the
+  // presented image (after TAA).
   void recordOverlay(vk::raii::CommandBuffer &commandBuffer, uint32_t imageIndex) {
     const std::array<std::string, OVERLAY_LINES> lines{
         "FPS " + std::to_string(static_cast<int>(std::lround(displayedFps))),
@@ -1715,8 +1758,8 @@ private:
           .image = *resolvedDepthImages[imageIndex],
           .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}},
          // This frame's taskMain read the pyramid; finish that before overwriting it.
-         {.srcStageMask = hzbImageInitialized ? vk::PipelineStageFlagBits2::eTaskShaderEXT
-                                              : vk::PipelineStageFlagBits2::eTopOfPipe,
+         {.srcStageMask =
+              hzbImageInitialized ? vk::PipelineStageFlagBits2::eTaskShaderEXT : vk::PipelineStageFlagBits2::eTopOfPipe,
           .srcAccessMask = hzbImageInitialized ? vk::AccessFlagBits2::eShaderRead : vk::AccessFlagBits2::eNone,
           .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
           .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
@@ -1743,7 +1786,8 @@ private:
 
     const HzbPushParams params{.mip0Size = {hzbSize.width, hzbSize.height},
                                .depthSize = {swapChainExtent.width, swapChainExtent.height},
-                               .mipCount = hzbMipCount};
+                               .mipCount = hzbMipCount,
+                               .ignoreNearerDepth = reverseZDepth(HZB_IGNORE_NEAR_DISTANCE)};
     commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *hzbPipelineLayout, 0, *hzbSets[imageIndex],
                                      nullptr);
     commandBuffer.pushConstants(*hzbPipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
@@ -1760,7 +1804,7 @@ private:
   }
 
   void createChunkComputePipeline() {
-    std::array<vk::DescriptorSetLayoutBinding, 19> bindings{};
+    std::array<vk::DescriptorSetLayoutBinding, 20> bindings{};
     for (uint32_t binding = 0; binding < bindings.size(); ++binding) {
       bindings[binding] = {.binding = binding,
                            .descriptorType = vk::DescriptorType::eStorageBuffer,
@@ -1992,6 +2036,8 @@ private:
       terrainLayerFillerBlocks[layer] = blockRegistry.idOf(world::kTerrainLayerFillerBlocks[layer]);
       terrainLayerDeepBlocks[layer] = blockRegistry.idOf(world::kTerrainLayerDeepBlocks[layer]);
     }
+    treeLogBlock = blockRegistry.idOf(world::kTreeLogBlock);
+    treeLeavesBlock = blockRegistry.idOf(world::kTreeLeavesBlock);
 
     const auto &texturePaths = blockRegistry.texturePaths;
     if (texturePaths.size() > textureDescriptorCapacity) {
@@ -2037,16 +2083,17 @@ private:
       for (size_t f = 0; f < blocks::kFaceCount; ++f) {
         const blocks::Face &face = block.faces[f];
         const uint32_t lodTexture = face.hasLodTexture ? face.lodTexture : face.texture;
-        const uint32_t frameMs = static_cast<uint32_t>(std::lround(std::clamp(block.frameTime, 0.001f, 60.0f) * 1000.0f));
-        faces[block.id * blocks::kFaceCount + f] = {.texture = textureSlots[face.texture],
-                         .lodTexture = textureSlots[lodTexture],
-                         .flags = (face.randomRotation ? BLOCK_FACE_RANDOM_ROTATION : 0u) |
-                                  (face.hasLodTexture ? BLOCK_FACE_HAS_LOD_TEXTURE : 0u) |
-                                  (block.fluid != blocks::Fluid::None ? BLOCK_FACE_FLUID : 0u),
-                         .animation = textureFrames[face.texture] | (textureFrames[lodTexture] << 8u) |
-                                      (frameMs << 16u),
-                         .lodTint = {block.lodTint[0], block.lodTint[1], block.lodTint[2], 1.0f},
-                         .tint = {block.tint[0], block.tint[1], block.tint[2], 1.0f}};
+        const uint32_t frameMs =
+            static_cast<uint32_t>(std::lround(std::clamp(block.frameTime, 0.001f, 60.0f) * 1000.0f));
+        faces[block.id * blocks::kFaceCount + f] = {
+            .texture = textureSlots[face.texture],
+            .lodTexture = textureSlots[lodTexture],
+            .flags = (face.randomRotation ? BLOCK_FACE_RANDOM_ROTATION : 0u) |
+                     (face.hasLodTexture ? BLOCK_FACE_HAS_LOD_TEXTURE : 0u) |
+                     (block.fluid != blocks::Fluid::None ? BLOCK_FACE_FLUID : 0u),
+            .animation = textureFrames[face.texture] | (textureFrames[lodTexture] << 8u) | (frameMs << 16u),
+            .lodTint = {block.lodTint[0], block.lodTint[1], block.lodTint[2], 1.0f},
+            .tint = {block.tint[0], block.tint[1], block.tint[2], 1.0f}};
       }
     }
 
@@ -2062,6 +2109,22 @@ private:
         createBuffer(size, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
                      vk::MemoryPropertyFlagBits::eDeviceLocal);
     copyBuffer(stagingBuffer, blockFaceBuffer, size);
+  }
+
+  void createTreeLodTableBuffer() {
+    const std::vector<uint32_t> table = vegetation::buildTreeLodTable();
+    const vk::DeviceSize size = table.size() * sizeof(uint32_t);
+    auto [stagingBuffer, stagingBufferMemory] =
+        createBuffer(size, vk::BufferUsageFlagBits::eTransferSrc,
+                     vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    void *data = stagingBufferMemory.mapMemory(0, size);
+    std::memcpy(data, table.data(), static_cast<size_t>(size));
+    stagingBufferMemory.unmapMemory();
+
+    std::tie(treeLodTableBuffer, treeLodTableBufferMemory) =
+        createBuffer(size, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+                     vk::MemoryPropertyFlagBits::eDeviceLocal);
+    copyBuffer(stagingBuffer, treeLodTableBuffer, size);
   }
 
   void createTextureImageViews() {
@@ -2346,9 +2409,8 @@ private:
                        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
       quadCountReadbackBuffers.emplace_back(std::move(readbackBuffer));
       quadCountReadbackMemories.emplace_back(std::move(readbackMemory));
-      quadCountReadbackMapped.emplace_back(
-          static_cast<const uint32_t *>(
-              quadCountReadbackMemories.back().mapMemory(0, READBACK_UINTS * sizeof(uint32_t))));
+      quadCountReadbackMapped.emplace_back(static_cast<const uint32_t *>(
+          quadCountReadbackMemories.back().mapMemory(0, READBACK_UINTS * sizeof(uint32_t))));
     }
   }
 
@@ -2362,8 +2424,8 @@ private:
     std::tie(waterClusterBuffer, waterClusterBufferMemory) =
         createBuffer(QUAD_CLUSTER_SIZE * QUAD_CLUSTERS_PER_CHUNK * workPoolCapacity,
                      gpuOnly | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
-    std::tie(chunkWorkBuffer, chunkWorkBufferMemory) = createBuffer(
-        sizeof(std::array<int32_t, 4>) * workPoolCapacity, gpuOnly, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(chunkWorkBuffer, chunkWorkBufferMemory) = createBuffer(sizeof(std::array<int32_t, 4>) * workPoolCapacity,
+                                                                    gpuOnly, vk::MemoryPropertyFlagBits::eDeviceLocal);
     std::tie(freeWorkSlotBuffer, freeWorkSlotBufferMemory) =
         createBuffer(sizeof(uint32_t) * workPoolCapacity, gpuOnly, vk::MemoryPropertyFlagBits::eDeviceLocal);
     std::tie(slotOwnerBuffer, slotOwnerBufferMemory) =
@@ -2384,11 +2446,11 @@ private:
     createWorkPoolBuffers();
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
       const std::array<std::pair<uint32_t, vk::Buffer>, 6> computeBindings{{{5u, *chunkWorkBuffer},
-                                                                             {6u, *quadClusterBuffer},
-                                                                             {13u, *freeWorkSlotBuffer},
-                                                                             {16u, *slotOwnerBuffer},
-                                                                             {17u, *relocationScratchBuffer},
-                                                                             {18u, *waterClusterBuffer}}};
+                                                                            {6u, *quadClusterBuffer},
+                                                                            {13u, *freeWorkSlotBuffer},
+                                                                            {16u, *slotOwnerBuffer},
+                                                                            {17u, *relocationScratchBuffer},
+                                                                            {18u, *waterClusterBuffer}}};
       std::array<vk::DescriptorBufferInfo, computeBindings.size() + 2> infos{};
       std::array<vk::WriteDescriptorSet, computeBindings.size() + 2> writes{};
       for (size_t b = 0; b < computeBindings.size(); ++b) {
@@ -2499,6 +2561,8 @@ private:
       ids.deep[layer] = static_cast<uint16_t>(terrainLayerDeepBlocks[layer]);
     }
     ids.ocean = static_cast<uint16_t>(blockRegistry.idOf("ocean"));
+    ids.log = static_cast<uint16_t>(treeLogBlock);
+    ids.leaves = static_cast<uint16_t>(treeLeavesBlock);
     oceanBlockId = ids.ocean;
     cpuWorld = std::make_unique<cpuworld::CpuWorld>(ids);
     const int32_t spawnHeight =
@@ -2612,8 +2676,8 @@ private:
           opaqueQuadCount += (cluster.counts01 & 0xffffu) + (cluster.counts01 >> 16u) + (cluster.counts23 & 0xffffu) +
                              (cluster.counts23 >> 16u) + (cluster.counts45 & 0xffffu) + (cluster.counts45 >> 16u);
         }
-        CpuChunkAllocation chunk{mesh.cy,         cpuChunkSlots.allocate(), *quadOffset, quadCount, mesh.clusters,
-                                 mesh.translucentClusters, opaqueQuadCount};
+        CpuChunkAllocation chunk{mesh.cy,       cpuChunkSlots.allocate(), *quadOffset,    quadCount,
+                                 mesh.clusters, mesh.translucentClusters, opaqueQuadCount};
         for (cpuworld::QuadCluster &cluster : chunk.clusters) {
           cluster.base += *quadOffset;
         }
@@ -2760,8 +2824,7 @@ private:
         inFlightCpuCenters.pop_front();
       }
       lastAppliedClipmapView = completion->view;
-      if (completion->result.chunks != visibleChunkSet ||
-          completion->result.neighborLods != visibleChunkNeighborLods) {
+      if (completion->result.chunks != visibleChunkSet || completion->result.neighborLods != visibleChunkNeighborLods) {
         visibleChunkSet = std::move(completion->result.chunks);
         visibleChunkNeighborLods = std::move(completion->result.neighborLods);
         chunkBuffersDirty = true;
@@ -2810,11 +2873,15 @@ private:
     const float forwardDot = builtView.forward[0] * currentView.forward[0] +
                              builtView.forward[1] * currentView.forward[1] +
                              builtView.forward[2] * currentView.forward[2];
-    // Without frustum culling the result doesn't depend on the view direction, so turning never forces a rebuild.
-    const bool directionCovered = !builtView.frustumCull || forwardDot >= minForwardDot;
+    // Without frustum culling, and unzoomed (same LOD distances inside and outside the frustum), the result doesn't
+    // depend on the view direction, so turning never forces a rebuild.
+    const bool directionDependent =
+        builtView.frustumCull || builtView.lodDistanceSquared != builtView.outsideLodDistanceSquared;
+    const bool directionCovered = !directionDependent || forwardDot >= minForwardDot;
     return positionDeltaSquared <= maxPositionDelta * maxPositionDelta && directionCovered &&
            builtView.frustumCull == currentView.frustumCull &&
            builtView.lodDistanceSquared == currentView.lodDistanceSquared &&
+           builtView.outsideLodDistanceSquared == currentView.outsideLodDistanceSquared &&
            builtView.verticalFovRadians == currentView.verticalFovRadians &&
            builtView.aspectRatio == currentView.aspectRatio &&
            (!tolerance.sameCpuRegion || builtView.cpuRegionCenter == currentView.cpuRegionCenter);
@@ -2827,7 +2894,7 @@ private:
 
   void createDescriptorPool() {
     std::array<vk::DescriptorPoolSize, 4> poolSize{
-        {{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 40u * MAX_FRAMES_IN_FLIGHT},
+        {{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 48u * MAX_FRAMES_IN_FLIGHT},
          {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 2u * MAX_FRAMES_IN_FLIGHT},
          {.type = vk::DescriptorType::eSampledImage,
           // Per scene set: the textures, Hi-Z and the opaque depth; then the TAA sets' three images.
@@ -2965,7 +3032,7 @@ private:
 
     const vk::DeviceSize coordinateBufferSize = sizeof(world::ChunkLod) * MAX_HORIZONTAL_CHUNK_COUNT;
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-      std::array<vk::DescriptorBufferInfo, 19> bufferInfos{{
+      std::array<vk::DescriptorBufferInfo, 20> bufferInfos{{
           {.buffer = chunkHeightBuffer, .offset = 0, .range = sizeof(int32_t) * MAX_HORIZONTAL_CHUNK_COUNT * 34u * 34u},
           {.buffer = chunkCoordinateBuffers[i], .offset = 0, .range = coordinateBufferSize},
           {.buffer = quadBuffer, .offset = 0, .range = sizeof(uint64_t) * MAX_QUAD_COUNT},
@@ -2985,8 +3052,9 @@ private:
           {.buffer = slotOwnerBuffer, .offset = 0, .range = vk::WholeSize},
           {.buffer = relocationScratchBuffer, .offset = 0, .range = vk::WholeSize},
           {.buffer = waterClusterBuffer, .offset = 0, .range = vk::WholeSize},
+          {.buffer = treeLodTableBuffer, .offset = 0, .range = vk::WholeSize},
       }};
-      std::array<vk::WriteDescriptorSet, 19> writes{};
+      std::array<vk::WriteDescriptorSet, 20> writes{};
       for (uint32_t binding = 0; binding < writes.size(); ++binding) {
         writes[binding] = {.dstSet = chunkComputeDescriptorSets[i],
                            .dstBinding = binding,
@@ -3167,15 +3235,15 @@ private:
           .storeOp = vk::AttachmentStoreOp::eStore,
           .clearValue = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 0.0f)}}};
 
-    vk::RenderingAttachmentInfo depthAttachmentInfo = {
-        .imageView = depthImageViews[imageIndex],
-        .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
-        .resolveMode = vk::ResolveModeFlagBits::eMin, // farthest sample (reverse-Z)
-        .resolveImageView = *resolvedDepthImageViews[imageIndex],
-        .resolveImageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
-        .loadOp = vk::AttachmentLoadOp::eClear,
-        .storeOp = vk::AttachmentStoreOp::eStore,
-        .clearValue = clearDepth};
+    vk::RenderingAttachmentInfo depthAttachmentInfo = {.imageView = depthImageViews[imageIndex],
+                                                       .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+                                                       .resolveMode =
+                                                           vk::ResolveModeFlagBits::eMin, // farthest sample (reverse-Z)
+                                                       .resolveImageView = *resolvedDepthImageViews[imageIndex],
+                                                       .resolveImageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+                                                       .loadOp = vk::AttachmentLoadOp::eClear,
+                                                       .storeOp = vk::AttachmentStoreOp::eStore,
+                                                       .clearValue = clearDepth};
 
     vk::RenderingInfo renderingInfo = {.renderArea = {.offset = {0, 0}, .extent = swapChainExtent},
                                        .layerCount = 1,
@@ -3188,6 +3256,7 @@ private:
                                wireframeEnabled
                                    ? (useVertexPulling ? *wireframeVertexPullingPipeline : *wireframePipeline)
                                    : (useVertexPulling ? *vertexPullingPipeline : *graphicsPipeline));
+    commandBuffer.setCullMode(frozenLodView ? vk::CullModeFlagBits::eNone : vk::CullModeFlagBits::eBack);
     // Negative height flips Y for Vulkan; see Uniform buffers.
     commandBuffer.setViewport(0, vk::Viewport(0.0f, static_cast<float>(swapChainExtent.height),
                                               static_cast<float>(swapChainExtent.width),
@@ -3254,15 +3323,15 @@ private:
 
     // Opaque pass -> water pass: the depth resolve becomes a shader input (the Hi-Z build reads it later too), and the
     // MSAA targets' stores happen before the water pass loads and writes them.
-    const vk::ImageMemoryBarrier2 opaqueDepthReady{
-        .srcStageMask = colorOutputStage,
-        .srcAccessMask = colorWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader | vk::PipelineStageFlagBits2::eComputeShader,
-        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-        .oldLayout = vk::ImageLayout::eDepthAttachmentOptimal,
-        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-        .image = *resolvedDepthImages[imageIndex],
-        .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}};
+    const vk::ImageMemoryBarrier2 opaqueDepthReady{.srcStageMask = colorOutputStage,
+                                                   .srcAccessMask = colorWrite,
+                                                   .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                                                                   vk::PipelineStageFlagBits2::eComputeShader,
+                                                   .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                                                   .oldLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+                                                   .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                                                   .image = *resolvedDepthImages[imageIndex],
+                                                   .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}};
     const vk::MemoryBarrier2 attachmentsStored{
         .srcStageMask = colorOutputStage | vk::PipelineStageFlagBits2::eLateFragmentTests,
         .srcAccessMask = colorWrite | vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
@@ -3296,12 +3365,12 @@ private:
                                                            .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
                                                            .loadOp = vk::AttachmentLoadOp::eLoad,
                                                            .storeOp = vk::AttachmentStoreOp::eDontCare};
-    commandBuffer.beginRendering(vk::RenderingInfo{.renderArea = {.offset = {0, 0}, .extent = swapChainExtent},
-                                                   .layerCount = 1,
-                                                   .colorAttachmentCount =
-                                                       static_cast<uint32_t>(waterAttachments.size()),
-                                                   .pColorAttachments = waterAttachments.data(),
-                                                   .pDepthAttachment = &waterDepthAttachment});
+    commandBuffer.beginRendering(
+        vk::RenderingInfo{.renderArea = {.offset = {0, 0}, .extent = swapChainExtent},
+                          .layerCount = 1,
+                          .colorAttachmentCount = static_cast<uint32_t>(waterAttachments.size()),
+                          .pColorAttachments = waterAttachments.data(),
+                          .pDepthAttachment = &waterDepthAttachment});
     commandBuffer.setViewport(0, vk::Viewport(0.0f, static_cast<float>(swapChainExtent.height),
                                               static_cast<float>(swapChainExtent.width),
                                               -static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
@@ -3312,6 +3381,7 @@ private:
       geometryPass = GEOMETRY_PASS_TRANSLUCENT;
       commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
                                  useVertexPulling ? *waterVertexPullingPipeline : *waterPipeline);
+      commandBuffer.setCullMode(vk::CullModeFlagBits::eNone);
     }
     if (!wireframeEnabled && terrainView != TerrainView::RealOnly) {
       commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0,
@@ -3349,7 +3419,7 @@ private:
     }
     recordOutline(commandBuffer);
     commandBuffer.endRendering();
-    if (!useVertexPulling && hzbOcclusionEnabled) {
+    if (!useVertexPulling && hzbOcclusionEnabled && !frozenLodView) {
       recordHzb(commandBuffer, imageIndex);
     }
 
@@ -3454,7 +3524,9 @@ private:
         .layerBlocks = terrainLayerBlocks,
         .layerFillerBlocks = terrainLayerFillerBlocks,
         .layerDeepBlocks = terrainLayerDeepBlocks,
-        .zBase = 0u};
+        .zBase = 0u,
+        .logBlock = treeLogBlock,
+        .leavesBlock = treeLeavesBlock};
     commandBuffer.pushConstants(*chunkComputePipelineLayout, vk::ShaderStageFlagBits::eCompute, 0,
                                 sizeof(computeParams), &computeParams);
     // One item per Z group, split into batches under the device's Z group limit (65535 or more), each pushing its
@@ -3481,8 +3553,7 @@ private:
                                  .dstStageMask = vk::PipelineStageFlagBits2::eDrawIndirect |
                                                  vk::PipelineStageFlagBits2::eComputeShader,
                                  .dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead |
-                                                  vk::AccessFlagBits2::eShaderRead |
-                                                  vk::AccessFlagBits2::eShaderWrite};
+                                                  vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite};
       commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
     };
 
@@ -3673,6 +3744,8 @@ private:
         swapChainExtent.height != cachedLodExtent.height) {
       lodDistanceSquared =
           initializeLodDistanceSquared(TARGET_SCREEN_PERCENTAGE, fov, {swapChainExtent.width, swapChainExtent.height});
+      baseLodDistanceSquared = initializeLodDistanceSquared(TARGET_SCREEN_PERCENTAGE, BASE_FOV_RADIANS,
+                                                            {swapChainExtent.width, swapChainExtent.height});
       cachedLodFov = fov;
       cachedLodExtent = swapChainExtent;
     }
@@ -3685,12 +3758,20 @@ private:
                                   {cameraRight.x, cameraRight.y, cameraRight.z},
                                   {cameraUp.x, cameraUp.y, cameraUp.z},
                                   lodDistanceSquared,
+                                  baseLodDistanceSquared,
                                   fov,
                                   aspectRatio,
                                   useVertexPulling,
                                   cpuAdvertisedCenter};
-    updateVisibleClipmap(clipmapView);
-    updateCpuWorld(eye, currentImage);
+    if (lodFreezeRequested && !frozenLodView) {
+      frozenLodView = clipmapView;
+      frozenLodEye = eye;
+      frozenCullMvpValid = false;
+    } else if (!lodFreezeRequested) {
+      frozenLodView.reset();
+    }
+    updateVisibleClipmap(frozenLodView ? *frozenLodView : clipmapView);
+    updateCpuWorld(frozenLodView ? frozenLodEye : eye, currentImage);
     if (chunkBuffersDirty) {
       remeshPlan = chunkSlots.update(visibleChunkSet, visibleChunkNeighborLods, forceFullRebuild);
       forceFullRebuild = false;
@@ -3705,16 +3786,16 @@ private:
                   remeshPlan.retiredColumns.size() * sizeof(uint32_t));
     }
 
-    constexpr float nearPlane = 0.1f;
-    constexpr float farPlane = 1000000.0f;
+    constexpr float nearPlane = NEAR_PLANE;
+    constexpr float farPlane = FAR_PLANE;
     // Reverse-Z (near and far swapped: depth 1 at the near plane, 0 at the far one). With the float depth buffer this
     // keeps roughly constant relative precision out to the far plane; standard Z lost all of it past a few thousand
     // blocks, and the ocean surface fought with the sea floor below it on coarse LODs. Explicitly the zero-to-one
     // variant: pch.hpp includes glm before GLM_FORCE_DEPTH_ZERO_TO_ONE above, so glm::perspective is -1..1, which
     // with near and far swapped puts everything past the near plane at negative depth (clipped).
     glm::mat4 proj = glm::perspectiveRH_ZO(
-        projectionFov, static_cast<float>(swapChainExtent.width) / static_cast<float>(swapChainExtent.height),
-        farPlane, nearPlane);
+        projectionFov, static_cast<float>(swapChainExtent.width) / static_cast<float>(swapChainExtent.height), farPlane,
+        nearPlane);
     const uint32_t jitterSample = (taaJitterIndex++ % 8u) + 1u;
     const float jitterX = TAA_ENABLED ? (halton(jitterSample, 2u) - 0.5f) * TAA_JITTER_PIXELS : 0.0f;
     const float jitterY = TAA_ENABLED ? (halton(jitterSample, 3u) - 0.5f) * TAA_JITTER_PIXELS : 0.0f;
@@ -3732,15 +3813,34 @@ private:
     // w: seconds for texture animation and fake waves, wrapped so a float keeps millisecond precision.
     ubo.cameraPosition = glm::vec4(eye, static_cast<float>(std::fmod(glfwGetTime(), 3600.0)));
     // z: 1 while the camera is inside an ocean cell (underwater fog in fragMain).
-    cameraUnderwater = cpuWorld->blockId(static_cast<int32_t>(std::floor(eye.x)), static_cast<int32_t>(std::floor(eye.y)),
-                                         static_cast<int32_t>(std::floor(eye.z))) == oceanBlockId;
-    ubo.viewRayScale = {1.0f / proj[0][0], 1.0f / proj[1][1], cameraUnderwater ? 1.0f : 0.0f, 0.0f};
+    cameraUnderwater =
+        cpuWorld->blockId(static_cast<int32_t>(std::floor(eye.x)), static_cast<int32_t>(std::floor(eye.y)),
+                          static_cast<int32_t>(std::floor(eye.z))) == oceanBlockId;
+    // Border fog end: the clipmap's radius, less how far the applied clipmap may lag behind the camera (stale cover)
+    // and a few chunks of slack, so the clipmap's edge is always inside opaque fog.
+    const float borderFogEnd =
+        kClipmapRadius - kClipmapStaleCover.maxPositionDelta - static_cast<float>(CHUNK_SIZE) * 4.0f;
+    ubo.viewRayScale = {1.0f / proj[0][0], 1.0f / proj[1][1], cameraUnderwater ? 1.0f : 0.0f, borderFogEnd};
     // Only the mesh path builds the Hi-Z; after a vertex-path frame it no longer matches previousMvp.
     if (useVertexPulling || !hzbOcclusionEnabled) {
       hzbValid = false;
     }
     ubo.hzbParams = {static_cast<float>(hzbSize.width), static_cast<float>(hzbSize.height),
                      static_cast<float>(hzbMipCount), hzbValid ? 1.0f : 0.0f};
+    if (frozenLodView) {
+      if (!frozenCullMvpValid) {
+        frozenCullMvp = ubo.mvp;
+        frozenHzbMvp = ubo.previousMvp;
+        frozenCullMvpValid = true;
+      }
+      ubo.cullMvp = frozenCullMvp;
+      ubo.cullCameraPosition = glm::vec4(frozenLodEye, 0.0f);
+      ubo.cullPreviousMvp = frozenHzbMvp; // recordHzb is skipped while frozen: the Hi-Z keeps the frozen view's depth
+    } else {
+      ubo.cullMvp = ubo.mvp;
+      ubo.cullCameraPosition = glm::vec4(eye, 0.0f);
+      ubo.cullPreviousMvp = ubo.previousMvp;
+    }
 
     memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
     previousMvp = ubo.mvp;
@@ -3783,6 +3883,13 @@ private:
           const int64_t top = static_cast<int32_t>(freeSlots);
           growWorkPool(static_cast<uint64_t>(std::max<int64_t>(int64_t{workPoolCapacity} - top, 0)));
         } else if (appended > MAX_QUAD_COUNT) {
+          // Quads past the end were dropped (holes). A rebuild only helps if the set got smaller since; say so once,
+          // since a set that doesn't fit rebuilds every frame.
+          if (!quadOverflowWarned) {
+            std::cerr << "QuadBuffer overflow: " << appended << " quads > capacity " << MAX_QUAD_COUNT
+                      << "; some chunks are missing\n";
+            quadOverflowWarned = true;
+          }
           forceFullRebuild = true;
           chunkBuffersDirty = true;
         } else if (garbageHeavy || nearlyFull || slotsSparse) {

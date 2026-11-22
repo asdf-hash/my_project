@@ -17,6 +17,50 @@ using simd::M8;
 
 constexpr int32_t N = CHUNK_SIZE;
 
+// The column's trees (Column::trees) within chunk chunkY, into cells the terrain leaves empty (terrain wins), the
+// same rule chunk_compute.slang's treeCellBlock applies.
+void stampTrees(const Column &column, int32_t chunkY, const TerrainBlockIds &ids, VoxelChunk &voxels) {
+  if (ids.log == kAir || ids.leaves == kAir) {
+    return;
+  }
+  const int32_t bottom = chunkY * N;
+  const int32_t originX = column.cx * N;
+  const int32_t originZ = column.cz * N;
+  for (const vegetation::TreeInstance &tree : column.trees) {
+    if (tree.trunkHeight == 0) {
+      continue;
+    }
+    const int32_t yBegin = std::max(tree.ground, bottom);
+    const int32_t yEnd = std::min(tree.ground + vegetation::TREE_MAX_ABOVE, bottom + N);
+    for (int32_t y = yBegin; y < yEnd; ++y) {
+      for (int32_t dz = -vegetation::TREE_RADIUS; dz <= vegetation::TREE_RADIUS; ++dz) {
+        for (int32_t dx = -vegetation::TREE_RADIUS; dx <= vegetation::TREE_RADIUS; ++dx) {
+          const int32_t wx = tree.trunkX + dx;
+          const int32_t wz = tree.trunkZ + dz;
+          const uint32_t block = vegetation::treeBlockAt(tree, wx, y, wz);
+          const int32_t lx = wx - originX;
+          const int32_t lz = wz - originZ;
+          if (block == vegetation::TREE_NONE || y < column.height(lx, lz)) {
+            continue;
+          }
+          const int32_t ly = y - bottom;
+          uint16_t &cell = voxels.ids[VoxelChunk::index(lx, ly, lz)];
+          const bool wasNonOpaque = cell != kAir && cell != column.oceanId && (cell & blocks::kNonOpaqueBit) != 0;
+          cell = block == vegetation::TREE_LOG ? ids.log : ids.leaves;
+          const uint32_t bit = 1u << ly;
+          voxels.ocean[lz * N + lx] &= ~bit;
+          if (blocks::isOpaque(cell)) {
+            voxels.solid[lz * N + lx] |= bit;
+            voxels.nonOpaqueCount = static_cast<uint16_t>(voxels.nonOpaqueCount - (wasNonOpaque ? 1 : 0));
+          } else if (!wasNonOpaque) {
+            voxels.nonOpaqueCount = static_cast<uint16_t>(voxels.nonOpaqueCount + 1);
+          }
+        }
+      }
+    }
+  }
+}
+
 // Fills one voxel chunk from the heightmap: the CPU twin of faceBlockType / selectBlockType at LOD 0. Cells within
 // one block of a (dithered) layer boundary take their material from the column's top instead of their own height.
 void fillChunk(const Column &column, int32_t chunkY, const TerrainBlockIds &ids, VoxelChunk &voxels) {
@@ -81,6 +125,7 @@ void fillChunk(const Column &column, int32_t chunkY, const TerrainBlockIds &ids,
       }
     }
   }
+  stampTrees(column, chunkY, ids, voxels);
 }
 
 // Gives the column voxel storage for chunk chunkY, filled from the heightmap (unstored chunks follow the same rule,
@@ -111,6 +156,7 @@ std::shared_ptr<Column> cloneColumn(const Column &source) {
   column->rawHeights = source.rawHeights;
   column->heights = source.heights;
   column->dither = source.dither;
+  column->trees = source.trees;
   column->oceanId = source.oceanId;
   column->firstChunkY = source.firstChunkY;
   column->edited = source.edited;
@@ -174,6 +220,30 @@ std::shared_ptr<Column> generateColumn(int32_t cx, int32_t cz, const TerrainBloc
     terrain::sampleDither8(xs, zs, &column->dither[static_cast<size_t>(i)]);
   }
 
+  // Trees: one candidate per 8x8 cell. The trunk sits 2..5 blocks into its cell, so it and its four neighbours are
+  // interior columns (the same heights generateHeights stores at LOD 0).
+  int32_t treeTop = world::kMinTerrainHeight;
+  if (ids.log != kAir && ids.leaves != kAir) {
+    for (int32_t cellZ = 0; cellZ < Column::kTreeCellsPerSide; ++cellZ) {
+      for (int32_t cellX = 0; cellX < Column::kTreeCellsPerSide; ++cellX) {
+        vegetation::TreeInstance tree = vegetation::treeCandidate(
+            vegetation::int2(cx * Column::kTreeCellsPerSide + cellX, cz * Column::kTreeCellsPerSide + cellZ));
+        if (tree.trunkHeight != 0) {
+          const int32_t lx = tree.trunkX - originX;
+          const int32_t lz = tree.trunkZ - originZ;
+          tree.ground = column->height(lx, lz);
+          if (vegetation::treeGroundOk(tree.ground, column->height(lx - 1, lz), column->height(lx + 1, lz),
+                                       column->height(lx, lz - 1), column->height(lx, lz + 1))) {
+            treeTop = std::max(treeTop, tree.ground + vegetation::TREE_MAX_ABOVE);
+          } else {
+            tree.trunkHeight = 0;
+          }
+        }
+        column->trees[static_cast<size_t>(cellZ * Column::kTreeCellsPerSide + cellX)] = tree;
+      }
+    }
+  }
+
   // Faces lie on cells in [paddedMin - 1, interiorMax): a solid cell needs a non-solid cell above it or beside it.
   // Ocean surface faces lie on the cell just below sea level, in columns lower than it. Fully ocean chunks between
   // the two hold no faces and stay unstored (null slots).
@@ -181,9 +251,12 @@ std::shared_ptr<Column> generateColumn(int32_t cx, int32_t cz, const TerrainBloc
   const int32_t terrainLastChunkY = floorDiv(interiorMax - 1, N);
   const bool hasSurface = ids.ocean != kAir && interiorMin < world::kSeaLevel;
   const int32_t seaChunkY = floorDiv(world::kSeaLevel - 1, N);
-  const int32_t lastChunkY = hasSurface ? std::max(terrainLastChunkY, seaChunkY) : terrainLastChunkY;
+  // Chunks holding tree blocks above the terrain are stored too (null slots must follow the heightmap).
+  const int32_t treeLastChunkY = floorDiv(treeTop - 1, N);
+  const int32_t lastChunkY =
+      std::max(hasSurface ? std::max(terrainLastChunkY, seaChunkY) : terrainLastChunkY, treeLastChunkY);
   for (int32_t chunkY = column->firstChunkY; chunkY <= lastChunkY; ++chunkY) {
-    if (chunkY > terrainLastChunkY && chunkY != seaChunkY) {
+    if (chunkY > terrainLastChunkY && chunkY != seaChunkY && chunkY > treeLastChunkY) {
       column->chunks.emplace_back();
       continue;
     }

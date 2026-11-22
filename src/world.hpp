@@ -57,4 +57,7 @@ inline constexpr std::array<std::string_view, kTerrainLayerBlocks.size()> kTerra
 // Block deeper than the filler, per layer (grass, 3 dirt, then stone; sand / snow: 3 more, then stone).
 inline constexpr std::array<std::string_view, kTerrainLayerBlocks.size()> kTerrainLayerDeepBlocks{"stone", "stone",
                                                                                                   "stone", "stone"};
+// Tree blocks (placement: shaders/vegetation_shared.hlsl).
+inline constexpr std::string_view kTreeLogBlock = "log";
+inline constexpr std::string_view kTreeLeavesBlock = "leaves";
 } // namespace world

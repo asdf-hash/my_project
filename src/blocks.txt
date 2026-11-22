@@ -45,3 +45,12 @@ fluid = ocean
 # = WATER_FOG_COLOR in slang.slang / fluid_still.png's average (0.694 gray): the surface matches the water fog.
 tint = 0.086 0.259 0.49
 frame_time = 0.1
+
+# Trees (placement: shaders/vegetation_shared.hlsl). Placeholder textures; replace freely.
+[log]
+side = log_side.png
+top = log_top.png
+bottom = log_top.png
+
+[leaves]
+all = leaves.png

@@ -1,3 +1,5 @@
+#include "vegetation_shared.hlsl"
+
 // Terrain height field modeled on the Big Globe mod's V6 overworld ("river mountains"), without its rivers.
 // Sea level y = 0.
 //
@@ -120,16 +122,7 @@ float tanhPoly(float x) {
   return x < 0.0f ? -t : t;
 }
 
-uint hashCell(int2 cell, uint seed) {
-  uint h = uint(cell.x) * 0x8da6b343u ^ uint(cell.y) * 0xd8163841u ^ seed;
-  h ^= h >> 16u;
-  h *= 0x7feb352du;
-  h ^= h >> 15u;
-  h *= 0x846ca68bu;
-  h ^= h >> 16u;
-  return h;
-}
-
+// hashCell lives in vegetation_shared.hlsl (shared with the CPU tree placement); the SIMD twin is in terrain_cpu.cpp.
 float latticeSign(int2 cell, uint seed) { return (hashCell(cell, seed) & 1u) != 0u ? 1.0f : -1.0f; }
 
 // Value noise with lattice values +-1 and smootherstep interpolation: (value, d/dx, d/dz) in world units.
