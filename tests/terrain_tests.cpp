@@ -1,5 +1,7 @@
 // CPU terrain checks: mesher output vs brute force, a height checksum (compare AVX2 and scalar builds), timings.
+// Printed output is diffed against a baseline: keep the strings stable.
 #include "../src/block_registry.hpp"
+#include "../src/cpu_light.hpp"
 #include "../src/cpu_mesher.hpp"
 #include "../src/cpu_world.hpp"
 #include "../src/simd.hpp"
@@ -22,6 +24,7 @@ using namespace cpuworld;
 namespace {
 
 int failures = 0;
+// Counts a failure and prints the first 20 (file:line plus a printf-style message).
 #define CHECK(cond, ...)                                                                                               \
   do {                                                                                                                 \
     if (!(cond)) {                                                                                                     \
@@ -36,10 +39,12 @@ int failures = 0;
 constexpr uint16_t kOcean = blocks::kNonOpaqueBit + 2; // glass / leaves in the edit tests use + 0 / + 1
 const TerrainBlockIds kIds{{0, 1, 2, 3}, {4, 5, 2, 3}, {4, 2, 2, 3}, kOcean};
 
+/** Reference answers for the mesher, computed cell by cell from the neighborhood. Coordinates are chunk-local. */
 struct Brute {
-  const Neighborhood &nb;
+  const Neighborhood &nb; // nb = 3x3 columns around the meshed one
   int32_t chunkY;
-  bool solid(int32_t x, int32_t y, int32_t z) const { // chunk-local, x/z in -1..32
+  /** Whether a cell is opaque; x/z may be -1..32 (reaches into neighbors, or border heights when absent). */
+  bool solid(int32_t x, int32_t y, int32_t z) const {
     const int32_t dx = x < 0 ? -1 : (x >= 32 ? 1 : 0);
     const int32_t dz = z < 0 ? -1 : (z >= 32 ? 1 : 0);
     const Column *c = nb.columns[dz + 1][dx + 1];
@@ -49,7 +54,8 @@ struct Brute {
     }
     return worldY < nb.center().borderHeight(x, z);
   }
-  uint16_t id(int32_t x, int32_t y, int32_t z) const { // chunk-local, x/z in -1..32
+  /** Block id of a cell; x/z may be -1..32, absent neighbors read as buried terrain or empty. */
+  uint16_t id(int32_t x, int32_t y, int32_t z) const {
     const int32_t dx = x < 0 ? -1 : (x >= 32 ? 1 : 0);
     const int32_t dz = z < 0 ? -1 : (z >= 32 ? 1 : 0);
     const Column *c = nb.columns[dz + 1][dx + 1];
@@ -59,8 +65,12 @@ struct Brute {
     }
     return worldY < nb.center().borderHeight(x, z) ? kBuriedTerrain : nb.center().emptyCell(worldY);
   }
-  // Opaque cells show a face toward any non-opaque cell; non-opaque blocks (not air) toward any non-opaque cell
-  // holding a different block.
+  /**
+   * Whether the cell shows a face toward a neighbor. Opaque cells show one toward any non-opaque cell; non-opaque
+   * blocks (not air) toward any non-opaque cell holding a different block.
+   *
+   * @param ox, oy, oz Unit offset to the neighbor.
+   */
   bool face(int32_t x, int32_t y, int32_t z, int32_t ox, int32_t oy, int32_t oz) const {
     if (solid(x + ox, y + oy, z + oz)) {
       return false;
@@ -71,33 +81,159 @@ struct Brute {
     const uint16_t self = id(x, y, z);
     return self != kAir && self != id(x + ox, y + oy, z + oz);
   }
+  /** Occlusion level 0-3 of one corner from its two side cells and the diagonal cell (both sides = fully occluded). */
   uint32_t vertexAo(bool a, bool b, bool c) const { return a && b ? 3u : uint32_t(a) + uint32_t(b) + uint32_t(c); }
+  /**
+   * Packed AO of one face, as the mesher stores it: 2 bits per corner, (-u,-v), (+u,-v), (+u,+v), (-u,+v).
+   *
+   * @param n Normal index 0-5 (+x, -x, +y, -y, +z, -z).
+   */
   uint32_t ao(int32_t x, int32_t y, int32_t z, uint32_t n) const {
     if (id(x, y, z) == kOcean) {
       return 0u; // water is lit flat
     }
+    // Per normal: the face's u and v axes and the outward offset.
     static const int u[6][3] = {{0, 0, 1}, {0, 0, 1}, {1, 0, 0}, {1, 0, 0}, {1, 0, 0}, {1, 0, 0}};
     static const int v[6][3] = {{0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, {0, 1, 0}};
     static const int o[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-    const int ox = x + o[n][0], oy = y + o[n][1], oz = z + o[n][2];
-    auto s = [&](int su, int sv) {
+    const int ox = x + o[n][0], oy = y + o[n][1], oz = z + o[n][2]; // cell in front of the face
+    auto solidInPlane = [&](int su, int sv) {
       return solid(ox + su * u[n][0] + sv * v[n][0], oy + su * u[n][1] + sv * v[n][1], oz + su * u[n][2] + sv * v[n][2]);
     };
-    return vertexAo(s(-1, 0), s(0, -1), s(-1, -1)) | (vertexAo(s(1, 0), s(0, -1), s(1, -1)) << 2) |
-           (vertexAo(s(1, 0), s(0, 1), s(1, 1)) << 4) | (vertexAo(s(-1, 0), s(0, 1), s(-1, 1)) << 6);
+    return vertexAo(solidInPlane(-1, 0), solidInPlane(0, -1), solidInPlane(-1, -1)) |
+           (vertexAo(solidInPlane(1, 0), solidInPlane(0, -1), solidInPlane(1, -1)) << 2) |
+           (vertexAo(solidInPlane(1, 0), solidInPlane(0, 1), solidInPlane(1, 1)) << 4) |
+           (vertexAo(solidInPlane(-1, 0), solidInPlane(0, 1), solidInPlane(-1, 1)) << 6);
   }
 };
 
-// `only`, if set, limits the AO / face checks to chunk-local cells it accepts.
+// Quads checked with skylight below 15 / at 0, so the light tests can tell they saw shadow.
+size_t gShadowedFaces = 0, gDarkFaces = 0;
+
+/**
+ * Skylight by plain BFS (Minecraft rules) over the chunk and a 15-cell halo, independent of cpu_light.cpp: seeds come
+ * from scanning each column top down, not from Column::skyTop. Unloaded neighbors read the center's nearest border
+ * height as a heightmap, the same convention as computeSkyLight.
+ *
+ * @return levels of the padded core, index ((z + 1) * 34 + (x + 1)) * 34 + (y + 1) for chunk-local x, y, z in -1..32.
+ */
+std::vector<uint8_t> bruteSkyLight(const Neighborhood &nb, int32_t chunkY) {
+  constexpr int H = 15, W = 32 + 2 * H; // halo and region width
+  // Column for chunk-local px, pz (lx, lz receive its column-local coords), or null when not loaded.
+  auto columnAt = [&](int px, int pz, int &lx, int &lz) -> const Column * {
+    const int dx = floorDiv(px, 32), dz = floorDiv(pz, 32);
+    lx = px - dx * 32, lz = pz - dz * 32;
+    return nb.columns[dz + 1][dx + 1];
+  };
+  auto borderAt = [&](int px, int pz) { return nb.center().borderHeight(std::clamp(px, -1, 32), std::clamp(pz, -1, 32)); };
+  std::vector<int> skyTop(W * W); // lowest world y with no opaque cell at or above, per region column
+  for (int pz = -H; pz < 32 + H; ++pz)
+    for (int px = -H; px < 32 + H; ++px) {
+      int lx, lz;
+      const Column *c = columnAt(px, pz, lx, lz);
+      int top;
+      if (!c) {
+        top = borderAt(px, pz);
+      } else {
+        top = (c->firstChunkY + int(c->chunks.size())) * 32; // all air above the stored range
+        while (top > world::kMinTerrainHeight && !c->isSolid(lx, top - 1, lz)) --top;
+      }
+      skyTop[(pz + H) * W + (px + H)] = top;
+    }
+  std::vector<uint8_t> opaque(W * W * W);
+  std::vector<int8_t> level(W * W * W, -1);
+  auto index = [&](int px, int py, int pz) { return ((pz + H) * W + (px + H)) * W + (py + H); };
+  std::vector<std::array<int, 3>> queue;
+  for (int pz = -H; pz < 32 + H; ++pz)
+    for (int px = -H; px < 32 + H; ++px) {
+      int lx, lz;
+      const Column *c = columnAt(px, pz, lx, lz);
+      for (int py = -H; py < 32 + H; ++py) {
+        const int wy = chunkY * 32 + py;
+        const bool solid = c ? c->isSolid(lx, wy, lz) : wy < borderAt(px, pz);
+        opaque[index(px, py, pz)] = solid;
+        if (!solid && wy >= skyTop[(pz + H) * W + (px + H)]) {
+          level[index(px, py, pz)] = 15;
+          queue.push_back({px, py, pz});
+        }
+      }
+    }
+  static const int o[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+  for (size_t head = 0; head < queue.size(); ++head) {
+    const auto [px, py, pz] = queue[head];
+    const int next = level[index(px, py, pz)] - 1;
+    if (next <= 0) continue;
+    for (const auto &d : o) {
+      const int nx = px + d[0], ny = py + d[1], nz = pz + d[2];
+      if (nx < -H || nx >= 32 + H || ny < -H || ny >= 32 + H || nz < -H || nz >= 32 + H) continue;
+      const int i = index(nx, ny, nz);
+      if (opaque[i] || level[i] >= next) continue;
+      level[i] = int8_t(next);
+      queue.push_back({nx, ny, nz});
+    }
+  }
+  std::vector<uint8_t> core(34 * 34 * 34);
+  for (int z = -1; z <= 32; ++z)
+    for (int x = -1; x <= 32; ++x)
+      for (int y = -1; y <= 32; ++y) core[((z + 1) * 34 + (x + 1)) * 34 + (y + 1)] = uint8_t(std::max<int>(level[index(x, y, z)], 0));
+  return core;
+}
+
+/**
+ * Smooth skylight of one face written plainly (vanilla's blend): per corner (AO's order), the rounded average of four
+ * samples: the cell in front of the face, the two side cells toward the corner, and the diagonal cell (the first
+ * side again when both sides are opaque). Opaque cells read 0, and every 0 sample counts as the front's level.
+ *
+ * @param light bruteSkyLight of the chunk.
+ * @param n Normal index 0-5 (+x, -x, +y, -y, +z, -z).
+ * @return 4 bits per corner, corner k in bits 4k..4k+3.
+ */
+uint32_t bruteCornerLight(const Brute &brute, const std::vector<uint8_t> &light, int x, int y, int z, int n) {
+  static const int u[6][3] = {{0, 0, 1}, {0, 0, 1}, {1, 0, 0}, {1, 0, 0}, {1, 0, 0}, {1, 0, 0}};
+  static const int v[6][3] = {{0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, {0, 1, 0}};
+  static const int o[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+  const int fx = x + o[n][0], fy = y + o[n][1], fz = z + o[n][2]; // cell in front of the face
+  // Whether the cell at offset (su, sv) in the face plane is opaque, and its level (0 if opaque).
+  auto opaqueAt = [&](int su, int sv) {
+    return brute.solid(fx + su * u[n][0] + sv * v[n][0], fy + su * u[n][1] + sv * v[n][1],
+                       fz + su * u[n][2] + sv * v[n][2]);
+  };
+  auto level = [&](int su, int sv) {
+    if (opaqueAt(su, sv)) return 0;
+    const int px = fx + su * u[n][0] + sv * v[n][0], py = fy + su * u[n][1] + sv * v[n][1],
+              pz = fz + su * u[n][2] + sv * v[n][2];
+    return int(light[((pz + 1) * 34 + (px + 1)) * 34 + (py + 1)]);
+  };
+  const int corners[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+  const int center = level(0, 0);
+  uint32_t packed = 0;
+  for (int k = 0; k < 4; ++k) {
+    const int a = level(corners[k][0], 0), b = level(0, corners[k][1]);
+    const int c = opaqueAt(corners[k][0], 0) && opaqueAt(0, corners[k][1]) ? a : level(corners[k][0], corners[k][1]);
+    int sum = center;
+    for (const int l : {a, b, c}) sum += l == 0 ? center : l;
+    packed |= uint32_t((sum + 2) / 4) << (4 * k);
+  }
+  return packed;
+}
+
+/**
+ * Checks one chunk's mesh against Brute: cluster bookkeeping, every quad cell's AO, block and corner skylight
+ * (bruteCornerLight), and that every face Brute expects is covered exactly once.
+ *
+ * @param only If set, limits the AO / face checks to chunk-local cells it accepts.
+ */
 void checkChunk(const Neighborhood &nb, int32_t chunkY, const ChunkMesh &mesh,
                 const std::function<bool(int, int, int)> &only = {}) {
   const Column &column = nb.center();
   const VoxelChunk *voxels = column.chunk(chunkY);
   Brute brute{nb, chunkY};
-  static const int o[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+  const std::vector<uint8_t> light = mesh.quads.empty() ? std::vector<uint8_t>{} : bruteSkyLight(nb, chunkY);
+  static const int o[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}}; // per normal
   std::map<std::tuple<int, int, int, int>, int> covered;
   // Opaque clusters' quads first, then the translucent (ocean) clusters' quads.
   uint32_t clusterQuads = 0;
+  // Adds each cluster's quad count to clusterQuads, checking that clusters are contiguous.
   auto sumClusters = [&](const std::array<QuadCluster, kClustersPerChunk> &clusters) {
     for (const QuadCluster &cluster : clusters) {
       const uint32_t count = (cluster.counts01 & 0xffff) + (cluster.counts01 >> 16) + (cluster.counts23 & 0xffff) +
@@ -110,32 +246,39 @@ void checkChunk(const Neighborhood &nb, int32_t chunkY, const ChunkMesh &mesh,
   const uint32_t opaqueQuads = clusterQuads;
   sumClusters(mesh.translucentClusters);
   CHECK(clusterQuads == mesh.quads.size(), "cluster total %u != %zu", clusterQuads, mesh.quads.size());
-  for (size_t qi = 0; qi < mesh.quads.size(); ++qi) {
-    const uint64_t q = mesh.quads[qi];
-    const uint32_t p = uint32_t(q), meta = uint32_t(q >> 32);
+  for (size_t quadIndex = 0; quadIndex < mesh.quads.size(); ++quadIndex) {
+    const uint64_t packed = mesh.quads[quadIndex];
+    // Low word: x, y, z (5 bits each), normal (3), ao (8), length - 1 (5). High word: block (10 bits), width - 1 (3 bits) at 26.
+    const uint32_t p = uint32_t(packed), meta = uint32_t(packed >> 32);
     const int x = p & 31, y = (p >> 5) & 31, z = (p >> 10) & 31, n = (p >> 15) & 7;
     const uint32_t ao = (p >> 18) & 0xff, length = ((p >> 26) & 31) + 1, width = ((meta >> 26) & 7) + 1;
     const uint32_t block = meta & 0x3ff;
-    CHECK((block == kOcean) == (qi >= opaqueQuads), "quad %zu (block %u) in the wrong cluster set", qi, block);
-    for (uint32_t a = 0; a < length; ++a) {
-      for (uint32_t b = 0; b < width; ++b) {
-        int cx = x, cy = y, cz = z;
+    const uint32_t cornerLight = (meta >> 10) & 0xffff;
+    CHECK((block == kOcean) == (quadIndex >= opaqueQuads), "quad %zu (block %u) in the wrong cluster set", quadIndex, block);
+    for (uint32_t a = 0; a < length; ++a) {   // along the greedy length
+      for (uint32_t b = 0; b < width; ++b) {  // along the greedy width
+        int cellX = x, cellY = y, cellZ = z;
         if (n == 2) {
-          cx += a, cz -= b;
+          cellX += a, cellZ -= b;
         } else if (n == 3) {
-          cx += a, cz += b;
+          cellX += a, cellZ += b;
         } else if (n < 2) {
-          cy += a, cz += b;
+          cellY += a, cellZ += b;
         } else {
-          cy += a, cx += b;
+          cellY += a, cellX += b;
         }
-        CHECK(cx >= 0 && cx < 32 && cy >= 0 && cy < 32 && cz >= 0 && cz < 32, "quad cell out of chunk");
-        if (cx < 0 || cx >= 32 || cy < 0 || cy >= 32 || cz < 0 || cz >= 32) continue;
-        ++covered[{cx, cy, cz, n}];
-        if (only && !only(cx, cy, cz)) continue;
-        CHECK(brute.ao(cx, cy, cz, n) == ao, "ao mismatch at %d %d %d n%d: %x vs %x (chunk %d %d %d)", cx, cy, cz,
-              n, brute.ao(cx, cy, cz, n), ao, column.cx, chunkY, column.cz);
-        CHECK(voxels->ids[VoxelChunk::index(cx, cy, cz)] == block, "block mismatch");
+        CHECK(cellX >= 0 && cellX < 32 && cellY >= 0 && cellY < 32 && cellZ >= 0 && cellZ < 32, "quad cell out of chunk");
+        if (cellX < 0 || cellX >= 32 || cellY < 0 || cellY >= 32 || cellZ < 0 || cellZ >= 32) continue;
+        ++covered[{cellX, cellY, cellZ, n}];
+        if (only && !only(cellX, cellY, cellZ)) continue;
+        CHECK(brute.ao(cellX, cellY, cellZ, n) == ao, "ao mismatch at %d %d %d n%d: %x vs %x (chunk %d %d %d)", cellX, cellY, cellZ,
+              n, brute.ao(cellX, cellY, cellZ, n), ao, column.cx, chunkY, column.cz);
+        CHECK(voxels->ids[VoxelChunk::index(cellX, cellY, cellZ)] == block, "block mismatch");
+        const uint32_t expected = bruteCornerLight(brute, light, cellX, cellY, cellZ, n);
+        CHECK(expected == cornerLight, "corner light mismatch at %d %d %d n%d: brute %04x, mesh %04x (chunk %d %d %d)",
+              cellX, cellY, cellZ, n, expected, cornerLight, column.cx, chunkY, column.cz);
+        gShadowedFaces += cornerLight != 0xffff;
+        gDarkFaces += cornerLight == 0;
       }
     }
   }
@@ -152,7 +295,7 @@ void checkChunk(const Neighborhood &nb, int32_t chunkY, const ChunkMesh &mesh,
         }
 }
 
-// Block ids against the fill rule written plainly.
+/** Checks a column's block ids and solid / ocean masks against the fill rule written plainly. */
 void checkFill(const Column &column) {
   for (size_t i = 0; i < column.chunks.size(); ++i) {
     const int32_t chunkY = column.firstChunkY + int32_t(i);
@@ -193,6 +336,7 @@ void checkFill(const Column &column) {
   }
 }
 
+/** Monotonic time in seconds. */
 double nowSeconds() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -202,7 +346,7 @@ double nowSeconds() {
 int main() {
   std::printf("SIMD: %s\n", ENGINE_SIMD_AVX2 ? "AVX2+FMA" : "scalar");
 
-  // Height checksum over a fixed grid: AVX2 and scalar builds must print the same value.
+  /** Height checksum over a fixed grid: AVX2 and scalar builds must print the same value. */
   uint64_t checksum = 1469598103934665603ull;
   double minH = 1e9, maxH = -1e9;
   for (int32_t i = 0; i < 4096; ++i) {
@@ -223,7 +367,7 @@ int main() {
   }
   std::printf("height checksum %016llx (range %.1f .. %.1f)\n", (unsigned long long)checksum, minH, maxH);
 
-  // Land floor: wherever the continent layer says land (>= kCoastBand), the surface stays above sea level.
+  /** Land floor: wherever the continent layer says land (>= kCoastBand), the surface stays above sea level. */
   {
     size_t land = 0, ocean = 0;
     float lowestLand = 1e9f;
@@ -249,14 +393,14 @@ int main() {
     std::printf("land floor: %zu land / %zu ocean samples, lowest land %.2f\n", land, ocean, lowestLand);
   }
 
-  // Mesher vs brute force on a spread of columns (plains, coasts, mountains), with and without neighbors.
+  /** Mesher vs brute force on a spread of columns (plains, coasts, mountains), with and without neighbors. */
   std::vector<std::array<int32_t, 2>> samples = {{0, 0},      {3, -7},     {40, 12},    {-120, 75},
                                                  {300, -260}, {-900, 410}, {1500, 1500}, {77, 333}};
   // Plus ocean columns: a deep one (unstored fully-ocean chunks between seabed and surface) and a coast.
   {
     bool deep = false, coast = false;
     for (int32_t i = 0; i < 4000 && !(deep && coast); ++i) {
-      const int32_t cx = i * 7 - 9000, cz = i * 3 - 5000;
+      const int32_t cx = i * 7 - 9000, cz = i * 3 - 5000; // chunk column
       float lo = 1e9f, hi = -1e9f;
       for (const int32_t d : {0, 31}) {
         for (const int32_t e : {0, 31}) {
@@ -298,13 +442,18 @@ int main() {
   }
   std::printf("mesher: %zu chunks checked, %zu quads\n", chunksChecked, quads);
 
-  // Block breaking through CpuWorld: a shaft down a column corner (x = 31 | 32, z = -1 | 0), crossing chunk borders
-  // and going below the stored chunk range; every mesh around it must match brute force.
+  /**
+   * Edits through CpuWorld: a shaft broken down a column corner (x = 31 | 32, z = -1 | 0) across chunk borders and
+   * below the stored range, a half unload / reload, then placed pillar, glass and leaves. Meshes around the edits
+   * must match brute force after each step.
+   */
   {
     CpuWorld world(kIds, 4);
     std::map<std::tuple<int32_t, int32_t, int32_t>, ChunkMesh> meshes;
     int32_t top = 0;
     int32_t regionLow = 0, regionHigh = 0; // world y range checkAround compares against brute force
+    int32_t areaXHigh = 34;                // east edge (world x) of the area checkAround compares
+    // Updates the world around `center` until its square is loaded, collecting mesh events into `meshes`.
     auto pump = [&](ChunkXZ center) {
       for (int i = 0; i < 20000 && !(world.squareLoaded(center) && world.readyCenter() == center); ++i) {
         world.update(center, {});
@@ -321,6 +470,7 @@ int main() {
         for (ChunkMesh &m : e.chunks) meshes[{e.cx, m.cy, e.cz}] = std::move(m);
       }
     };
+    // checkChunk on every chunk around the shaft, limited to cells near it; prints a summary line.
     auto checkAround = [&](const char *when) {
       const int before = failures;
       size_t checked = 0;
@@ -341,7 +491,7 @@ int main() {
             // Near the shaft only: borders elsewhere may have been meshed before a neighbor loaded (border heights).
             const auto nearShaft = [&](int x, int y, int z) {
               const int32_t wx = cx * 32 + x, wy = cy * 32 + y, wz = cz * 32 + z;
-              return wx >= 29 && wx <= 34 && wz >= -3 && wz <= 2 && wy >= regionLow && wy <= regionHigh;
+              return wx >= 29 && wx <= areaXHigh && wz >= -3 && wz <= 2 && wy >= regionLow && wy <= regionHigh;
             };
             checkChunk(nb, cy, it != meshes.end() ? it->second : ChunkMesh{}, nearShaft);
             ++checked;
@@ -421,15 +571,39 @@ int main() {
     CHECK(world.blockId(32, base + 2, -1) == kAir, "broken glass not air");
     pump({0, 0});
     checkAround("after breaking placed glass");
+
+    // Skylight: cap one shaft cell 10 below the surface (light still pours down the other) and dig a 2-tall tunnel
+    // east from beside it, so light fades along the tunnel to level 0. Every quad around must match the BFS reference.
+    const size_t shadowedBefore = gShadowedFaces, darkBefore = gDarkFaces;
+    const int32_t capY = top - 10, tunnelY = top - 40;
+    bool capped = true;
+    // Only the x = 32 half of the shaft is still open (the reload regenerated x = 31); (32, -1) stays open.
+    capped = world.placeBlock(32, capY, 0, kStone);
+    CHECK(capped, "could not cap the shaft");
+    for (int32_t x = 33; x <= 50; ++x)
+      for (const int32_t y : {tunnelY, tunnelY + 1}) world.breakBlock(x, y, 0);
+    CHECK(!world.isSolid(50, tunnelY, 0), "tunnel not dug");
+    pump({0, 0});
+    regionLow = top - 50;
+    regionHigh = capY + 2;
+    areaXHigh = 53;
+    checkAround("skylight under a capped shaft");
+    std::printf("skylight: %zu shadowed faces checked, %zu at level 0\n", gShadowedFaces - shadowedBefore,
+                gDarkFaces - darkBefore);
+    CHECK(gShadowedFaces - gDarkFaces - (shadowedBefore - darkBefore) > 50, "no partly lit faces in the tunnel");
+    CHECK(gDarkFaces - darkBefore > 10, "the tunnel's far end is not dark");
   }
 
-  // Ocean edits: placing into ocean, breaking it back (ocean flows in on the next flow step), the raycast passing
-  // through water, and a dry tunnel under the seabed flooding one block per step once a shaft connects it.
+  /**
+   * Ocean edits: placing into ocean, breaking it back (ocean flows in on the next flow step), the raycast passing
+   * through water, and a dry tunnel under the seabed flooding one block per step once a shaft connects it.
+   */
   {
     const std::array<int32_t, 2> coast = samples.back();
     const ChunkXZ center{coast[0], coast[1]};
     CpuWorld world(kIds, 4);
     std::map<std::tuple<int32_t, int32_t, int32_t>, ChunkMesh> meshes;
+    // Same as the edit test's pump, around the coast column.
     auto pump = [&] {
       for (int i = 0; i < 20000 && !(world.squareLoaded(center) && world.readyCenter() == center); ++i) {
         world.update(center, {});
@@ -442,13 +616,14 @@ int main() {
         for (ChunkMesh &m : e.chunks) meshes[{e.cx, m.cy, e.cz}] = std::move(m);
     };
     pump();
+    // Terrain height at a world block column.
     auto heightAt = [&](int32_t x, int32_t z) {
       const int32_t cx = floorDiv(x, 32), cz = floorDiv(z, 32);
       return world.column(cx, cz)->height(x - cx * 32, z - cz * 32);
     };
     // A seabed cell no lower than its 8 neighbors (so a shaft down from it is walled by terrain), with room for a
     // tunnel toward +x.
-    int32_t sx = 0, sz = 0, sh = 0;
+    int32_t sx = 0, sz = 0, sh = 0; // seabed cell x / z and its height
     bool found = false;
     for (int32_t z = center[1] * 32 - 24; z < center[1] * 32 + 56 && !found; ++z)
       for (int32_t x = center[0] * 32 - 24; x < center[0] * 32 + 48 && !found; ++x) {
@@ -465,6 +640,7 @@ int main() {
     CHECK(found, "no seabed cell for the ocean edit test");
     if (found) {
       double t = 1000.0;
+      // One fluid tick, one second later.
       auto step = [&] {
         t += 1.0;
         world.tickFluids(t);
@@ -532,7 +708,7 @@ int main() {
     }
   }
 
-  // Registry: opaque blocks numbered from 0, non-opaque ones from 512 (bit 9), each in file order.
+  /** Registry: opaque blocks numbered from 0, non-opaque ones from 512 (bit 9), each in file order. */
   {
     const char *path = "terrain_tests_blocks.txt";
     {
@@ -561,28 +737,32 @@ int main() {
     std::printf("registry: id ranges checked\n");
   }
 
-  // Trees (shaders/vegetation_shared.hlsl, shared with the GPU).
+  /** Trees (shaders/vegetation_shared.hlsl, shared with the GPU): bounds, far-LOD agreement, stamped voxels. */
   {
     using namespace vegetation;
-    // Every tree block lies inside its 8x8 cell and within TREE_MAX_ABOVE of the ground, for every hash outcome.
+    // Every tree block lies inside its region (chunk column) and within TREE_MAX_ABOVE of the ground, for every hash
+    // outcome.
     uint32_t state = 12345u;
     auto next = [&] { return state = state * 1664525u + 1013904223u; };
     uint64_t treeChecksum = 1469598103934665603ull;
     size_t accepted = 0;
     for (int i = 0; i < 20000; ++i) {
-      const int2 cell(int32_t(next() >> 8) - (1 << 23), int32_t(next() >> 8) - (1 << 23));
-      TreeInstance tree = treeCandidate(cell);
+      const int2 cell(int32_t(next() >> 12) - (1 << 19), int32_t(next() >> 12) - (1 << 19)); // region
+      TreeInstance tree = treeCandidate(cell, next() % uint32_t(TREE_SLOTS));
       accepted += tree.trunkHeight != 0;
       treeChecksum = (treeChecksum ^ uint32_t(tree.trunkX) ^ (uint64_t(uint32_t(tree.trunkHeight)) << 32)) * 1099511628211ull;
-      tree.trunkHeight = 4 + i % 3; // check the shape of rejected candidates too
+      // Check every style at its shortest and tallest, rejected candidates included.
+      const uint32_t style = uint32_t(i) % 4u;
+      tree.shape = (tree.shape & ~(3u << 12u)) | (style << 12u);
+      tree.trunkHeight = treeTrunkHeightFor(style, (i / 4) % 2 ? 255u : 0u);
       tree.ground = int32_t(next() % 200u) + 3;
-      const int32_t x0 = cell.x * 8, z0 = cell.y * 8;
-      for (int32_t z = z0 - 4; z < z0 + 12; ++z)
-        for (int32_t x = x0 - 4; x < x0 + 12; ++x)
+      const int32_t x0 = cell.x * 32, z0 = cell.y * 32;
+      for (int32_t z = z0 - 4; z < z0 + 36; ++z)
+        for (int32_t x = x0 - 4; x < x0 + 36; ++x)
           for (int32_t y = tree.ground - 2; y < tree.ground + TREE_MAX_ABOVE + 2; ++y) {
             if (treeBlockAt(tree, x, y, z) == TREE_NONE) continue;
-            CHECK(x >= x0 && x < x0 + 8 && z >= z0 && z < z0 + 8, "tree block %d %d outside cell %d %d", x, z, cell.x,
-                  cell.y);
+            CHECK(x >= x0 && x < x0 + 32 && z >= z0 && z < z0 + 32, "tree block %d %d outside region %d %d", x, z,
+                  cell.x, cell.y);
             CHECK(y >= tree.ground && y < tree.ground + TREE_MAX_ABOVE, "tree block y %d outside [%d, +%d)", y,
                   tree.ground, TREE_MAX_ABOVE);
           }
@@ -590,31 +770,104 @@ int main() {
     std::printf("trees: candidate checksum %016llx (%zu of 20000 pass the density)\n",
                 (unsigned long long)treeChecksum, accepted);
 
-    // LOD 1-2 table: every variant has a trunk capped by leaves (no log cell with open sky above it).
+    // Far LODs show the same trees: a scale-16 / scale-64 column (computeTreeColumn's LOD 4+ rule: candidates whose
+    // trunk is inside, density, slope and band from the column's centre) is filled where the exact trees have a trunk.
     {
-      const std::vector<uint32_t> lodTable = buildTreeLodTable();
-      for (const int scale : {2, 4}) {
-        const int perCell = 8 / scale;
-        for (uint32_t offset = 0; offset < 16u; ++offset) {
-          for (uint32_t heightIndex = 0; heightIndex < 3u; ++heightIndex) {
-            const int trunkX = (TREE_RADIUS + int(offset & 3u)) / scale, trunkZ = (TREE_RADIUS + int(offset >> 2u)) / scale;
-            int trunks = 0;
-            for (int cz = 0; cz < perCell; ++cz) {
-              for (int cx = 0; cx < perCell; ++cx) {
-                const uint32_t entry = lodTable[treeLodTableIndex(scale, offset, heightIndex, uint32_t(cx), uint32_t(cz))];
-                const uint32_t logs = (entry >> 4u) & 0xfu;
-                if (logs == 0u) continue;
-                ++trunks;
-                CHECK(cx == trunkX && cz == trunkZ, "LOD table: log outside the trunk column (scale %d)", scale);
-                CHECK(((entry >> logs) & 1u) != 0u, "LOD table: trunk not capped by leaves (scale %d, offset %u, h %u)",
-                      scale, offset, 4u + heightIndex);
-              }
+      constexpr int32_t kRegions = 32; // 1024 x 1024 blocks
+      constexpr int32_t kSize = kRegions * 32;
+      const int32_t baseX = -6016, baseZ = 1984; // region-aligned (multiples of 64)
+      std::vector<TreeInstance> exactTrees;
+      for (int32_t rz = 0; rz < kRegions; ++rz)
+        for (int32_t rx = 0; rx < kRegions; ++rx)
+          for (uint32_t slot = 0; slot < uint32_t(TREE_SLOTS); slot += 8) {
+            TreeInstance trees8[8];
+            int32_t tx[8], tz[8];
+            float th[8], gx[8], gz[8];
+            for (uint32_t l = 0; l < 8; ++l) {
+              trees8[l] = treeCandidate(int2(baseX / 32 + rx, baseZ / 32 + rz), slot + l);
+              tx[l] = trees8[l].trunkX;
+              tz[l] = trees8[l].trunkZ;
             }
-            CHECK(trunks == 1, "LOD table: %d trunk columns (scale %d)", trunks, scale);
+            terrain::sampleHeightsGrad8(tx, tz, th, gx, gz);
+            for (uint32_t l = 0; l < 8; ++l) {
+              trees8[l].ground = int32_t(std::floor(th[l]));
+              if (trees8[l].trunkHeight != 0 && treeGroundOk(trees8[l].ground, treeSteepness(gx[l], gz[l]), trees8[l].shape))
+                exactTrees.push_back(trees8[l]);
+            }
           }
+      std::vector<uint8_t> canopy(size_t(kSize) * kSize, 0);
+      for (const TreeInstance &t : exactTrees)
+        for (int32_t dz = -TREE_RADIUS; dz <= TREE_RADIUS; ++dz)
+          for (int32_t dx = -TREE_RADIUS; dx <= TREE_RADIUS; ++dx)
+            canopy[size_t(t.trunkZ - baseZ + dz) * kSize + size_t(t.trunkX - baseX + dx)] = 1;
+      double lod0 = 0;
+      for (const uint8_t c : canopy) lod0 += c;
+      lod0 /= double(canopy.size());
+      std::printf("trees: %zu exact trees, LOD 0 canopy cover %.4f", exactTrees.size(), lod0);
+      std::vector<uint8_t> filled8;
+      for (const int scale : {8, 16, 64}) {
+        const int32_t perSide = kSize / scale;
+        std::vector<uint8_t> exact(size_t(perSide) * perSide, 0), filled(size_t(perSide) * perSide, 0);
+        for (const TreeInstance &t : exactTrees)
+          if (treeShowsAtScale(t.trunkX, t.trunkZ, scale))
+            exact[size_t((t.trunkZ - baseZ) / scale) * perSide + size_t((t.trunkX - baseX) / scale)] = 1;
+        size_t both = 0, exactOnly = 0, farOnly = 0, count = 0;
+        for (int32_t cz = 0; cz < perSide; ++cz)
+          for (int32_t cx = 0; cx < perSide; ++cx) {
+            const int32_t columnX = baseX + cx * scale, columnZ = baseZ + cz * scale;
+            bool f = exact[size_t(cz) * perSide + size_t(cx)] != 0; // scale 8: the staged, exact trees
+            if (scale > 8) {
+              // computeTreeColumn's LOD 4+ rule: position, roll, density, then slope / band at the column's centre.
+              int32_t xs[8], zs[8];
+              float h[8], gx[8], gz[8];
+              for (int l = 0; l < 8; ++l) {
+                xs[l] = columnX + scale / 2;
+                zs[l] = columnZ + scale / 2;
+              }
+              terrain::sampleHeightsGrad8(xs, zs, h, gx, gz);
+              const int32_t ground = int32_t(std::floor(h[0]));
+              const int steepness = treeSteepness(gx[0], gz[0]);
+              f = false;
+              for (int32_t rz = columnZ >> 5; rz <= (columnZ + scale - 1) >> 5 && !f; ++rz)
+                for (int32_t rx = columnX >> 5; rx <= (columnX + scale - 1) >> 5 && !f; ++rx)
+                  for (uint32_t slot = 0; slot < uint32_t(TREE_SLOTS) && !f; ++slot) {
+                    const TreeInstance t = treeCandidateUnfiltered(int2(rx, rz), slot);
+                    if (t.trunkX < columnX || t.trunkX >= columnX + scale || t.trunkZ < columnZ ||
+                        t.trunkZ >= columnZ + scale || !treeShowsAtScale(t.trunkX, t.trunkZ, scale))
+                      continue;
+                    if (int(treeCandidateHash(int2(rx, rz), slot) >> 24u) >= treeChanceAt(t.trunkX, t.trunkZ)) continue;
+                    f = ground >= TREE_MIN_GROUND && ground <= TREE_MAX_GROUND &&
+                        treeSlopeOk(steepness, treeSlopeRoll(t.shape));
+                  }
+            }
+            filled[size_t(cz) * perSide + size_t(cx)] = f;
+            const bool e = exact[size_t(cz) * perSide + size_t(cx)] != 0;
+            both += e && f;
+            exactOnly += e && !f;
+            farOnly += !e && f;
+            count += f;
+          }
+        const double cover = double(count) / double(perSide * perSide);
+        std::printf(", scale %d cover %.4f (%zu on exact trunks, %zu not, %zu missed)", scale, cover, both, farOnly,
+                    exactOnly);
+        CHECK(std::abs(cover - lod0) < 0.3 * lod0, "scale %d cover %.4f vs LOD 0 %.4f", scale, cover, lod0);
+        CHECK(double(farOnly) <= 0.1 * double(std::max<size_t>(1, count)), "scale %d: cells off the real trunks", scale);
+        if (scale == 8) filled8 = filled;
+        if (scale == 16) {
+          // Nested: a filled scale-16 column (from an exact trunk) has a filled scale-8 child.
+          size_t orphans = 0;
+          for (int32_t cz = 0; cz < perSide; ++cz)
+            for (int32_t cx = 0; cx < perSide; ++cx) {
+              if (!filled[size_t(cz) * perSide + size_t(cx)] || !exact[size_t(cz) * perSide + size_t(cx)]) continue;
+              bool child = false;
+              for (int a = 0; a < 2; ++a)
+                for (int b = 0; b < 2; ++b) child = child || filled8[size_t(cz * 2 + a) * (kSize / 8) + size_t(cx * 2 + b)];
+              orphans += !child;
+            }
+          CHECK(orphans == 0, "%zu scale-16 cells without a scale-8 child", orphans);
         }
       }
-      std::printf("trees: LOD table checked\n");
+      std::printf("\n");
     }
 
     // Stamped voxels against the placement rule written plainly, on columns that have trees; then the mesher.
@@ -637,18 +890,37 @@ int main() {
       for (int32_t z = 0; z < 32; ++z)
         for (int32_t x = 0; x < 32; ++x) {
           const int32_t wx = cx * 32 + x, wz = cz * 32 + z;
-          TreeInstance tree = treeCandidate(int2(wx >> 3, wz >> 3));
-          if (tree.trunkHeight != 0) {
+          // Every slot's tree, by the rule written plainly.
+          TreeInstance slotTrees[TREE_SLOTS];
+          for (uint32_t slot = 0; slot < uint32_t(TREE_SLOTS); ++slot) {
+            TreeInstance &tree = slotTrees[slot];
+            tree = treeCandidate(int2(cx, cz), slot);
+            if (tree.trunkHeight == 0) continue;
             const int32_t lx = tree.trunkX - cx * 32, lz = tree.trunkZ - cz * 32;
             tree.ground = column->height(lx, lz);
-            if (!treeGroundOk(tree.ground, column->height(lx - 1, lz), column->height(lx + 1, lz),
-                              column->height(lx, lz - 1), column->height(lx, lz + 1))) {
+            int32_t tx[8], tz[8];
+            float th[8], gx[8], gz[8];
+            for (int l = 0; l < 8; ++l) {
+              tx[l] = tree.trunkX;
+              tz[l] = tree.trunkZ;
+            }
+            terrain::sampleHeightsGrad8(tx, tz, th, gx, gz);
+            if (!treeGroundOk(tree.ground, treeSteepness(gx[0], gz[0]), tree.shape)) {
               tree.trunkHeight = 0;
             }
           }
+          // Expected tree block at world y in this cell; overlapping trees: log wins over leaves.
+          auto blockAt = [&](int32_t wy) {
+            uint32_t block = TREE_NONE;
+            for (const TreeInstance &tree : slotTrees) {
+              const uint32_t b = treeBlockAt(tree, wx, wy, wz);
+              block = b == TREE_LOG || block == TREE_LOG ? TREE_LOG : (b != TREE_NONE ? b : block);
+            }
+            return block;
+          };
           for (int32_t wy = column->firstChunkY * 32; wy < (column->firstChunkY + int32_t(column->chunks.size())) * 32;
                ++wy) {
-            const uint32_t block = treeBlockAt(tree, wx, wy, wz);
+            const uint32_t block = blockAt(wy);
             const bool placed = block != TREE_NONE && wy >= column->height(x, z);
             const uint16_t expected =
                 placed ? (block == TREE_LOG ? treeIds.log : treeIds.leaves) : bare->blockId(x, wy, z);
@@ -659,7 +931,7 @@ int main() {
           // Nothing above the stored range: tree chunks must be stored.
           const int32_t top = (column->firstChunkY + int32_t(column->chunks.size())) * 32;
           for (int32_t wy = top; wy < top + TREE_MAX_ABOVE; ++wy) {
-            CHECK(tree.trunkHeight == 0 || treeBlockAt(tree, wx, wy, wz) == TREE_NONE, "tree above stored chunks");
+            CHECK(blockAt(wy) == TREE_NONE, "tree above stored chunks");
           }
         }
       for (const auto &chunk : column->chunks) {
@@ -690,7 +962,7 @@ int main() {
     std::printf("trees: %zu columns (%zu trees) checked, %zu chunks meshed\n", treeColumns, treesSeen, treeChunks);
   }
 
-  // Timings.
+  /** Timings: column generation and meshing. */
   const int columns = 64;
   double t0 = nowSeconds();
   std::vector<std::shared_ptr<Column>> generated;

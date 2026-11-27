@@ -15,5 +15,6 @@ static_assert(LOD_AO_LIGHTENING_PER_LEVEL >= 0.0f && LOD_AO_LIGHTENING_PER_LEVEL
 
 class Renderer {
 public:
+  /** Create the window and Vulkan state, then run the frame loop until the window closes. */
   void run();
 };

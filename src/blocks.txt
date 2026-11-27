@@ -12,11 +12,15 @@
 #                                  16 * N tall is a strip of N animation frames, top first
 #   fluid = ocean                  the ocean: fills empty cells below sea level, an infinite source that only
 #                                  placing a block removes; drawn translucent (needs opaque = false)
+#   hardness = <number>            Minecraft's destroy time (default 0: breaks instantly in survival)
+#   requires_tool = true           needs a tool to drop in Minecraft; breaking by hand is 3.3x slower
 #   random_rotation = <faces...>   rotate these faces' textures by a per-face hash to break up tiling
 #   lod_<faces> = <texture>        texture used instead on coarse LOD chunks
 #   lod_tint = <r> <g> <b>         color multiplier applied with the lod_ texture
+#   far_tint = <r> <g> <b>         color multiplier faded in with distance around LOD 3 (where a tree is one leaf block)
 
 [grass]
+hardness = 0.6
 side = grass_side.png
 top = grass_top.png
 bottom = dirt.png
@@ -26,19 +30,26 @@ lod_side = dirt.png
 lod_tint = 0.658 0.8305 0.64
 
 [dirt]
+hardness = 0.5
 all = dirt.png
 
 [stone]
+hardness = 1.5
+requires_tool = true
 all = stone.png
 
 [sand]
+hardness = 0.5
 all = sand.png
 
 [snow]
+hardness = 0.2
+requires_tool = true
 all = snow.png
 
 # The ocean: one of several liquids sharing fluid_still.png, told apart by tint (and their own IDs).
 [ocean]
+hardness = 100
 all = fluid_still.png
 opaque = false
 fluid = ocean
@@ -48,9 +59,12 @@ frame_time = 0.1
 
 # Trees (placement: shaders/vegetation_shared.hlsl). Placeholder textures; replace freely.
 [log]
+hardness = 2
 side = log_side.png
 top = log_top.png
 bottom = log_top.png
 
 [leaves]
+hardness = 0.2
 all = leaves.png
+far_tint = 1.7 1.7 1.7

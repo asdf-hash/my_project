@@ -53,22 +53,32 @@ constexpr uint32_t SEED_LAYER_STEP = 0x9e3779b9u;
 
 constexpr float TAU = 6.28318530718f;
 
+/** Broadcast a uint32 constant (bit pattern preserved) to all lanes. */
 I8 u32(uint32_t v) { return I8(static_cast<int32_t>(v)); }
 
+// 8 world-space (x, z) positions.
 struct V2 {
   F8 x, z;
 };
-// (value, d/dx, d/dz)
+// Noise sample with its gradient: (value, d/dx, d/dz).
 struct N3 {
   F8 v, dx, dz;
 };
 
+// Lane-wise sum and scalar scaling of value and gradient together.
 N3 operator+(const N3 &a, const N3 &b) { return {a.v + b.v, a.dx + b.dx, a.dz + b.dz}; }
 N3 operator*(F8 s, const N3 &a) { return {s * a.v, s * a.dx, s * a.dz}; }
 
-// HLSL lerp (SPIR-V FMix): x * (1 - s) + y * s.
+/** HLSL lerp (SPIR-V FMix), in its exact operation order: x * (1 - s) + y * s. */
 F8 lerp(F8 x, F8 y, F8 s) { return x * (F8(1.0f) - s) + y * s; }
 
+/**
+ * Integer hash of a lattice cell (terrain_noise.hlsl hashCell).
+ *
+ * @param cx Cell x coordinate, in lattice cells.
+ * @param cz Cell z coordinate, in lattice cells.
+ * @return 32 well-mixed bits per lane.
+ */
 I8 hashCell(I8 cx, I8 cz, uint32_t seed) {
   I8 h = (cx * u32(0x8da6b343u)) ^ (cz * u32(0xd8163841u)) ^ u32(seed);
   h = h ^ simd::srl<16>(h);
@@ -79,18 +89,25 @@ I8 hashCell(I8 cx, I8 cz, uint32_t seed) {
   return h;
 }
 
-// (h & 1) ? 1 : -1, by flipping the sign bit of -1.0f.
+/** Random +-1 per lattice cell: (h & 1) ? 1 : -1, by flipping the sign bit of -1.0f. */
 F8 latticeSign(I8 cx, I8 cz, uint32_t seed) {
   const I8 h = hashCell(cx, cz, seed);
   return simd::bitsToFloat(u32(0xbf800000u) ^ simd::sll<31>(h));
 }
 
+/**
+ * Value noise over random +-1 lattice corners, quintic-interpolated (terrain_noise.hlsl binaryNoise).
+ *
+ * @param p World positions, in blocks.
+ * @param wavelength Lattice spacing, in blocks.
+ * @return value in [-1, 1] with its analytic gradient, per block.
+ */
 N3 binaryNoise(const V2 &p, float wavelength, uint32_t seed) {
   const F8 wl(wavelength);
-  const F8 gx = p.x / wl, gz = p.z / wl;
+  const F8 gx = p.x / wl, gz = p.z / wl;      // lattice coords
   const F8 fx = simd::floor(gx), fz = simd::floor(gz);
-  const I8 cx = simd::toInt(fx), cz = simd::toInt(fz);
-  const F8 tx = gx - fx, tz = gz - fz;
+  const I8 cx = simd::toInt(fx), cz = simd::toInt(fz); // cell
+  const F8 tx = gx - fx, tz = gz - fz;        // position within the cell; ux/uz = quintic fade, dux/duz its slope
   const F8 ux = tx * tx * tx * (tx * (tx * 6.0f - 15.0f) + 10.0f);
   const F8 uz = tz * tz * tz * (tz * (tz * 6.0f - 15.0f) + 10.0f);
   const F8 dux = F8(30.0f) * tx * tx * (tx * (tx - 2.0f) + 1.0f);
@@ -104,7 +121,17 @@ N3 binaryNoise(const V2 &p, float wavelength, uint32_t seed) {
   return {a + (b - a) * ux + (c - a) * uz + k * ux * uz, dux * ((b - a) + k * uz) / wl, duz * ((c - a) + k * ux) / wl};
 }
 
-// lodScale is always 1 on the CPU: minWavelength = 2.
+/**
+ * Sum of binaryNoise layers, halving wavelength and scaling amplitude by 0.4 per layer (terrain_noise.hlsl
+ * layeredNoise). lodScale is always 1 on the CPU, so layers stop below wavelength 2.
+ *
+ * @param p World positions, in blocks.
+ * @param wavelength First layer's wavelength, in blocks.
+ * @param amplitude First layer's amplitude.
+ * @param layers Maximum layer count.
+ * @param firstLayer Receives the first layer's value alone.
+ * @return the summed value and gradient.
+ */
 N3 layeredNoise(const V2 &p, float wavelength, float amplitude, uint32_t layers, uint32_t seed, F8 &firstLayer) {
   N3 sum{0.0f, 0.0f, 0.0f};
   firstLayer = F8(0.0f);
@@ -123,7 +150,13 @@ N3 layeredNoise(const V2 &p, float wavelength, float amplitude, uint32_t layers,
   return sum;
 }
 
-// GRADIENTS[h & 7] from terrain_noise.hlsl, by bit selection instead of a table gather.
+/**
+ * Perlin corner gradient GRADIENTS[h & 7] from terrain_noise.hlsl, by bit selection instead of a table gather.
+ *
+ * @param h Cell hash.
+ * @param gx Receives the gradient's x component.
+ * @param gz Receives the gradient's z component.
+ */
 void gradient(I8 h, F8 &gx, F8 &gz) {
   const M8 bit0 = ((h & I8(1)) == I8(1));
   const M8 bit1 = ((h & I8(2)) == I8(2));
@@ -134,9 +167,16 @@ void gradient(I8 h, F8 &gx, F8 &gz) {
   gz = simd::select(bit2, simd::select(bit1, F8(-D), F8(D)), simd::select(bit1, sign1, F8(0.0f)));
 }
 
+/**
+ * Gradient (Perlin) noise with quintic fade (terrain_noise.hlsl perlinNoise), scaled by ~sqrt(2) to span ~[-1, 1].
+ *
+ * @param p World positions, in blocks.
+ * @param wavelength Lattice spacing, in blocks.
+ * @return value with its analytic gradient, per block.
+ */
 N3 perlinNoise(const V2 &p, float wavelength, uint32_t seed) {
   const F8 wl(wavelength);
-  const F8 gx = p.x / wl, gz = p.z / wl;
+  const F8 gx = p.x / wl, gz = p.z / wl; // lattice coords; fx/fz = position within the cell
   const F8 flx = simd::floor(gx), flz = simd::floor(gz);
   const I8 cx = simd::toInt(flx), cz = simd::toInt(flz);
   const F8 fx = gx - flx, fz = gz - flz;
@@ -145,7 +185,7 @@ N3 perlinNoise(const V2 &p, float wavelength, uint32_t seed) {
   const F8 dux = F8(30.0f) * fx * fx * (fx * (fx - 2.0f) + 1.0f);
   const F8 duz = F8(30.0f) * fz * fz * (fz * (fz - 2.0f) + 1.0f);
   const I8 one(1);
-  F8 g00x, g00z, g10x, g10z, g01x, g01z, g11x, g11z;
+  F8 g00x, g00z, g10x, g10z, g01x, g01z, g11x, g11z; // corner gradients; gIJ = corner (cx + I, cz + J)
   gradient(hashCell(cx, cz, seed), g00x, g00z);
   gradient(hashCell(cx + one, cz, seed), g10x, g10z);
   gradient(hashCell(cx, cz + one, seed), g01x, g01z);
@@ -166,6 +206,13 @@ N3 perlinNoise(const V2 &p, float wavelength, uint32_t seed) {
   return {value * s, gradX / wl * s, gradZ / wl * s};
 }
 
+/**
+ * Fractal sum of perlinNoise octaves (wavelength and amplitude halve per octave), normalized by total amplitude.
+ *
+ * @param p World positions, in blocks.
+ * @param wavelength First octave's wavelength, in blocks.
+ * @return value in ~[-1, 1] with its gradient.
+ */
 N3 perlinFbm(const V2 &p, float wavelength, uint32_t octaves, uint32_t seed) {
   N3 sum{0.0f, 0.0f, 0.0f};
   float amplitude = 1.0f;
@@ -183,12 +230,20 @@ N3 perlinFbm(const V2 &p, float wavelength, uint32_t octaves, uint32_t seed) {
   return {sum.v / t, sum.dx / t, sum.dz / t};
 }
 
-// sinCosPoly / expPoly / tanhPoly in terrain_noise.hlsl.
+// Constants of sinCosPoly / expPoly / tanhPoly in terrain_noise.hlsl (Cody-Waite split of pi/2).
 constexpr float PIO2_1 = 1.5703125f;
 constexpr float PIO2_2 = 4.837512969970703125e-4f;
 constexpr float PIO2_3 = 7.54978995489188216e-8f;
 constexpr float TWO_OVER_PI = 0.636619772367581343f;
 
+/**
+ * Polynomial sine and cosine (terrain_noise.hlsl sinCosPoly): reduce by pi/2, evaluate on the remainder, then fix
+ * up by quadrant. Used instead of std::sin so CPU and GPU round alike.
+ *
+ * @param x Angle, in radians.
+ * @param s Receives sin(x).
+ * @param c Receives cos(x).
+ */
 void sinCosPoly(F8 x, F8 &s, F8 &c) {
   const F8 q = simd::floor(x * TWO_OVER_PI + 0.5f);
   const F8 r = ((x - q * PIO2_1) - q * PIO2_2) - q * PIO2_3;
@@ -206,6 +261,12 @@ void sinCosPoly(F8 x, F8 &s, F8 &c) {
   s = simd::select(negS, -s, s);
 }
 
+/**
+ * Polynomial e^x (terrain_noise.hlsl expPoly): 2^n * p(r), building 2^n directly in the exponent bits.
+ *
+ * @param x Exponent; clamped to [-87, 87].
+ * @return e^x.
+ */
 F8 expPoly(F8 x) {
   x = simd::clamp(x, -87.0f, 87.0f);
   const F8 n = simd::floor(x * 1.44269504088896341f + 0.5f);
@@ -221,6 +282,11 @@ F8 expPoly(F8 x) {
   return p * simd::bitsToFloat(simd::sll<23>(simd::toInt(n) + I8(127)));
 }
 
+/**
+ * Polynomial tanh (terrain_noise.hlsl tanhPoly): odd polynomial for |x| < 0.625, else 1 - 2 / (e^2|x| + 1).
+ *
+ * @return tanh(x).
+ */
 F8 tanhPoly(F8 x) {
   const F8 a = simd::abs(x);
   const F8 z = x * x;
@@ -234,15 +300,27 @@ F8 tanhPoly(F8 x) {
   return simd::select(a < F8(0.625f), small, large);
 }
 
+/** Length of the 2D vector (x, z). */
 F8 length2(F8 x, F8 z) { return simd::sqrt(x * x + z * z); }
 
+/**
+ * Erosion gullies (terrain_noise.hlsl erode): per octave, sine waves running across the current slope, blended
+ * between 4 randomly phased cell corners; each octave's wave also bends the slope the next octave follows.
+ *
+ * @param p World positions, in blocks.
+ * @param y Height before erosion, in blocks.
+ * @param gradX Slope d y / dx.
+ * @param gradZ Slope d y / dz.
+ * @param amplitude Per-lane erosion strength, in blocks.
+ * @return the eroded height.
+ */
 F8 erode(const V2 &p, F8 y, F8 gradX, F8 gradZ, F8 amplitude) {
   F8 mask = F8(1.0f) - F8(1.0f) / ((gradX * gradX + gradZ * gradZ) * 2.0f + 1.0f);
-  M8 alive = F8(0.0f) == F8(0.0f); // all lanes
+  M8 alive = F8(0.0f) == F8(0.0f); // all lanes true; per-lane stand-in for the shader's loop break
   uint32_t octave = 0;
   for (float wavelength = EROSION_MAX_WAVELENGTH; wavelength >= EROSION_MIN_WAVELENGTH; wavelength *= 0.5f, ++octave) {
     const F8 gradLength = length2(gradX, gradZ);
-    alive = alive & !(gradLength == F8(0.0f)); // the shader breaks out of the loop
+    alive = alive & !(gradLength == F8(0.0f));
     if (!simd::any(alive)) {
       break;
     }
@@ -251,16 +329,16 @@ F8 erode(const V2 &p, F8 y, F8 gradX, F8 gradZ, F8 amplitude) {
     const F8 acrossZ = gradX / safeLength;
     const F8 wl(wavelength);
     const F8 coordX = p.x / wl, coordZ = p.z / wl;
-    const F8 flX = simd::floor(coordX), flZ = simd::floor(coordZ);
+    const F8 flX = simd::floor(coordX), flZ = simd::floor(coordZ); // fl = floor
     const I8 cellX = simd::toInt(flX), cellZ = simd::toInt(flZ);
-    F8 sx = coordX - flX, sz = coordZ - flZ;
+    F8 sx = coordX - flX, sz = coordZ - flZ; // smoothstep blend weights within the cell
     sx = sx * sx * (F8(3.0f) - F8(2.0f) * sx);
     sz = sz * sz * (F8(3.0f) - F8(2.0f) * sz);
     const uint32_t seed = SEED_EROSION + octave * SEED_EROSION_STEP;
 
     F8 sines[4], cosines[4];
     for (int corner = 0; corner < 4; ++corner) {
-      const int ox = corner & 1, oz = corner >> 1;
+      const int ox = corner & 1, oz = corner >> 1; // corner offset within the cell
       const I8 h = hashCell(cellX + I8(ox), cellZ + I8(oz), seed);
       const F8 phase = simd::toFloatUnsigned(simd::srl<8>(h)) * (TAU / 16777216.0f);
       const F8 dx = coordX - (flX + static_cast<float>(ox));
@@ -278,15 +356,28 @@ F8 erode(const V2 &p, F8 y, F8 gradX, F8 gradZ, F8 amplitude) {
   return y;
 }
 
+// Smoothstep value and its derivative.
 struct SD {
   F8 v, d;
 };
+
+/**
+ * HLSL smoothstep with its derivative with respect to `x`.
+ *
+ * @return {smoothstep(edge0, edge1, x), d/dx}; edge0 > edge1 gives a falling ramp.
+ */
 SD smoothstepD(float edge0, float edge1, F8 x) {
   const F8 t = simd::saturate((x - edge0) / F8(edge1 - edge0));
   return {t * t * (F8(3.0f) - F8(2.0f) * t), F8(6.0f) * t * (F8(1.0f) - t) / F8(edge1 - edge0)};
 }
 
-// (height, d height / d e, steering slope)
+/**
+ * Map continent elevation to base terrain height (terrain_noise.hlsl baseProfile): tanh plains on land, a
+ * shelf / slope / abyss profile under the sea.
+ *
+ * @param e Biased elevation; >= 0 is land.
+ * @return {height, d height / d e, steering slope}; under the sea the steering slope is the shelf term only.
+ */
 N3 baseProfile(F8 e) {
   constexpr float COAST_SLOPE = PLAINS_HEIGHT / PLAINS_SCALE;
   const F8 tl = tanhPoly(e / F8(PLAINS_SCALE));
@@ -311,8 +402,16 @@ N3 baseProfile(F8 e) {
           simd::select(isLand, land.dz, dShelf)};
 }
 
+/** HLSL sign: -1, 0 or 1 per lane. */
 F8 signOf(F8 x) { return simd::select(x > F8(0.0f), F8(1.0f), simd::select(x < F8(0.0f), F8(-1.0f), F8(0.0f))); }
 
+/**
+ * Mountain range height (terrain_noise.hlsl mountainRanges): ridged belts along zero crossings of a range noise,
+ * gated by a regional mask and modulated by peak noise. Returns early when every lane is outside a range.
+ *
+ * @param p World positions, in blocks.
+ * @return height with its gradient (0 outside ranges).
+ */
 N3 mountainRanges(const V2 &p) {
   const N3 zero{0.0f, 0.0f, 0.0f};
   const N3 regionNoise = perlinFbm(p, REGION_WAVELENGTH, 2u, SEED_RANGE_REGIONS);
@@ -350,7 +449,16 @@ N3 mountainRanges(const V2 &p) {
           simd::select(active, gz, F8(0.0f))};
 }
 
-F8 sampleTerrainHeight(const V2 &p) {
+/**
+ * Terrain surface height (terrain_noise.hlsl sampleTerrainHeight): base profile + hills + mountains, eroded,
+ * floored on land, clamped to the terrain range.
+ *
+ * @param p World positions, in blocks.
+ * @param outGradX If non-null, receives the pre-erosion d height / dx.
+ * @param outGradZ Receives d height / dz; must be non-null when outGradX is.
+ * @return height, in blocks.
+ */
+F8 sampleTerrainHeight(const V2 &p, F8 *outGradX = nullptr, F8 *outGradZ = nullptr) {
   F8 continentLayer;
   const N3 elevation = layeredNoise(p, 4096.0f, 153.6f, 5u, SEED_ELEVATION, continentLayer);
   const N3 base = baseProfile(elevation.v + F8(ELEVATION_BIAS));
@@ -366,9 +474,13 @@ F8 sampleTerrainHeight(const V2 &p) {
   const F8 gradZ = base.dz * elevation.dz + mountains.dz +
                    F8(HILL_HEIGHT) * (shore.v * hillNoise.dz + hillNoise.v * shore.d * base.dz * elevation.dz);
 
+  if (outGradX != nullptr) {
+    *outGradX = gradX;
+    *outGradZ = gradZ;
+  }
+
   const F8 erosionAmplitude = F8(EROSION_AMPLITUDE) * simd::saturate(mountains.v / F8(MOUNTAIN_HEIGHT) * 3.0f);
-  // Erosion adds wave * mask * amplitude: with zero amplitude in every lane it can't change the height, so skip it
-  // (most land has no mountains).
+  // Zero amplitude in every lane can't change the height, so skip erosion (most land has no mountains).
   const F8 eroded = simd::any(erosionAmplitude > F8(0.0f)) ? erode(p, height, gradX, gradZ, erosionAmplitude) : height;
 
   // Land floor (terrain_noise.hlsl): polynomial smooth max with LAND_FLOOR, faded in from the coast inland.
@@ -380,6 +492,7 @@ F8 sampleTerrainHeight(const V2 &p) {
   return simd::clamp(surface, TERRAIN_MIN_HEIGHT, TERRAIN_MAX_HEIGHT);
 }
 
+/** Load 8 world block columns as float positions. */
 V2 positions(const int32_t *worldX, const int32_t *worldZ) {
   return {simd::toFloat(I8::load(worldX)), simd::toFloat(I8::load(worldZ))};
 }
@@ -388,6 +501,15 @@ V2 positions(const int32_t *worldX, const int32_t *worldZ) {
 
 void sampleHeights8(const int32_t *worldX, const int32_t *worldZ, float *out) {
   sampleTerrainHeight(positions(worldX, worldZ)).store(out);
+}
+
+void sampleHeightsGrad8(const int32_t *worldX, const int32_t *worldZ, float *outHeight, float *outGradX,
+                        float *outGradZ) {
+  F8 gradX;
+  F8 gradZ;
+  sampleTerrainHeight(positions(worldX, worldZ), &gradX, &gradZ).store(outHeight);
+  gradX.store(outGradX);
+  gradZ.store(outGradZ);
 }
 
 void sampleDither8(const int32_t *worldX, const int32_t *worldZ, float *out) {
@@ -403,24 +525,13 @@ void sampleContinent8(const int32_t *worldX, const int32_t *worldZ, float *out) 
 }
 
 float sampleHeight(int32_t worldX, int32_t worldZ) {
-  int32_t xs[8], zs[8];
+  int32_t xs[8], zs[8]; // worldX / worldZ broadcast to every lane
   float out[8];
   for (int i = 0; i < 8; ++i) {
     xs[i] = worldX;
     zs[i] = worldZ;
   }
   sampleHeights8(xs, zs, out);
-  return out[0];
-}
-
-float sampleDither(int32_t worldX, int32_t worldZ) {
-  int32_t xs[8], zs[8];
-  float out[8];
-  for (int i = 0; i < 8; ++i) {
-    xs[i] = worldX;
-    zs[i] = worldZ;
-  }
-  sampleDither8(xs, zs, out);
   return out[0];
 }
 

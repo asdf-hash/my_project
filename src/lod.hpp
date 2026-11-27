@@ -13,6 +13,16 @@ struct TargetResolution {
   std::uint32_t height;
 };
 
+/**
+ * Squared camera distance at which each LOD begins, chosen so one voxel of that LOD covers `screenPercentage` of the
+ * screen height.
+ *
+ * @param screenPercentage Target voxel size as a fraction of the screen height, in (0, 1).
+ * @param verticalFovRadians Vertical field of view, in radians.
+ * @param resolution Render target size, in pixels.
+ * @return squared start distance per LOD, in blocks squared.
+ * @throws std::invalid_argument if any parameter is out of range.
+ */
 inline std::array<float, MAX_LOD> initializeLodDistanceSquared(float screenPercentage, float verticalFovRadians,
                                                                TargetResolution resolution) {
   if (!std::isfinite(screenPercentage) || screenPercentage <= 0.0f || screenPercentage >= 1.0f ||
@@ -32,6 +42,12 @@ inline std::array<float, MAX_LOD> initializeLodDistanceSquared(float screenPerce
   return distances;
 }
 
+/**
+ * Pick the LOD for a squared distance.
+ *
+ * @param lodDistanceSquared Thresholds from initializeLodDistanceSquared.
+ * @return coarsest LOD whose start distance is at most `distanceSquared`.
+ */
 inline std::uint32_t selectLodSquared(float distanceSquared,
                                       const std::array<float, MAX_LOD> &lodDistanceSquared) noexcept {
   std::uint32_t lod = 0;
@@ -44,6 +60,16 @@ inline std::uint32_t selectLodSquared(float distanceSquared,
   return lod;
 }
 
+/**
+ * Upper bound on the tiles a clipmap can hold: per LOD, the cells across the ring out to that LOD's transition
+ * radius (plus one partial and two margin cells per axis), plus 100 slack.
+ *
+ * @param screenPercentage Target voxel size as a fraction of the screen height.
+ * @param minTanHalfFov tan(fov / 2) of the narrowest supported FOV (largest capacity).
+ * @param chunkSize Chunk edge, in blocks.
+ * @param renderDistance Outer clipmap radius, in coarsest-LOD tiles.
+ * @return tile capacity.
+ */
 inline constexpr std::uint32_t calculateClipmapCapacity(float screenPercentage, double minTanHalfFov,
                                                         std::uint32_t chunkSize, std::uint32_t renderDistance) {
   constexpr double distanceEpsilon = 1.0e-6;

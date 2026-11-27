@@ -14,9 +14,25 @@ struct GeometryPushConstants {
   uint quadBase;  // vertex path: first quad of this draw
   uint quadCount; // vertex path: quads in this draw (0: up to QuadCount[0])
   uint pass;      // GEOMETRY_PASS_*
+  uint clusterBase; // mesh path: first cluster of this draw (CPU frustum culling draws runs of visible chunk slots)
 };
-static const uint GEOMETRY_PASS_OPAQUE = 0u;
+static const uint GEOMETRY_PASS_OPAQUE = 0u;      // opaque blocks only: no discard, so early depth testing holds
 static const uint GEOMETRY_PASS_TRANSLUCENT = 1u; // blended water: no back-face culling
+static const uint GEOMETRY_PASS_CUTOUT = 2u;      // non-opaque blocks (leaves, glass): alpha-tested with discard
+
+// Bit 9 of a block ID marks a non-opaque block (blocks::kNonOpaqueBit): its texture alpha is cut out.
+static const uint NON_OPAQUE_BIT = 0x200u;
+/**
+ * Whether a quad belongs to the current draw's pass. Opaque and cutout passes walk the same clusters and split
+ * their quads by the block's non-opaque bit; the translucent pass keeps everything.
+ *
+ * @param material Packed DecodedQuad::material (block ID in the low bits).
+ * @return true if the quad is drawn in drawParams.pass.
+ */
+bool quadInPass(uint material) {
+  return drawParams.pass == GEOMETRY_PASS_TRANSLUCENT ||
+         ((material & NON_OPAQUE_BIT) != 0u) == (drawParams.pass == GEOMETRY_PASS_CUTOUT);
+}
 [[vk::push_constant]]
 ConstantBuffer<GeometryPushConstants> drawParams;
 
@@ -29,8 +45,9 @@ struct QuadCluster {
   uint counts23; // +X | -Z << 16
   uint counts45; // +Z | -Y << 16
   float4 boundsMin;
-  float4 boundsMax;
+  float4 boundsMax; // w: CLUSTER_HAS_CUTOUT when it may hold non-opaque quads (else 0)
 };
+static const float CLUSTER_HAS_CUTOUT = 1.0f;
 [[vk::binding(6, 0)]]
 StructuredBuffer<QuadCluster> Clusters;
 

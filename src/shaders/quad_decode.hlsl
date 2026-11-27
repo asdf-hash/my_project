@@ -17,8 +17,16 @@ struct DecodedQuad {
   bool frontFacing;
 };
 
+/**
+ * Unpack one quad into world-space face geometry, lighting and material bits.
+ *
+ * @param packed QuadBuffer entry: x = position/normal/AO/length, y = block/light/width metadata.
+ * @param chunkOffsetPacked ChunkOffsets entry: signed 24/24/13-bit chunk origin x/z/y with a 3-bit LOD on top, packed
+ *        by cpuworld::packChunkOffset (CPU chunks) and writeQuad in chunk_compute.slang (GPU chunks).
+ * @param cameraPosition World-space eye, for the front-facing test.
+ * @return the decoded quad.
+ */
 DecodedQuad decodePackedQuad(uint2 packed, uint64_t chunkOffsetPacked, float3 cameraPosition) {
-  // Chunk origin fields are signed 24/24/15-bit values packed by World::packChunkOffset.
   const int32_t chunkOffsetX = int32_t(int32_t(chunkOffsetPacked & 0xFFFFFFul) << 8) >> 8;
   const int32_t chunkOffsetZ = int32_t(int32_t((chunkOffsetPacked >> 24u) & 0xFFFFFFul) << 8) >> 8;
   const int32_t chunkY = int32_t(int32_t((chunkOffsetPacked >> 48u) & 0x1FFFul) << 19) >> 19;
@@ -27,12 +35,11 @@ DecodedQuad decodePackedQuad(uint2 packed, uint64_t chunkOffsetPacked, float3 ca
   const float chunkOffsetY = float(chunkY * 32) * voxelScale;
   const uint3 subchunkPos = uint3(packed.x & 0x1fu, (packed.x >> 5u) & 0x1fu, (packed.x >> 10u) & 0x1fu);
   const uint normalIndex = (packed.x >> 15u) & 0x7u;
-  const uint aoBits = (packed.x >> 18u) & 0xffu;
+  const uint aoBits = (packed.x >> 18u) & 0xffu; // ambient occlusion, 2 bits per corner
   const uint metadata = packed.y;
   const uint blockType = metadata & 0x3ffu;
   // Metadata bits 26-28: merged width - 1, across the greedy length (see writeQuad in chunk_compute.slang).
   const uint greedyWidth = ((metadata >> 26u) & 0x7u) + 1u;
-  const uint coloredLight = (metadata >> 14u) & 0xfffu;
   const uint encodedLength = (packed.x >> 26u) & 0x1fu;
   const uint greedyLength = encodedLength + 1u;
   const uint faceAxis = normalIndex >> 1u;
@@ -61,7 +68,7 @@ DecodedQuad decodePackedQuad(uint2 packed, uint64_t chunkOffsetPacked, float3 ca
                                  : float2(float(greedyWidth), float(greedyLength));
   quad.voxelScale = voxelScale;
   quad.normalIndex = normalIndex;
-  quad.lighting = aoBits | (((metadata >> 10u) & 0xfu) << 8u) | (coloredLight << 12u);
+  quad.lighting = aoBits | (((metadata >> 10u) & 0xffffu) << 8u); // corner skylight, 4 bits per corner
   // Chunk origins are multiples of 32 cells, so the shifts are exact (and floor for negative coordinates).
   quad.baseCell = int3(subchunkPos) + int3(chunkOffsetX >> int(lod), chunkY * 32, chunkOffsetZ >> int(lod));
   // Bits 15-19 hold length - 1: a full-chunk run (32) would spill into the LOD bits.
@@ -70,17 +77,23 @@ DecodedQuad decodePackedQuad(uint2 packed, uint64_t chunkOffsetPacked, float3 ca
   return quad;
 }
 
-// Corner order: 0 = (0,0), 1 = (1,0), 2 = (1,1), 3 = (0,1) in (greedy, faceV) quad space.
+/**
+ * Corner position in (greedy, faceV) quad space, in cells.
+ *
+ * @param corner 0 = (0,0), 1 = (1,0), 2 = (1,1), 3 = (0,1).
+ * @return the corner scaled by the quad's size.
+ */
 float2 quadCornerCoord(DecodedQuad quad, uint corner) {
   return float2((corner == 1u || corner == 2u) ? 1.0f : 0.0f, corner >= 2u ? 1.0f : 0.0f) * quad.quadSize;
 }
 
+/** World-space position of a quad corner (same corner order as quadCornerCoord). */
 float3 quadCornerWorld(DecodedQuad quad, uint corner) {
   const float2 scaled = quadCornerCoord(quad, corner) * quad.voxelScale;
   return quad.faceOrigin + quad.greedyAxis * scaled.x + quad.faceV * scaled.y;
 }
 
-// Faces 0 and 5 have the opposite winding for the same corner order.
+/** Whether a face direction needs the opposite winding for the shared corner order (faces 0 and 5). */
 bool flippedWinding(uint normalIndex) {
   return normalIndex == 0u || normalIndex == 5u;
 }

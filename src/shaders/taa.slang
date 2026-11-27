@@ -1,6 +1,5 @@
 struct TaaInput {
-  float4 pos : SV_Position;
-  float2 uv : TEXCOORD0;
+  float4 pos : SV_Position; // the fragment stage derives its uv from this
 };
 
 struct TaaOutput {
@@ -17,34 +16,43 @@ Texture2D<float4> MotionVectors;
 [[vk::binding(3, 0)]]
 SamplerState taaSampler;
 
+// Matches TaaParams in renderer.cpp.
 struct TaaParams {
   float2 inverseRenderSize;
-  uint historyValid;
+  uint historyValid; // bit 0: history usable; bit 1: TAA enabled (TAA_ENABLED)
   float depthRejectionThreshold;
 };
 
 [[vk::push_constant]]
 ConstantBuffer<TaaParams> taaParams;
 
+/** Linear RGB to YCoCg (x = luma Y, y = Co, z = Cg). */
 float3 toYCoCg(float3 color) {
   return float3(dot(color, float3(0.25f, 0.5f, 0.25f)), color.r - color.b,
                 color.g - (color.r + color.b) * 0.5f);
 }
 
+/** Inverse of toYCoCg. */
 float3 fromYCoCg(float3 color) {
   const float temp = color.x - color.z * 0.5f;
   return float3(temp + color.y * 0.5f, color.x + color.z * 0.5f, temp - color.y * 0.5f);
 }
 
+/** Fullscreen triangle from three vertex IDs, no vertex buffer. */
 [shader("vertex")]
 void taaVertexMain(uint vertexId : SV_VertexID, out TaaInput output) {
   const float2 uv = vertexId == 0u ? float2(0.0f, 0.0f)
                      : vertexId == 1u ? float2(2.0f, 0.0f)
                                       : float2(0.0f, 2.0f);
   output.pos = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 0.0f, 1.0f);
-  output.uv = uv;
 }
 
+/**
+ * Resolves TAA: sharpens the current frame's luma, then blends in reprojected history clamped to the 3x3 YCoCg
+ * neighborhood. History whose stored depth differs from motion.z by more than depthRejectionThreshold is rejected.
+ *
+ * @return color: the displayed frame; history: the same color with this pixel's depth (motion.w) in alpha.
+ */
 [shader("fragment")]
 TaaOutput taaFragmentMain(TaaInput input) {
   const float2 uv = input.pos.xy * taaParams.inverseRenderSize;

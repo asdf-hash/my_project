@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
+#include <random>
 
 namespace {
 
@@ -44,13 +46,121 @@ constexpr double kSwimmingHeight = 0.6;
 constexpr float kSwimmingEye = 0.4f;
 constexpr double kDoubleTapSeconds = 0.35; // 7 ticks
 constexpr int kMaxTicksPerFrame = 10;      // after a stall, drop time instead of spiraling
+// Fall damage follows the real-world injury of the same drop height (1 block = 1 m), not Minecraft's ~32 m/s^2
+// gravity: superlinear in height, +-20% per landing. Water only cushions dives under ~12 m.
+constexpr double kSafeFallHeight = 2.5;
+constexpr double kFatalFallHeight = 15.0;
+constexpr double kSafeWaterFallHeight = 12.0;
+constexpr double kFatalWaterFallHeight = 50.0;
+constexpr double kFallDamageExponent = 1.5;
+constexpr double kFallDamageVariation = 0.2;
+constexpr int kHurtFlashTicks = 10;
+constexpr double kStepHeight = 1.0;      // walking up ledges this tall without jumping (vanilla: 0.6)
+constexpr float kStepSmoothing = 12.0f;  // camera catch-up rate after a step (1/s)
+constexpr int kRegenIntervalTicks = 80;   // one health point per 4 seconds
 
 } // namespace
 
 void Player::spawn(const glm::dvec3 &feet) {
+  stepLift = 0.0f;
+  spawnPoint = feet;
   position = previousPosition = feet;
   motion = glm::dvec3(0.0);
+  fallDistance = 0.0;
   frozen = true;
+}
+
+void Player::setGameMode(GameMode mode) {
+  if (mode == currentGameMode) {
+    return;
+  }
+  lastGameMode = currentGameMode;
+  currentGameMode = mode;
+  fallDistance = 0.0;
+  if (mode == GameMode::Spectator) {
+    currentMode = Mode::Spectator;
+    motion = glm::dvec3(0.0);
+    previousPosition = position;
+    sprinting = sneaking = swimmingPose = false;
+  } else if (mode == GameMode::Creative) {
+    if (currentMode == Mode::Spectator) {
+      currentMode = Mode::Flying;
+    }
+  } else {
+    currentMode = Mode::Walking;
+  }
+}
+
+void Player::scrollSpectatorSpeed(int steps) {
+  const int count = static_cast<int>(spectatorSpeeds.size());
+  const int index = std::clamp(static_cast<int>(spectatorSpeedIndex) + steps, 0, count - 1);
+  spectatorSpeedIndex = static_cast<std::size_t>(index);
+}
+
+void Player::damage(float amount) {
+  if (amount <= 0.0f || !survivalLike()) {
+    return;
+  }
+  hp = std::max(hp - amount, 0.0f);
+  hurtTicks = kHurtFlashTicks;
+  regenTicks = 0;
+  if (hp <= 0.0f) {
+    respawn();
+  }
+}
+
+void Player::respawn() {
+  stepLift = 0.0f;
+  std::clog << "You died\n";
+  currentMode = Mode::Walking; // only survival and adventure die
+  position = previousPosition = spawnPoint;
+  motion = glm::dvec3(0.0);
+  fallDistance = 0.0;
+  hp = kMaxHealth;
+  sprinting = sneaking = swimmingPose = false;
+  frozen = true; // wait for the spawn column, like spawn()
+}
+
+namespace {
+
+/**
+ * Health points lost from a fall.
+ *
+ * @param height Fall distance, in blocks.
+ * @param safeHeight Largest harmless fall (ground or water constant).
+ * @param fatalHeight Fall that costs about kMaxHealth (ground or water constant).
+ * @return whole health points, randomized by +-kFallDamageVariation.
+ */
+float fallDamage(double height, double safeHeight, double fatalHeight) {
+  if (height <= safeHeight) {
+    return 0.0f;
+  }
+  static std::mt19937 rng{std::random_device{}()};
+  std::uniform_real_distribution<double> variation(1.0 - kFallDamageVariation, 1.0 + kFallDamageVariation);
+  const double severity = (height - safeHeight) / (fatalHeight - safeHeight);
+  const double points = Player::kMaxHealth * std::pow(severity, kFallDamageExponent) * variation(rng);
+  return static_cast<float>(std::round(points)); // whole points; a tiny jolt rounds to nothing
+}
+
+} // namespace
+
+void Player::updateFall(double deltaY) {
+  if (currentMode != Mode::Walking) {
+    fallDistance = 0.0;
+    return;
+  }
+  if (inWater) {
+    // Only the tick you hit the water carries a fall; it resets every tick after.
+    damage(fallDamage(fallDistance, kSafeWaterFallHeight, kFatalWaterFallHeight));
+    fallDistance = 0.0;
+    return;
+  }
+  if (onGround) {
+    damage(fallDamage(fallDistance, kSafeFallHeight, kFatalFallHeight));
+    fallDistance = 0.0;
+  } else if (deltaY < 0.0) {
+    fallDistance -= deltaY;
+  }
 }
 
 void Player::handleKey(int key, int action) {
@@ -58,15 +168,10 @@ void Player::handleKey(int key, int action) {
     return;
   }
   const double now = glfwGetTime();
-  if (key == GLFW_KEY_Z) {
-    currentMode = currentMode == Mode::Spectator ? Mode::Flying : Mode::Spectator;
-    motion = glm::dvec3(0.0);
-    previousPosition = position;
-  }
   if (key == GLFW_KEY_E && currentMode == Mode::Spectator) {
     spectatorSpeedIndex = (spectatorSpeedIndex + 1) % spectatorSpeeds.size();
   }
-  if (key == GLFW_KEY_SPACE && currentMode != Mode::Spectator) {
+  if (key == GLFW_KEY_SPACE && currentGameMode == GameMode::Creative) {
     if (now - lastJumpPress < kDoubleTapSeconds) {
       currentMode = currentMode == Mode::Flying ? Mode::Walking : Mode::Flying;
       motion.y = 0.0;
@@ -91,12 +196,12 @@ double Player::boxHeight() const {
 glm::vec3 Player::eyePosition() const {
   const double alpha = std::clamp(tickAccumulator / kTickSeconds, 0.0, 1.0);
   const glm::dvec3 feet = currentMode == Mode::Spectator ? position : glm::mix(previousPosition, position, alpha);
-  return glm::vec3(feet) + glm::vec3(0.0f, eyeHeight, 0.0f);
+  return glm::vec3(feet) + glm::vec3(0.0f, eyeHeight - stepLift, 0.0f);
 }
 
 void Player::update(GLFWwindow *window, float deltaTime, const Camera &camera, const cpuworld::CpuWorld &world) {
   const bool captured = camera.cursorCaptured();
-  auto down = [&](int key) { return captured && glfwGetKey(window, key) == GLFW_PRESS; };
+  auto isKeyDown = [&](int key) { return captured && glfwGetKey(window, key) == GLFW_PRESS; };
 
   if (currentMode == Mode::Spectator) {
     // The old free-fly camera: no collision, no ticks.
@@ -104,14 +209,15 @@ void Player::update(GLFWwindow *window, float deltaTime, const Camera &camera, c
     const glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0.0f, 1.0f, 0.0f)));
     const double step = spectatorSpeeds[spectatorSpeedIndex] * static_cast<double>(deltaTime);
     glm::dvec3 delta(0.0);
-    if (down(GLFW_KEY_W)) delta += glm::dvec3(front);
-    if (down(GLFW_KEY_S)) delta -= glm::dvec3(front);
-    if (down(GLFW_KEY_D)) delta += glm::dvec3(right);
-    if (down(GLFW_KEY_A)) delta -= glm::dvec3(right);
-    if (down(GLFW_KEY_SPACE)) delta.y += 1.0;
-    if (down(GLFW_KEY_LEFT_SHIFT)) delta.y -= 1.0;
+    if (isKeyDown(GLFW_KEY_W)) delta += glm::dvec3(front);
+    if (isKeyDown(GLFW_KEY_S)) delta -= glm::dvec3(front);
+    if (isKeyDown(GLFW_KEY_D)) delta += glm::dvec3(right);
+    if (isKeyDown(GLFW_KEY_A)) delta -= glm::dvec3(right);
+    if (isKeyDown(GLFW_KEY_SPACE)) delta.y += 1.0;
+    if (isKeyDown(GLFW_KEY_LEFT_SHIFT)) delta.y -= 1.0;
     position += delta * step;
     previousPosition = position;
+    stepLift = 0.0f;
     eyeHeight = kStandingEye;
     fovScale = 1.0f;
     swimmingPose = false;
@@ -138,14 +244,14 @@ void Player::update(GLFWwindow *window, float deltaTime, const Camera &camera, c
   }
 
   Input input;
-  input.forward = (down(GLFW_KEY_W) ? 1.0f : 0.0f) - (down(GLFW_KEY_S) ? 1.0f : 0.0f);
-  input.strafe = (down(GLFW_KEY_D) ? 1.0f : 0.0f) - (down(GLFW_KEY_A) ? 1.0f : 0.0f);
-  input.jump = down(GLFW_KEY_SPACE);
-  input.sneak = down(GLFW_KEY_LEFT_SHIFT);
-  if (!down(GLFW_KEY_W)) {
+  input.forward = (isKeyDown(GLFW_KEY_W) ? 1.0f : 0.0f) - (isKeyDown(GLFW_KEY_S) ? 1.0f : 0.0f);
+  input.strafe = (isKeyDown(GLFW_KEY_D) ? 1.0f : 0.0f) - (isKeyDown(GLFW_KEY_A) ? 1.0f : 0.0f);
+  input.jump = isKeyDown(GLFW_KEY_SPACE);
+  input.sneak = isKeyDown(GLFW_KEY_LEFT_SHIFT);
+  if (!isKeyDown(GLFW_KEY_W)) {
     sprintFromDoubleTap = false;
   }
-  input.sprint = down(GLFW_KEY_LEFT_CONTROL) || sprintFromDoubleTap;
+  input.sprint = isKeyDown(GLFW_KEY_LEFT_CONTROL) || sprintFromDoubleTap;
 
   tickAccumulator += static_cast<double>(deltaTime);
   int ticks = 0;
@@ -157,10 +263,15 @@ void Player::update(GLFWwindow *window, float deltaTime, const Camera &camera, c
     }
     previousPosition = position;
     tick(input, camera.yaw(), camera.front().y, world);
+    if (frozen) { // died and respawned: wait for the spawn column before simulating again
+      tickAccumulator = 0.0;
+      break;
+    }
   }
 
   // Smooth the eye height and FOV toward their targets (per frame, frame-rate independent).
   const float blend = 1.0f - std::exp(-deltaTime * 15.0f);
+  stepLift *= std::exp(-deltaTime * kStepSmoothing);
   const float targetEye = swimmingPose                                ? kSwimmingEye
                           : sneaking && currentMode == Mode::Walking ? kSneakingEye
                                                                      : kStandingEye;
@@ -246,12 +357,12 @@ void Player::tick(const Input &input, float yawDegrees, float lookY, const cpuwo
   // up while holding Space or with water above the head, so it doesn't launch you out at the surface.
   if (sprintSwimming) {
     const double look = static_cast<double>(lookY);
-    const double k = look < -0.2 ? 0.085 : 0.06;
+    const double pullRate = look < -0.2 ? 0.085 : 0.06;
     const bool waterAbove =
         world.isInfiniteSource(static_cast<int>(std::floor(position.x)), static_cast<int>(std::floor(position.y + 1.0 - 0.1)),
                                static_cast<int>(std::floor(position.z)));
     if (look <= 0.0 || input.jump || waterAbove) {
-      motion.y += (look - motion.y) * k;
+      motion.y += (look - motion.y) * pullRate;
     }
   }
 
@@ -277,13 +388,21 @@ void Player::tick(const Input &input, float yawDegrees, float lookY, const cpuwo
   if (inputLength >= 1.0e-4) {
     inputLength = std::max(inputLength, 1.0);
     const double scale = speed / inputLength;
-    const double f = forward * scale;
-    const double s = strafe * scale;
-    motion.x += forwardDir.x * f + rightDir.x * s;
-    motion.z += forwardDir.y * f + rightDir.y * s;
+    const double forwardAccel = forward * scale;
+    const double strafeAccel = strafe * scale;
+    motion.x += forwardDir.x * forwardAccel + rightDir.x * strafeAccel;
+    motion.z += forwardDir.y * forwardAccel + rightDir.y * strafeAccel;
   }
 
   move(motion, (sneaking || crawling) && onGround && !flying && !inWater, world);
+  updateFall(position.y - previousPosition.y);
+  if (hurtTicks > 0) {
+    --hurtTicks;
+  }
+  if (hp < kMaxHealth && ++regenTicks >= kRegenIntervalTicks) {
+    hp = std::min(hp + 1.0f, kMaxHealth);
+    regenTicks = 0;
+  }
 
   if (flying) {
     motion.y *= kFlyVerticalDamping;
@@ -365,6 +484,7 @@ void Player::move(glm::dvec3 delta, bool sneakGuard, const cpuworld::CpuWorld &w
   // Sneaking on the ground: shrink the horizontal move until the box would still stand on something.
   if (sneakGuard) {
     constexpr double step = 0.05;
+    /** Whether the box shifted by (dx, dz) still has a collidable block within 1 block below it. */
     auto supported = [&](double dx, double dz) {
       return boxCollides(boxMin + glm::dvec3(dx, -1.0, dz), boxMax + glm::dvec3(dx, -height, dz), world);
     };
@@ -380,7 +500,17 @@ void Player::move(glm::dvec3 delta, bool sneakGuard, const cpuworld::CpuWorld &w
     }
   }
 
-  // Clip the move along one axis against every solid block the swept box touches (AxisAlignedBB.calculate*Offset).
+  const glm::dvec3 startMin = boxMin, startMax = boxMax;
+  const glm::dvec3 guarded = delta; // after the sneak guard
+
+  /**
+   * Clip a move along one axis against every solid block the swept box touches (AxisAlignedBB.calculate*Offset),
+   * then shift boxMin / boxMax by the result.
+   *
+   * @param axis 0 = x, 1 = y, 2 = z.
+   * @param d Requested displacement along `axis`, in blocks.
+   * @return the allowed displacement.
+   */
   auto clipAxis = [&](int axis, double d) {
     if (d == 0.0) {
       return 0.0;
@@ -411,11 +541,40 @@ void Player::move(glm::dvec3 delta, bool sneakGuard, const cpuworld::CpuWorld &w
   delta.y = clipAxis(1, delta.y);
   delta.x = clipAxis(0, delta.x);
   delta.z = clipAxis(2, delta.z);
+  bool landed = delta.y != guarded.y && guarded.y < 0.0;
+
+  // Step up (Entity.move's stepHeight): walking into a ledge up to kStepHeight tall, retry the move raised by that
+  // much, then settle back down onto whatever is there. Kept only if it gets further horizontally.
+  const bool blockedHorizontally = delta.x != guarded.x || delta.z != guarded.z;
+  if (currentMode == Mode::Walking && blockedHorizontally && (onGround || landed)) {
+    const glm::dvec3 normalMin = boxMin, normalMax = boxMax, normalDelta = delta;
+    boxMin = startMin;
+    boxMax = startMax;
+    glm::dvec3 stepped;
+    const double stepUp = clipAxis(1, kStepHeight);
+    stepped.x = clipAxis(0, guarded.x);
+    stepped.z = clipAxis(2, guarded.z);
+    const double settleDown = clipAxis(1, -stepUp + std::min(guarded.y, 0.0));
+    stepped.y = stepUp + settleDown;
+    const double normalDist = normalDelta.x * normalDelta.x + normalDelta.z * normalDelta.z;
+    const double steppedDist = stepped.x * stepped.x + stepped.z * stepped.z;
+    if (steppedDist > normalDist + 1.0e-9 && stepped.y > 1.0e-9) {
+      delta = stepped;
+      landed = true;
+      // The camera eases up instead of popping a full block: the render interpolation starts from the raised
+      // height, and stepLift (decaying per frame) holds the eye back.
+      stepLift += static_cast<float>(stepped.y);
+      previousPosition.y += stepped.y;
+    } else {
+      boxMin = normalMin;
+      boxMax = normalMax;
+    }
+  }
 
   position = glm::dvec3((boxMin.x + boxMax.x) * 0.5, boxMin.y, (boxMin.z + boxMax.z) * 0.5);
   const bool collidedVertically = delta.y != wanted.y;
   collidedHorizontally = delta.x != wanted.x || delta.z != wanted.z;
-  onGround = collidedVertically && wanted.y < 0.0;
+  onGround = landed;
   if (delta.x != wanted.x) motion.x = 0.0;
   if (delta.z != wanted.z) motion.z = 0.0;
   if (collidedVertically) motion.y = 0.0;

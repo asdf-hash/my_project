@@ -1,21 +1,22 @@
 #include "cpu_mesher.hpp"
 
+#include "cpu_light.hpp"
 #include "simd.hpp"
 
 #include <bit>
-#include <cstring>
 
 namespace cpuworld {
 namespace {
 
 using simd::I8;
 
-constexpr int32_t N = CHUNK_SIZE;
-constexpr int32_t TILE = 8;
+constexpr int32_t N = CHUNK_SIZE; // chunk edge, in blocks
+constexpr int32_t TILE = 8;      // cluster edge, in columns
 
 struct Int3 {
   int32_t x, y, z;
 };
+// Component-wise offset arithmetic.
 Int3 operator+(Int3 a, Int3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
 Int3 operator-(Int3 a, Int3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
 
@@ -26,25 +27,86 @@ constexpr Int3 kV[6] = {{0, 1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {0, 1, 0}, 
 // Cluster run order: +Y, -X, +X, -Z, +Z, -Y.
 constexpr uint32_t kRunNormals[6] = {2, 1, 0, 5, 4, 3};
 
+/**
+ * Pack one LOD 0 quad in chunk_compute.slang writeQuad's layout.
+ * Low word: x | y << 5 | z << 10 (5 bits each) | normal << 15 (3) | ao << 18 (8) | (length - 1) << 26 (5).
+ * High word: block id (10) | corner skylight << 10 (16: 4 bits per corner, AO's corner order) | (width - 1) << 26 (3).
+ *
+ * @param x Chunk-local block x.
+ * @param y Chunk-local block y.
+ * @param z Chunk-local block z.
+ * @param normalIndex Face direction, 0..5 = +x, -x, +y, -y, +z, -z.
+ * @param ao Four 2-bit corner AO values (corner k in bits 2k..2k+1).
+ * @param blockType Block id (10 bits).
+ * @param length Quad extent along its first axis, in blocks (1..32).
+ * @param width Quad extent along its second axis, in blocks (1..8).
+ * @param cornerLight Smooth skylight, levels 0..15 per corner (corner k in bits 4k..4k+3).
+ * @return the packed 64-bit quad.
+ */
+uint64_t packQuad(uint32_t x, uint32_t y, uint32_t z, uint32_t normalIndex, uint32_t ao, uint32_t blockType,
+                  uint32_t length, uint32_t width, uint32_t cornerLight) {
+  uint32_t packed = (x & 0x1fu) | ((y & 0x1fu) << 5u) | ((z & 0x1fu) << 10u) | ((normalIndex & 0x7u) << 15u);
+  packed |= ao << 18u;
+  packed |= ((length - 1u) & 0x1fu) << 26u;
+  const uint32_t metadata = blockType | ((cornerLight & 0xffffu) << 10u) | (((width - 1u) & 0x7u) << 26u); // LOD 0
+  return (static_cast<uint64_t>(metadata) << 32u) | packed;
+}
+
+/**
+ * Pack a LOD 0 chunk's world origin: block x in bits 0..23, block z in 24..47, chunk y in 48..60.
+ *
+ * @param cx Chunk column x, in chunks.
+ * @param chunkY Chunk y, in chunks.
+ * @param cz Chunk column z, in chunks.
+ * @return the packed offset.
+ */
+uint64_t packChunkOffset(int32_t cx, int32_t chunkY, int32_t cz) {
+  const uint64_t offsetX = static_cast<uint32_t>(cx * CHUNK_SIZE) & 0x00ffffffu;
+  const uint64_t offsetZ = static_cast<uint64_t>(static_cast<uint32_t>(cz * CHUNK_SIZE) & 0x00ffffffu) << 24u;
+  const uint64_t offsetY = static_cast<uint64_t>(static_cast<uint32_t>(chunkY) & 0x1fffu) << 48u;
+  return offsetX | offsetZ | offsetY; // LOD 0
+}
+
+/** Whether packed AO matches across the u axis (corners 0 == 1, 3 == 2), so the quad may grow along u. */
 bool aoConstantAlongU(uint32_t ao) { return (ao & 3u) == ((ao >> 2u) & 3u) && ((ao >> 6u) & 3u) == ((ao >> 4u) & 3u); }
+/** Whether packed AO matches across the v axis (corners 0 == 3, 1 == 2), so the quad may grow along v. */
 bool aoConstantAlongV(uint32_t ao) { return (ao & 3u) == ((ao >> 6u) & 3u) && ((ao >> 2u) & 3u) == ((ao >> 4u) & 3u); }
+/** Corner k's 4-bit light level from packed corner light. */
+constexpr uint32_t cornerLevel(uint32_t light, uint32_t k) { return (light >> (4u * k)) & 0xfu; }
+/** Whether packed corner light matches across the u axis (corners 0 == 1, 3 == 2). */
+bool lightConstantAlongU(uint32_t light) {
+  return cornerLevel(light, 0) == cornerLevel(light, 1) && cornerLevel(light, 3) == cornerLevel(light, 2);
+}
+/** Whether packed corner light matches across the v axis (corners 0 == 3, 1 == 2). */
+bool lightConstantAlongV(uint32_t light) {
+  return cornerLevel(light, 0) == cornerLevel(light, 3) && cornerLevel(light, 1) == cornerLevel(light, 2);
+}
 
 // Column bitmasks over the padded 34x34 area, pre-shifted: shifted[k][i] = uint32(M >> k), where M has bit (y + 1)
 // set for a solid cell at chunk-local y in -1..32. Bit y of shifted[1 + dy] is then the cell at y + dy.
 struct PaddedMasks {
   std::array<std::array<uint32_t, kPad * kPad>, 3> shifted;
 
-  // 8 consecutive x columns starting at chunk-local (x, z) shifted by `off`.
+  /**
+   * Load 8 consecutive x columns, offset so bit y of each lane is the cell at chunk-local (x, y, z) + off.
+   *
+   * @param off Neighbor offset; each component in -1..1.
+   */
   I8 load(Int3 off, int32_t x, int32_t z) const {
     return I8::load(reinterpret_cast<const int32_t *>(&shifted[1 + off.y][(z + off.z + 1) * kPad + (x + off.x + 1)]));
   }
 };
 
-// The same pre-shifted columns for ocean cells (Column::ocean32; border heights where a neighbor isn't loaded).
+/**
+ * Build PaddedMasks of ocean cells (Column::ocean32; border heights where a neighbor isn't loaded).
+ *
+ * @param nb Neighborhood of the column being meshed.
+ * @param chunkY Chunk y, in chunks.
+ */
 void buildOceanMasks(const Neighborhood &nb, int32_t chunkY, PaddedMasks &masks) {
   const Column &center = nb.center();
-  for (int32_t pz = -1; pz <= N; ++pz) {
-    const int32_t dz = pz < 0 ? -1 : (pz >= N ? 1 : 0);
+  for (int32_t pz = -1; pz <= N; ++pz) { // px/pz: chunk-local coords over the padded area
+    const int32_t dz = pz < 0 ? -1 : (pz >= N ? 1 : 0); // dx/dz: which neighbor column, -1..1
     for (int32_t px = -1; px <= N; ++px) {
       const int32_t dx = px < 0 ? -1 : (px >= N ? 1 : 0);
       const Column *column = nb.columns[dz + 1][dx + 1];
@@ -63,20 +125,27 @@ void buildOceanMasks(const Neighborhood &nb, int32_t chunkY, PaddedMasks &masks)
       } else {
         below = self = above = 0u;
       }
-      const uint64_t m = static_cast<uint64_t>(below >> 31u) | (static_cast<uint64_t>(self) << 1u) |
-                         (static_cast<uint64_t>(above & 1u) << 33u);
+      // y = -1..32 at bits 0..33: top cell of the chunk below, this chunk, bottom cell of the chunk above.
+      const uint64_t padded = static_cast<uint64_t>(below >> 31u) | (static_cast<uint64_t>(self) << 1u) |
+                              (static_cast<uint64_t>(above & 1u) << 33u);
       const int32_t i = (pz + 1) * kPad + (px + 1);
-      masks.shifted[0][i] = static_cast<uint32_t>(m);
-      masks.shifted[1][i] = static_cast<uint32_t>(m >> 1u);
-      masks.shifted[2][i] = static_cast<uint32_t>(m >> 2u);
+      masks.shifted[0][i] = static_cast<uint32_t>(padded);
+      masks.shifted[1][i] = static_cast<uint32_t>(padded >> 1u);
+      masks.shifted[2][i] = static_cast<uint32_t>(padded >> 2u);
     }
   }
 }
 
-void buildMasks(const Neighborhood &nb, int32_t chunkY, PaddedMasks &masks) {
+/**
+ * Build PaddedMasks of opaque cells (Column::solid32; border heights where a neighbor isn't loaded).
+ *
+ * @param nb Neighborhood of the column being meshed.
+ * @param chunkY Chunk y, in chunks. * @param opaque Receives the same bits unshifted, for computeSkyLight.
+ */
+void buildMasks(const Neighborhood &nb, int32_t chunkY, PaddedMasks &masks, PaddedOpaque &opaque) {
   const Column &center = nb.center();
-  for (int32_t pz = -1; pz <= N; ++pz) {
-    const int32_t dz = pz < 0 ? -1 : (pz >= N ? 1 : 0);
+  for (int32_t pz = -1; pz <= N; ++pz) { // px/pz: chunk-local coords over the padded area
+    const int32_t dz = pz < 0 ? -1 : (pz >= N ? 1 : 0); // dx/dz: which neighbor column, -1..1
     for (int32_t px = -1; px <= N; ++px) {
       const int32_t dx = px < 0 ? -1 : (px >= N ? 1 : 0);
       const Column *column = nb.columns[dz + 1][dx + 1];
@@ -93,12 +162,14 @@ void buildMasks(const Neighborhood &nb, int32_t chunkY, PaddedMasks &masks) {
         self = Column::heightMask(h, chunkY);
         above = Column::heightMask(h, chunkY + 1);
       }
-      const uint64_t m = static_cast<uint64_t>(below >> 31u) | (static_cast<uint64_t>(self) << 1u) |
-                         (static_cast<uint64_t>(above & 1u) << 33u);
+      // y = -1..32 at bits 0..33: top cell of the chunk below, this chunk, bottom cell of the chunk above.
+      const uint64_t padded = static_cast<uint64_t>(below >> 31u) | (static_cast<uint64_t>(self) << 1u) |
+                              (static_cast<uint64_t>(above & 1u) << 33u);
       const int32_t i = (pz + 1) * kPad + (px + 1);
-      masks.shifted[0][i] = static_cast<uint32_t>(m);
-      masks.shifted[1][i] = static_cast<uint32_t>(m >> 1u);
-      masks.shifted[2][i] = static_cast<uint32_t>(m >> 2u);
+      masks.shifted[0][i] = static_cast<uint32_t>(padded);
+      masks.shifted[1][i] = static_cast<uint32_t>(padded >> 1u);
+      masks.shifted[2][i] = static_cast<uint32_t>(padded >> 2u);
+      opaque[static_cast<size_t>(i)] = padded;
     }
   }
 }
@@ -109,25 +180,60 @@ struct TilePlanes {
   std::array<uint32_t, 64> face;
   std::array<std::array<uint32_t, 64>, 4> aoLo;
   std::array<std::array<uint32_t, 64>, 4> aoHi;
+  // Light context of the tile and direction last computed (computePlanes / computeOceanPlanes).
+  const ChunkLight *light = nullptr;
+  const PaddedMasks *opaque = nullptr;
+  uint32_t normal = 0;
+  int32_t tileX = 0;
+  int32_t tileZ = 0;
 
+  /** Packed corner skylight of the face at cell y of column c (cornerLight). */
+  uint32_t lightAt(int32_t c, int32_t y) const;
+
+  /**
+   * Gather the packed AO of the face at cell y of column c.
+   *
+   * @return four 2-bit corner values, corner k in bits 2k..2k+1 (packQuad's ao).
+   */
   uint32_t ao(int32_t c, int32_t y) const {
-    uint32_t ao = 0;
+    uint32_t packed = 0;
     for (int k = 0; k < 4; ++k) {
-      ao |= (((aoLo[k][c] >> y) & 1u) | (((aoHi[k][c] >> y) & 1u) << 1u)) << (2 * k);
+      packed |= (((aoLo[k][c] >> y) & 1u) | (((aoHi[k][c] >> y) & 1u) << 1u)) << (2 * k);
     }
-    return ao;
+    return packed;
   }
 };
 
-// vertexAo(a, b, c) = a && b ? 3 : a + b + c, as two bitplanes over 32 cells.
+/**
+ * Bit-sliced vertexAo(a, b, c) = a && b ? 3 : a + b + c over 32 cells per lane.
+ *
+ * @param a Side neighbor solidity along u.
+ * @param b Side neighbor solidity along v.
+ * @param c Diagonal corner neighbor solidity.
+ * @param lo Receives bit 0 of the AO value.
+ * @param hi Receives bit 1 of the AO value.
+ */
 void vertexAoPlanes(I8 a, I8 b, I8 c, I8 &lo, I8 &hi) {
   const I8 ab = a & b;
   lo = ab | (a ^ b ^ c);
   hi = ab | (c & (a | b));
 }
 
-void computePlanes(const PaddedMasks &masks, uint32_t normal, int32_t tileX, int32_t tileZ, TilePlanes &planes) {
-  const Int3 o = kNormals[normal];
+/**
+ * Compute face bits and AO bitplanes of opaque cells for one tile and one direction.
+ *
+ * @param normal Face direction, 0..5 = +x, -x, +y, -y, +z, -z.
+ * @param tileX Tile x within the chunk, 0..3.
+ * @param tileZ Tile z within the chunk, 0..3.
+ */
+void computePlanes(const PaddedMasks &masks, const ChunkLight &light, uint32_t normal, int32_t tileX, int32_t tileZ,
+                   TilePlanes &planes) {
+  planes.light = &light;
+  planes.opaque = &masks;
+  planes.normal = normal;
+  planes.tileX = tileX;
+  planes.tileZ = tileZ;
+  const Int3 faceDir = kNormals[normal];
   const Int3 u = kU[normal];
   const Int3 v = kV[normal];
   const Int3 zero{0, 0, 0};
@@ -135,15 +241,16 @@ void computePlanes(const PaddedMasks &masks, uint32_t normal, int32_t tileX, int
     const int32_t x = tileX * TILE;
     const int32_t z = tileZ * TILE + row;
     const I8 solid = masks.load(zero, x, z);
-    const I8 face = simd::andnot(solid, masks.load(o, x, z));
-    const I8 u0 = masks.load(o - u, x, z);
-    const I8 u1 = masks.load(o + u, x, z);
-    const I8 v0 = masks.load(o - v, x, z);
-    const I8 v1 = masks.load(o + v, x, z);
-    const I8 c0 = masks.load(o - u - v, x, z);
-    const I8 c1 = masks.load(o + u - v, x, z);
-    const I8 c2 = masks.load(o + u + v, x, z);
-    const I8 c3 = masks.load(o - u + v, x, z);
+    const I8 face = simd::andnot(solid, masks.load(faceDir, x, z));
+    // Solidity around the outside cell: u0/u1 and v0/v1 the sides, c0..c3 the diagonal corners.
+    const I8 u0 = masks.load(faceDir - u, x, z);
+    const I8 u1 = masks.load(faceDir + u, x, z);
+    const I8 v0 = masks.load(faceDir - v, x, z);
+    const I8 v1 = masks.load(faceDir + v, x, z);
+    const I8 c0 = masks.load(faceDir - u - v, x, z);
+    const I8 c1 = masks.load(faceDir + u - v, x, z);
+    const I8 c2 = masks.load(faceDir + u + v, x, z);
+    const I8 c3 = masks.load(faceDir - u + v, x, z);
     I8 lo[4], hi[4];
     vertexAoPlanes(u0, v0, c0, lo[0], hi[0]);
     vertexAoPlanes(u1, v0, c1, lo[1], hi[1]);
@@ -157,18 +264,28 @@ void computePlanes(const PaddedMasks &masks, uint32_t normal, int32_t tileX, int
   }
 }
 
-// Ocean faces of one tile in one direction: an ocean cell beside a cell that is neither opaque nor ocean (air, other
-// non-opaque blocks). No AO: water is lit flat.
-void computeOceanPlanes(const PaddedMasks &solidMasks, const PaddedMasks &oceanMasks, uint32_t normal, int32_t tileX,
-                        int32_t tileZ, TilePlanes &planes) {
-  const Int3 o = kNormals[normal];
+/**
+ * Compute ocean face bits for one tile and one direction: an ocean cell beside a cell that is neither opaque nor
+ * ocean (air, other non-opaque blocks). AO planes are zeroed: water is lit flat.
+ *
+ * @param normal Face direction, 0..5 = +x, -x, +y, -y, +z, -z.
+ * @param tileX Tile x within the chunk, 0..3.
+ * @param tileZ Tile z within the chunk, 0..3.
+ */
+void computeOceanPlanes(const PaddedMasks &solidMasks, const PaddedMasks &oceanMasks, const ChunkLight &light,
+                        uint32_t normal, int32_t tileX, int32_t tileZ, TilePlanes &planes) {
+  planes.light = &light;
+  planes.opaque = &solidMasks;
+  planes.normal = normal;
+  planes.tileX = tileX;
+  planes.tileZ = tileZ;
+  const Int3 faceDir = kNormals[normal];
   const Int3 zero{0, 0, 0};
   for (int32_t row = 0; row < TILE; ++row) {
     const int32_t x = tileX * TILE;
     const int32_t z = tileZ * TILE + row;
     const I8 ocean = oceanMasks.load(zero, x, z);
-    const I8 covered = solidMasks.load(o, x, z) | oceanMasks.load(o, x, z);
-    // andnot(a, b) = a & ~b: ocean cells whose neighbor is neither opaque nor ocean.
+    const I8 covered = solidMasks.load(faceDir, x, z) | oceanMasks.load(faceDir, x, z);
     simd::andnot(ocean, covered).store(reinterpret_cast<int32_t *>(&planes.face[row * TILE]));
   }
   for (int k = 0; k < 4; ++k) {
@@ -177,17 +294,28 @@ void computeOceanPlanes(const PaddedMasks &solidMasks, const PaddedMasks &oceanM
   }
 }
 
+// Vertical extent of a tile's quads, in chunk-local blocks; low > high while empty.
 struct TileBounds {
   int32_t low = N;
   int32_t high = 0;
+  /** Grow to include cells [lowCell, highCell). */
   void add(int32_t lowCell, int32_t highCell) {
     low = std::min(low, lowCell);
     high = std::max(high, highCell);
   }
 };
 
-// Top / bottom faces: per layer, rectangles of identical (block, AO) within the tile, extended along x only when AO
-// is constant along u and along z only when it is constant along v (the GPU's top-face rules).
+/**
+ * Emit top / bottom faces: per layer, greedy rectangles of identical (block, AO) within the tile, extended along x
+ * only when AO is constant along u and along z only when constant along v (the GPU's top-face rules).
+ *
+ * @param normal 2 (+y) or 3 (-y).
+ * @param tileX Tile x within the chunk, 0..3.
+ * @param tileZ Tile z within the chunk, 0..3.
+ * @param quads Receives the packed quads.
+ * @param bounds Grown to cover the emitted faces.
+ * @return number of quads emitted.
+ */
 uint32_t emitHorizontal(const TilePlanes &planes, const VoxelChunk &voxels, uint32_t normal, int32_t tileX,
                         int32_t tileZ, std::vector<uint64_t> &quads, TileBounds &bounds) {
   uint32_t layers = 0;
@@ -198,13 +326,15 @@ uint32_t emitHorizontal(const TilePlanes &planes, const VoxelChunk &voxels, uint
   while (layers != 0u) {
     const int32_t y = std::countr_zero(layers);
     layers &= layers - 1u;
-    std::array<uint32_t, 64> key{};
+    // Per column: 0 = no face, else corner light << 32 | 1 << 19 | ao << 10 | block id, so equal keys merge.
+    std::array<uint64_t, 64> key{};
     for (int32_t c = 0; c < 64; ++c) {
       if ((planes.face[c] >> y) & 1u) {
         const uint32_t ao = planes.ao(c, y);
         const int32_t x = tileX * TILE + (c & 7);
         const int32_t z = tileZ * TILE + (c >> 3);
-        key[c] = (1u << 19u) | (ao << 10u) | voxels.ids[VoxelChunk::index(x, y, z)];
+        key[c] = (static_cast<uint64_t>(planes.lightAt(c, y)) << 32u) | (1u << 19u) | (ao << 10u) |
+                 voxels.ids[VoxelChunk::index(x, y, z)];
       }
     }
     std::array<bool, 64> used{};
@@ -214,16 +344,17 @@ uint32_t emitHorizontal(const TilePlanes &planes, const VoxelChunk &voxels, uint
         if (key[c] == 0u || used[c]) {
           continue;
         }
-        const uint32_t k = key[c];
-        const uint32_t ao = (k >> 10u) & 0xffu;
+        const uint64_t cellKey = key[c];
+        const uint32_t ao = static_cast<uint32_t>(cellKey >> 10u) & 0xffu;
+        const uint32_t light = static_cast<uint32_t>(cellKey >> 32u);
         uint32_t length = 1;
-        if (aoConstantAlongU(ao)) {
-          while (col + static_cast<int32_t>(length) < TILE && key[c + length] == k && !used[c + length]) {
+        if (aoConstantAlongU(ao) && lightConstantAlongU(light)) {
+          while (col + static_cast<int32_t>(length) < TILE && key[c + length] == cellKey && !used[c + length]) {
             ++length;
           }
         }
         uint32_t width = 1;
-        if (aoConstantAlongV(ao)) {
+        if (aoConstantAlongV(ao) && lightConstantAlongV(light)) {
           for (;;) {
             const int32_t nextRow = row + static_cast<int32_t>(width);
             if (nextRow >= TILE) {
@@ -231,8 +362,8 @@ uint32_t emitHorizontal(const TilePlanes &planes, const VoxelChunk &voxels, uint
             }
             bool same = true;
             for (uint32_t i = 0; i < length && same; ++i) {
-              const int32_t n = nextRow * TILE + col + static_cast<int32_t>(i);
-              same = key[n] == k && !used[n];
+              const int32_t nextCell = nextRow * TILE + col + static_cast<int32_t>(i);
+              same = key[nextCell] == cellKey && !used[nextCell];
             }
             if (!same) {
               break;
@@ -248,7 +379,9 @@ uint32_t emitHorizontal(const TilePlanes &planes, const VoxelChunk &voxels, uint
         const uint32_t x = static_cast<uint32_t>(tileX * TILE + col);
         // +Y faces extend toward -z from the written cell (faceV), -Y faces toward +z: write the far / near row.
         const uint32_t z = static_cast<uint32_t>(tileZ * TILE + row) + (normal == 2u ? width - 1u : 0u);
-        quads.push_back(packQuad(x, static_cast<uint32_t>(y), z, normal, ao, k & 0x3ffu, length, width));
+        quads.push_back(
+            packQuad(x, static_cast<uint32_t>(y), z, normal, ao, static_cast<uint32_t>(cellKey) & 0x3ffu, length, width,
+                     light));
         ++count;
         bounds.add(y, y + 1);
       }
@@ -257,13 +390,23 @@ uint32_t emitHorizontal(const TilePlanes &planes, const VoxelChunk &voxels, uint
   return count;
 }
 
+// A vertical run of side faces in one column; start / length in chunk-local blocks.
 struct SideRun {
-  uint32_t start, length, block, ao;
+  uint32_t start, length, block, ao, light;
   bool operator==(const SideRun &) const = default;
 };
 
-// Side faces: vertical runs of equal (block, AO) per column, merged across the tile along the greedy axis (z for x
-// faces, x for z faces) when the neighbor column has the identical run (sideFaceRuns / sideRun on the GPU).
+/**
+ * Emit side faces: vertical runs of equal (block, AO) per column, merged across the tile along the greedy axis
+ * (z for x faces, x for z faces) where the neighbor column has the identical run (sideFaceRuns / sideRun on the GPU).
+ *
+ * @param normal 0, 1, 4 or 5 (+x, -x, +z, -z).
+ * @param tileX Tile x within the chunk, 0..3.
+ * @param tileZ Tile z within the chunk, 0..3.
+ * @param quads Receives the packed quads.
+ * @param bounds Grown to cover the emitted faces.
+ * @return number of quads emitted.
+ */
 uint32_t emitSide(const TilePlanes &planes, const VoxelChunk &voxels, uint32_t normal, int32_t tileX, int32_t tileZ,
                   std::vector<uint64_t> &quads, TileBounds &bounds) {
   // Runs per column; at most 16 per column in practice (alternating faces), bounded by 32.
@@ -284,15 +427,17 @@ uint32_t emitSide(const TilePlanes &planes, const VoxelChunk &voxels, uint32_t n
       bits &= bits - 1u;
       const uint32_t ao = planes.ao(c, static_cast<int32_t>(y));
       const uint32_t block = voxels.ids[VoxelChunk::index(x, static_cast<int32_t>(y), z)];
-      const bool mergeable = aoConstantAlongV(ao);
-      if (open && run.start + run.length == y && openMergeable && mergeable && block == run.block && ao == run.ao) {
+      const uint32_t light = planes.lightAt(c, static_cast<int32_t>(y));
+      const bool mergeable = aoConstantAlongV(ao) && lightConstantAlongV(light);
+      if (open && run.start + run.length == y && openMergeable && mergeable && block == run.block && ao == run.ao &&
+          light == run.light) {
         ++run.length;
         continue;
       }
       if (open) {
         runs[c][runCount[c]++] = run;
       }
-      run = {y, 1u, block, ao};
+      run = {y, 1u, block, ao, light};
       open = true;
       openMergeable = mergeable;
     }
@@ -300,8 +445,11 @@ uint32_t emitSide(const TilePlanes &planes, const VoxelChunk &voxels, uint32_t n
   }
 
   const bool xFace = normal < 2u;
+  /** Tile column `step` columns from c along the greedy axis. */
   auto columnAt = [&](int32_t c, int32_t step) { return xFace ? c + step * TILE : c + step; };
+  /** Position of column c along the greedy axis, 0..7. */
   auto positionOf = [&](int32_t c) { return xFace ? c >> 3 : c & 7; };
+  /** Whether column c has a run identical to `run`. */
   auto hasRun = [&](int32_t c, const SideRun &run) {
     for (uint32_t i = 0; i < runCount[c]; ++i) {
       if (runs[c][i] == run) {
@@ -314,9 +462,9 @@ uint32_t emitSide(const TilePlanes &planes, const VoxelChunk &voxels, uint32_t n
   uint32_t count = 0;
   for (int32_t c = 0; c < 64; ++c) {
     const int32_t position = positionOf(c);
-    for (uint32_t r = 0; r < runCount[c]; ++r) {
-      const SideRun &run = runs[c][r];
-      const bool mergeable = aoConstantAlongU(run.ao);
+    for (uint32_t runIndex = 0; runIndex < runCount[c]; ++runIndex) {
+      const SideRun &run = runs[c][runIndex];
+      const bool mergeable = aoConstantAlongU(run.ao) && lightConstantAlongU(run.light);
       if (mergeable && position > 0 && hasRun(columnAt(c, -1), run)) {
         continue; // covered by the previous column's quad
       }
@@ -328,7 +476,7 @@ uint32_t emitSide(const TilePlanes &planes, const VoxelChunk &voxels, uint32_t n
       }
       const uint32_t x = static_cast<uint32_t>(tileX * TILE + (c & 7));
       const uint32_t z = static_cast<uint32_t>(tileZ * TILE + (c >> 3));
-      quads.push_back(packQuad(x, run.start, z, normal, run.ao, run.block, run.length, width));
+      quads.push_back(packQuad(x, run.start, z, normal, run.ao, run.block, run.length, width, run.light));
       ++count;
       bounds.add(static_cast<int32_t>(run.start), static_cast<int32_t>(run.start + run.length));
     }
@@ -336,14 +484,77 @@ uint32_t emitSide(const TilePlanes &planes, const VoxelChunk &voxels, uint32_t n
   return count;
 }
 
-// Opaque bit of chunk-local cell (x, y, z), x / z in -1..32, y in -1..32, from the padded masks.
+/**
+ * Read one opaque bit from the padded masks.
+ *
+ * @return whether chunk-local cell (x, y, z) is opaque; x, y, z each in -1..32.
+ */
 bool opaqueAt(const PaddedMasks &masks, int32_t x, int32_t y, int32_t z) {
   const int32_t i = (z + 1) * kPad + (x + 1);
   // shifted[0] has the cell at y in bit y + 1, shifted[2] in bit y - 1 (reaches y = 32).
   return y <= 30 ? (masks.shifted[0][i] >> (y + 1)) & 1u : (masks.shifted[2][i] >> (y - 1)) & 1u;
 }
 
-// Block id of chunk-local cell (x, y, z), x / z in -1..32 (neighbor columns; border heights where not loaded).
+/**
+ * Smooth skylight of one face, vanilla's blend: per corner, the average of the cell the face looks into (front) and
+ * its neighbors toward that corner (two sides, and the diagonal unless both sides are opaque, else the first side
+ * again), where any sample reading 0 (opaque or dark) counts as the front's level. Rounded to whole levels.
+ *
+ * @param front Chunk-local cell the face looks into.
+ * @param normal Face direction, 0..5 = +x, -x, +y, -y, +z, -z.
+ * @return 4 bits per corner, corner k = (-u,-v), (+u,-v), (+u,+v), (-u,+v) in bits 4k..4k+3 (AO's order).
+ */
+uint32_t cornerLight(const ChunkLight &light, const PaddedMasks &opaque, Int3 front, uint32_t normal) {
+  if (light.allLit) {
+    return 0xffffu;
+  }
+  const Int3 u = kU[normal];
+  const Int3 v = kV[normal];
+  /** Whether the cell at offset (du * u + dv * v) from front is opaque. */
+  const auto isOpaque = [&](int32_t du, int32_t dv) {
+    return opaqueAt(opaque, front.x + du * u.x + dv * v.x, front.y + du * u.y + dv * v.y,
+                    front.z + du * u.z + dv * v.z);
+  };
+  /** Level of the cell at offset (du * u + dv * v) from front (0 when opaque). */
+  const auto level = [&](int32_t du, int32_t dv) {
+    return isOpaque(du, dv) ? 0
+                            : static_cast<int32_t>(light.level(front.x + du * u.x + dv * v.x,
+                                                               front.y + du * u.y + dv * v.y,
+                                                               front.z + du * u.z + dv * v.z));
+  };
+  static constexpr int32_t kCornerU[4] = {-1, 1, 1, -1};
+  static constexpr int32_t kCornerV[4] = {-1, -1, 1, 1};
+  const int32_t center = level(0, 0);
+  /** A sample, with 0 replaced by the front's level. */
+  const auto orCenter = [&](int32_t sample) { return sample == 0 ? center : sample; };
+  uint32_t packed = 0;
+  for (uint32_t k = 0; k < 4; ++k) {
+    const bool sideUOpaque = isOpaque(kCornerU[k], 0);
+    const bool sideVOpaque = isOpaque(0, kCornerV[k]);
+    const int32_t sideU = level(kCornerU[k], 0);
+    const int32_t sideV = level(0, kCornerV[k]);
+    const int32_t diagonal = sideUOpaque && sideVOpaque ? sideU : level(kCornerU[k], kCornerV[k]);
+    const int32_t sum = center + orCenter(sideU) + orCenter(sideV) + orCenter(diagonal);
+    packed |= static_cast<uint32_t>((sum + 2) / 4) << (4u * k);
+  }
+  return packed;
+}
+
+uint32_t TilePlanes::lightAt(int32_t c, int32_t y) const {
+  const Int3 dir = kNormals[normal];
+  const Int3 front{tileX * TILE + (c & 7) + dir.x, y + dir.y, tileZ * TILE + (c >> 3) + dir.z};
+  return cornerLight(*light, *opaque, front, normal);
+}
+
+/**
+ * Look up the block id of chunk-local cell (x, y, z), reaching into neighbor columns.
+ *
+ * @param nb Neighborhood of the column being meshed.
+ * @param chunkY Chunk y, in chunks.
+ * @param x Chunk-local x, -1..32.
+ * @param z Chunk-local z, -1..32.
+ * @return the id; from border heights (kBuriedTerrain / empty) where the neighbor isn't loaded.
+ */
 uint16_t neighborId(const Neighborhood &nb, int32_t chunkY, int32_t x, int32_t y, int32_t z) {
   const int32_t dx = x < 0 ? -1 : (x >= N ? 1 : 0);
   const int32_t dz = z < 0 ? -1 : (z >= N ? 1 : 0);
@@ -354,15 +565,27 @@ uint16_t neighborId(const Neighborhood &nb, int32_t chunkY, int32_t x, int32_t y
   return worldY < nb.center().borderHeight(x, z) ? kBuriedTerrain : nb.center().emptyCell(worldY);
 }
 
+/** Corner AO 0..3: 3 when both sides are solid, else the count of solid neighbors. */
 uint32_t vertexAo(bool a, bool b, bool corner) { return a && b ? 3u : uint32_t(a) + uint32_t(b) + uint32_t(corner); }
 
-// Non-opaque blocks (id bit 9 set): the binary masks leave them out, so they get their own per-cell pass. Full
-// cubes for now: a face shows unless the neighbor is opaque or the same block, as a 1x1 quad with the binary
-// mesher's AO (from opaque neighbors). nonOpaque holds the chunk's non-opaque cells as column bits.
-uint32_t emitNonOpaque(const PaddedMasks &masks, const Neighborhood &nb, const VoxelChunk &voxels,
+/**
+ * Emit faces of non-opaque blocks (id bit 9 set), which the binary masks leave out, in a per-cell pass. Full cubes
+ * for now: a face shows unless the neighbor is opaque or the same block, as a 1x1 quad with AO from opaque neighbors.
+ *
+ * @param nb Neighborhood of the column being meshed.
+ * @param nonOpaque Per column (z * N + x), bit y set for a non-opaque cell.
+ * @param chunkY Chunk y, in chunks.
+ * @param normal Face direction, 0..5 = +x, -x, +y, -y, +z, -z.
+ * @param tileX Tile x within the chunk, 0..3.
+ * @param tileZ Tile z within the chunk, 0..3.
+ * @param quads Receives the packed quads.
+ * @param bounds Grown to cover the emitted faces.
+ * @return number of quads emitted.
+ */
+uint32_t emitNonOpaque(const PaddedMasks &masks, const ChunkLight &light, const Neighborhood &nb, const VoxelChunk &voxels,
                        const std::array<uint32_t, N * N> &nonOpaque, int32_t chunkY, uint32_t normal, int32_t tileX,
                        int32_t tileZ, std::vector<uint64_t> &quads, TileBounds &bounds) {
-  const Int3 o = kNormals[normal];
+  const Int3 faceDir = kNormals[normal];
   const Int3 u = kU[normal];
   const Int3 v = kV[normal];
   uint32_t count = 0;
@@ -374,21 +597,24 @@ uint32_t emitNonOpaque(const PaddedMasks &masks, const Neighborhood &nb, const V
       while (bits != 0u) {
         const int32_t y = std::countr_zero(bits);
         bits &= bits - 1u;
-        const Int3 out{x + o.x, y + o.y, z + o.z};
-        if (opaqueAt(masks, out.x, out.y, out.z)) {
+        const Int3 outsideCell{x + faceDir.x, y + faceDir.y, z + faceDir.z};
+        if (opaqueAt(masks, outsideCell.x, outsideCell.y, outsideCell.z)) {
           continue;
         }
         const uint16_t id = voxels.ids[VoxelChunk::index(x, y, z)];
-        if (neighborId(nb, chunkY, out.x, out.y, out.z) == id) {
+        if (neighborId(nb, chunkY, outsideCell.x, outsideCell.y, outsideCell.z) == id) {
           continue;
         }
-        const auto at = [&](Int3 d) { return opaqueAt(masks, out.x + d.x, out.y + d.y, out.z + d.z); };
+        /** Whether the cell at offset d from the outside cell is opaque. */
+        const auto at = [&](Int3 d) {
+          return opaqueAt(masks, outsideCell.x + d.x, outsideCell.y + d.y, outsideCell.z + d.z);
+        };
         const Int3 zero{0, 0, 0};
         const bool u0 = at(zero - u), u1 = at(u), v0 = at(zero - v), v1 = at(v);
         const uint32_t ao = vertexAo(u0, v0, at(zero - u - v)) | (vertexAo(u1, v0, at(u - v)) << 2u) |
                             (vertexAo(u1, v1, at(u + v)) << 4u) | (vertexAo(u0, v1, at(v - u)) << 6u);
         quads.push_back(packQuad(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z), normal,
-                                 ao, id & 0x3ffu, 1u, 1u));
+                                 ao, id & 0x3ffu, 1u, 1u, cornerLight(light, masks, outsideCell, normal)));
         ++count;
         bounds.add(y, y + 1);
       }
@@ -397,31 +623,20 @@ uint32_t emitNonOpaque(const PaddedMasks &masks, const Neighborhood &nb, const V
   return count;
 }
 
-} // namespace
-
-uint64_t packQuad(uint32_t x, uint32_t y, uint32_t z, uint32_t normalIndex, uint32_t ao, uint32_t blockType,
-                  uint32_t length, uint32_t width) {
-  uint32_t packed = (x & 0x1fu) | ((y & 0x1fu) << 5u) | ((z & 0x1fu) << 10u) | ((normalIndex & 0x7u) << 15u);
-  packed |= ao << 18u;
-  packed |= ((length - 1u) & 0x1fu) << 26u;
-  const uint32_t metadata = blockType | (15u << 10u) | (0xfffu << 14u) | (((width - 1u) & 0x7u) << 26u); // LOD 0
-  return (static_cast<uint64_t>(metadata) << 32u) | packed;
-}
-
-uint64_t packChunkOffset(int32_t cx, int32_t chunkY, int32_t cz) {
-  const uint64_t offsetX = static_cast<uint32_t>(cx * CHUNK_SIZE) & 0x00ffffffu;
-  const uint64_t offsetZ = static_cast<uint64_t>(static_cast<uint32_t>(cz * CHUNK_SIZE) & 0x00ffffffu) << 24u;
-  const uint64_t offsetY = static_cast<uint64_t>(static_cast<uint32_t>(chunkY) & 0x1fffu) << 48u;
-  return offsetX | offsetZ | offsetY; // LOD 0
-}
-
-void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
+/**
+ * Mesh a chunk (see meshChunk) into `quads`, a reused per-thread scratch, so the result can be copied out with one
+ * exact allocation. Opaque and cutout quads come first, then ocean quads for the translucent clusters.
+ *
+ * @param nb Neighborhood of the column being meshed.
+ * @param chunkY Chunk y, in chunks.
+ * @param out Receives clusters and chunk offset (not quads).
+ * @param quads Receives the packed quads.
+ */
+void meshChunkInto(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out, std::vector<uint64_t> &quads) {
   const Column &center = nb.center();
   const VoxelChunk *voxels = center.chunk(chunkY);
-  out.cx = center.cx;
   out.cy = chunkY;
-  out.cz = center.cz;
-  out.quads.clear();
+  quads.clear();
   out.chunkOffset = packChunkOffset(center.cx, chunkY, center.cz);
   out.clusters = {};
   out.translucentClusters = {};
@@ -431,8 +646,11 @@ void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
 
   thread_local PaddedMasks masks;
   thread_local TilePlanes planes;
-  buildMasks(nb, chunkY, masks);
-  thread_local std::array<uint32_t, N * N> nonOpaque;
+  thread_local PaddedOpaque paddedOpaque;
+  buildMasks(nb, chunkY, masks, paddedOpaque);
+  thread_local ChunkLight light;
+  computeSkyLight(nb, chunkY, paddedOpaque, light);
+  thread_local std::array<uint32_t, N * N> nonOpaque; // per column, bit y = non-opaque, non-ocean cell
   const bool hasNonOpaque = voxels->nonOpaqueCount != 0;
   if (hasNonOpaque) {
     for (int32_t column = 0; column < N * N; ++column) {
@@ -448,17 +666,21 @@ void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
   for (int32_t tileZ = 0; tileZ < N / TILE; ++tileZ) {
     for (int32_t tileX = 0; tileX < N / TILE; ++tileX) {
       QuadCluster &cluster = out.clusters[static_cast<size_t>(tileZ * 4 + tileX)];
-      cluster.base = static_cast<uint32_t>(out.quads.size());
+      cluster.base = static_cast<uint32_t>(quads.size());
       std::array<uint32_t, 6> counts{};
       TileBounds bounds;
+      uint32_t cutoutQuads = 0; // non-opaque (alpha cutout) quads, drawn by the cutout pass
       for (int run = 0; run < 6; ++run) {
         const uint32_t normal = kRunNormals[run];
-        computePlanes(masks, normal, tileX, tileZ, planes);
+        computePlanes(masks, light, normal, tileX, tileZ, planes);
         counts[run] = normal == 2u || normal == 3u
-                          ? emitHorizontal(planes, *voxels, normal, tileX, tileZ, out.quads, bounds)
-                          : emitSide(planes, *voxels, normal, tileX, tileZ, out.quads, bounds);
+                          ? emitHorizontal(planes, *voxels, normal, tileX, tileZ, quads, bounds)
+                          : emitSide(planes, *voxels, normal, tileX, tileZ, quads, bounds);
         if (hasNonOpaque) {
-          counts[run] += emitNonOpaque(masks, nb, *voxels, nonOpaque, chunkY, normal, tileX, tileZ, out.quads, bounds);
+          const uint32_t nonOpaqueCount =
+              emitNonOpaque(masks, light, nb, *voxels, nonOpaque, chunkY, normal, tileX, tileZ, quads, bounds);
+          counts[run] += nonOpaqueCount;
+          cutoutQuads += nonOpaqueCount;
         }
       }
       cluster.counts01 = counts[0] | (counts[1] << 16u);
@@ -470,7 +692,9 @@ void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
       const float minY = static_cast<float>(chunkY * N + faceLow);
       const float minZ = static_cast<float>(center.cz * N + tileZ * TILE);
       cluster.boundsMin = {minX, minY, minZ, 0.0f};
-      cluster.boundsMax = {minX + TILE, minY + static_cast<float>(faceHigh - faceLow), minZ + TILE, 0.0f};
+      // w: 1 when the cluster holds non-opaque quads (geometry_shared.hlsl CLUSTER_HAS_CUTOUT).
+      cluster.boundsMax = {minX + TILE, minY + static_cast<float>(faceHigh - faceLow), minZ + TILE,
+                           cutoutQuads != 0u ? 1.0f : 0.0f};
     }
   }
 
@@ -487,15 +711,15 @@ void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
   for (int32_t tileZ = 0; tileZ < N / TILE; ++tileZ) {
     for (int32_t tileX = 0; tileX < N / TILE; ++tileX) {
       QuadCluster &cluster = out.translucentClusters[static_cast<size_t>(tileZ * 4 + tileX)];
-      cluster.base = static_cast<uint32_t>(out.quads.size());
+      cluster.base = static_cast<uint32_t>(quads.size());
       std::array<uint32_t, 6> counts{};
       TileBounds bounds;
       for (int run = 0; run < 6; ++run) {
         const uint32_t normal = kRunNormals[run];
-        computeOceanPlanes(masks, oceanMasks, normal, tileX, tileZ, planes);
+        computeOceanPlanes(masks, oceanMasks, light, normal, tileX, tileZ, planes);
         counts[run] = normal == 2u || normal == 3u
-                          ? emitHorizontal(planes, *voxels, normal, tileX, tileZ, out.quads, bounds)
-                          : emitSide(planes, *voxels, normal, tileX, tileZ, out.quads, bounds);
+                          ? emitHorizontal(planes, *voxels, normal, tileX, tileZ, quads, bounds)
+                          : emitSide(planes, *voxels, normal, tileX, tileZ, quads, bounds);
       }
       cluster.counts01 = counts[0] | (counts[1] << 16u);
       cluster.counts23 = counts[2] | (counts[3] << 16u);
@@ -509,6 +733,14 @@ void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
       cluster.boundsMax = {minX + TILE, minY + static_cast<float>(faceHigh - faceLow), minZ + TILE, 0.0f};
     }
   }
+}
+
+} // namespace
+
+void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
+  thread_local std::vector<uint64_t> scratch;
+  meshChunkInto(nb, chunkY, out, scratch);
+  out.quads.assign(scratch.begin(), scratch.end());
 }
 
 } // namespace cpuworld

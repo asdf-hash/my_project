@@ -1,16 +1,30 @@
 set_project("engine")
 set_languages("c++20")
-set_toolchains("clang")
+-- Linux: system clang. Windows cross: mingw-w64-gcc (pacman), `xmake f -p mingw -a x86_64`.
+if not is_plat("mingw") then
+    set_toolchains("clang")
+end
 
 add_rules("mode.debug", "mode.release")
 set_defaultmode("release")
--- Release: -O3 explicitly (xmake's default for release, but not on every platform).
+-- -O3 explicitly: not xmake's release default on every platform.
 if is_mode("release") then
     set_optimize("fastest")
+    -- LTO: inlines cpu_world calls (e.g. CpuWorld::isCollidable) across the static lib.
+    set_policy("build.optimization.lto", true)
 end
 
--- lld links much faster than GNU ld (the debug binary is ~10 MB). Swap for "-fuse-ld=mold" if mold is installed.
-add_ldflags("-fuse-ld=lld")
+-- lld links much faster than GNU ld. Not on mingw: GCC LTO objects (GIMPLE) need GNU ld's LTO plugin.
+if not is_plat("mingw") then
+    add_ldflags("-fuse-ld=lld")
+else
+    -- Static libstdc++/libgcc/winpthreads: no mingw DLLs needed next to the .exe.
+    add_ldflags("-static")
+    -- Workaround for GCC bug 54412: Win64 stacks are only 16-byte aligned, yet GCC emits aligned 32-byte AVX moves
+    -- for stack locals. The assembler rewrites them as unaligned; also on the link line, where LTO generates code.
+    add_cxflags("-Wa,-muse-unaligned-vector-move", {force = true})
+    add_ldflags("-Wa,-muse-unaligned-vector-move", {force = true})
+end
 
 -- keep build/compile_commands.json fresh for clangd
 add_rules("plugin.compile_commands.autoupdate", {outputdir = "build"})
@@ -26,8 +40,7 @@ rule("slang")
         local outfile = path.join(outdir, path.basename(sourcefile) .. ".spv")
         local incdir = path.directory(sourcefile)
 
-        -- Depend only on the files this shader actually #includes (recursively), so editing
-        -- one .hlsl does not recompile every shader.
+        -- Depend only on this shader's (recursive) #includes, so editing one .hlsl doesn't recompile every shader.
         local deps = {sourcefile}
         local seen = {}
         local function scan(file)
@@ -57,25 +70,47 @@ rule_end()
 -- CPU terrain generation + meshing, shared by the engine and the tests so it is compiled once.
 target("cpu_world")
     set_kind("static")
-    add_files("src/cpu_world.cpp", "src/cpu_mesher.cpp")
+    add_files("src/cpu_world.cpp", "src/cpu_mesher.cpp", "src/cpu_light.cpp")
     -- No FMA contraction in the terrain port: AVX2 and scalar builds then give bit-identical heights.
     add_files("src/terrain_cpu.cpp", {cxflags = "-ffp-contract=off"})
-    -- simd.hpp; without these flags it falls back to scalar lanes. Public so users of the headers match.
-    add_vectorexts("avx2", "fma", {public = true})
-    add_syslinks("pthread", {public = true})
+    -- simd.hpp falls back to scalar lanes without this. Public so users of the headers match.
+    -- x86-64-v3 = AVX2 + FMA + BMI1/2 + LZCNT (tzcnt/blsr in the mesher bit loops): Haswell or newer.
+    add_cxflags("-march=x86-64-v3", {public = true, force = true})
+    if not is_plat("mingw") then
+        add_syslinks("pthread", {public = true})
+    end
 
 target("engine")
     set_kind("binary")
     add_deps("cpu_world")
     add_files("src/main.cpp", "src/renderer.cpp", "src/camera.cpp", "src/block_registry.cpp", "src/player.cpp",
               "src/stb_image_impl.cpp")
-    -- vulkan.hpp/glm/glfw parsed once instead of on every renderer.cpp edit (~5 s of its compile time).
+    -- vulkan.hpp/glm/glfw parsed once, not on every renderer.cpp edit (~5 s).
     set_pcxxheader("src/pch.hpp")
     add_rules("slang")
     add_files("src/shaders/*.slang")
 
-    -- system libraries from pacman (glfw, vulkan-icd-loader); glm/stb/vulkan-hpp are header-only in /usr/include
-    add_links("glfw", "vulkan")
+    -- Linux: pacman glfw, glm, stb, vulkan-headers in /usr/include.
+    -- mingw: AUR mingw-w64-glfw + pacman mingw-w64-vulkan-headers. Header-only glm and stb have no mingw package, so
+    -- they are symlinked into their own include dir (adding /usr/include would pull in Linux libc headers).
+    -- raii::Context loads the Vulkan loader at runtime, so no -lvulkan.
+    if not is_plat("mingw") then
+        add_links("glfw")
+    else
+        add_links("glfw3")
+        add_syslinks("gdi32")
+        on_config(function (target)
+            local dir = path.join(os.projectdir(), "build", "mingw-include")
+            for _, name in ipairs({"glm", "stb"}) do
+                local link = path.join(dir, name)
+                if not os.exists(link) then
+                    os.mkdir(dir)
+                    os.ln(path.join("/usr/include", name), link)
+                end
+            end
+            target:add("sysincludedirs", dir)
+        end)
+    end
     add_defines(
         "VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1",
         "VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1",

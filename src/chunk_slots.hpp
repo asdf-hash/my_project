@@ -1,14 +1,11 @@
 #pragma once
 
-// Persistent GPU slots for incremental remeshing. Each visible column (horizontal chunk) keeps one column slot (its
-// heights, coordinates and neighbor LODs) for as long as it stays in the clipmap with the same LOD and neighbor LODs.
-// A clipmap change then only regenerates the columns that are new and retires the ones that left, instead of
-// remeshing the whole world. The work slots of a column's vertical chunks (16 QuadClusters each) are picked and
-// allocated on the GPU from its heights (allocateWork / retireWork in chunk_compute.slang).
+// Persistent GPU slots for incremental remeshing. A visible column keeps its column slot while its LOD and neighbor
+// LODs stay the same, so a clipmap change only generates new columns and retires departed ones. Per-chunk work slots
+// are allocated on the GPU (allocateWork / retireWork in chunk_compute.slang).
 
 #include "world.hpp"
 
-#include <array>
 #include <cstdint>
 #include <functional>
 #include <iterator>
@@ -21,11 +18,12 @@
 // Lowest-free-first slot allocator, so live slots stay packed near 0 and the task shader can walk [0, highWater).
 class SlotAllocator {
 public:
+  /** Take the lowest free slot, or grow the high-water mark. */
   uint32_t allocate() {
     while (!free_.empty()) {
       const uint32_t slot = free_.top();
       free_.pop();
-      if (slot < highWater_ && !used_[slot]) { // skip stale entries (above highWater, or reused since)
+      if (slot < highWater_ && !used_[slot]) { // skip stale entries (above highWater_, or reused since)
         used_[slot] = true;
         return slot;
       }
@@ -38,6 +36,7 @@ public:
     return slot;
   }
 
+  /** Free `slot` and lower the high-water mark past any trailing free slots. */
   void release(uint32_t slot) {
     used_[slot] = false;
     free_.push(slot);
@@ -46,18 +45,19 @@ public:
     }
   }
 
+  /** Free every slot. */
   void reset() {
     used_.clear();
     free_ = {};
     highWater_ = 0;
   }
 
-  // One past the highest slot in use.
+  /** One past the highest slot in use. */
   uint32_t highWater() const { return highWater_; }
 
 private:
   std::vector<bool> used_;
-  std::priority_queue<uint32_t, std::vector<uint32_t>, std::greater<>> free_;
+  std::priority_queue<uint32_t, std::vector<uint32_t>, std::greater<>> free_; // min-heap; may hold stale entries
   uint32_t highWater_ = 0;
 };
 
@@ -67,6 +67,11 @@ class RangeAllocator {
 public:
   explicit RangeAllocator(uint32_t capacity) : capacity_(capacity) { free_.emplace(0u, capacity); }
 
+  /**
+   * Allocate `size` elements from the first free range large enough.
+   *
+   * @return offset of the range (0 for size 0), or nullopt if no free range fits.
+   */
   std::optional<uint32_t> allocate(uint32_t size) {
     if (size == 0u) {
       return 0u;
@@ -86,6 +91,7 @@ public:
     return std::nullopt;
   }
 
+  /** Return [offset, offset + size) to the free list, merging it with adjacent free ranges. */
   void release(uint32_t offset, uint32_t size) {
     if (size == 0u) {
       return;
@@ -106,7 +112,7 @@ public:
     free_.emplace(offset, size);
   }
 
-  // One past the highest allocated element.
+  /** One past the highest allocated element. */
   uint32_t highWater() const {
     if (free_.empty()) {
       return capacity_;
@@ -129,7 +135,14 @@ struct ChunkRemeshPlan {
 
 class ChunkSlotTable {
 public:
-  // Moves the slots to `chunks` / `neighborLods` (a ClipmapResult) and returns the GPU work for that.
+  /**
+   * Move the column slots to a new clipmap.
+   *
+   * @param chunks Columns of a ClipmapResult.
+   * @param neighborLods Packed neighbor LODs per entry of `chunks` (ClipmapResult::neighborLods).
+   * @param fullRebuild Drop every slot first and treat all columns as new.
+   * @return the GPU work (retired and new column slots) for the change.
+   */
   ChunkRemeshPlan update(const std::vector<world::ChunkLod> &chunks, const std::vector<uint32_t> &neighborLods,
                          bool fullRebuild) {
     ChunkRemeshPlan plan;
@@ -179,11 +192,12 @@ public:
     return plan;
   }
 
-  // Indexed by column slot; entries at or past columnSlotCount() and of freed slots are stale.
+  /** Coordinates by column slot; entries at or past columnSlotCount() and of freed slots are stale. */
   const std::vector<world::ChunkLod> &slotCoords() const { return slotCoords_; }
+  /** Packed neighbor LODs by column slot; stale like slotCoords(). */
   const std::vector<uint32_t> &slotNeighborLods() const { return slotNeighborLods_; }
+  /** One past the highest column slot in use. */
   uint32_t columnSlotCount() const { return columnSlots_.highWater(); }
-  size_t liveColumns() const { return columns_.size(); }
 
 private:
   struct ColumnKey {
@@ -201,9 +215,10 @@ private:
   };
   struct ColumnEntry {
     uint32_t columnSlot = 0;
-    bool seen = false;
+    bool seen = false; // present in the clipmap being applied
   };
 
+  /** Slot-table key of a clipmap column. */
   static ColumnKey keyOf(const world::ChunkLod &chunk, uint32_t neighborLods) {
     return {chunk.x, chunk.z, chunk.lod, neighborLods};
   }

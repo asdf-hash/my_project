@@ -1,21 +1,9 @@
 #include "vegetation_shared.hlsl"
 
-// Terrain height field modeled on the Big Globe mod's V6 overworld ("river mountains"), without its rivers.
-// Sea level y = 0.
-//
-//   elevation     value noise (lattice values +-1, smootherstep), wavelengths 4096..256, +-253: continents and
-//                 ocean basins. Shaped by baseProfile: land into wide plains, ocean into shelf / slope / abyss
-//   hills         4 Perlin octaves of rolling hills on land, faded out at beaches
-//   land floor    where the continent layer (the elevation's 4096 wavelength) says land, the surface is smoothly
-//                 floored at y = 1, so inland basins, gullies and hills never dip below sea level
-//   mountains     grouped into ranges. A gradient-noise field r has long winding zero lines; each is a range
-//                 spine, with mountains in a belt around it and lower foothills to either side. A regional mask
-//                 leaves wide areas with no ranges, and a second noise varies peaks and passes along a range
-//   erosion       gullies: sine waves aligned downhill (wavelengths 512..4, amplitude proportional to
-//                 wavelength, up to 128 blocks), strongest on mountains. Each octave bends the slope seen by the
-//                 next and fades itself out on crests, which makes the gullies branch.
-//
-// Layers shorter than two voxels at the requested LOD scale are skipped, so coarse chunks are cheaper.
+// Terrain height field after Big Globe's V6 overworld, without rivers; sea level y = 0. Layers: continental
+// elevation (value noise) shaped by baseProfile, Perlin hills, a land floor at y = 1, mountain ranges along the zero
+// lines of a noise field r, and branching downhill gully erosion. Also compiled as C++ by terrain_cpu.cpp: keep it
+// bit-exact with the CPU port. Layers shorter than two voxels at the LOD scale are skipped.
 // Output stays within [kMinTerrainHeight, kMaxTerrainHeight] in world.hpp.
 
 static const float TERRAIN_MIN_HEIGHT = -400.0f;
@@ -33,9 +21,8 @@ static const float PEAK_WAVELENGTH = 1800.0f;    // peaks and passes along a ran
 static const float PLAINS_HEIGHT = 70.0f;
 static const float PLAINS_SCALE = 180.0f;
 
-// Raw elevation is shifted up by this much so land covers about two thirds of the world. The extra term lifts the
-// coast by BEACH_LIFT blocks (land rises PLAINS_HEIGHT / PLAINS_SCALE blocks per unit of elevation at the coast),
-// so beaches sit above sea level; inland plains level off as before.
+// Raw elevation shift: land covers about two thirds of the world, and the extra term lifts the coast BEACH_LIFT
+// blocks (land rises PLAINS_HEIGHT / PLAINS_SCALE per unit of elevation there) so beaches sit above sea level.
 static const float BEACH_LIFT = 2.0f;
 static const float ELEVATION_BIAS = 35.0f + BEACH_LIFT * PLAINS_SCALE / PLAINS_HEIGHT;
 
@@ -52,9 +39,8 @@ static const float SLOPE_EXTENT = 40.0f; // continental slope: steep drop of SLO
 static const float SLOPE_DEPTH = 200.0f;
 static const float ABYSS_DEPTH = 40.0f; // abyssal plain: deepens by this much over the rest of the range
 
-// Land never dips below sea level: only the coarsest elevation layer (the continent, wavelength 4096) decides land vs
-// ocean, and where it says land the surface is smoothly floored at LAND_FLOOR. The floor fades in over COAST_BAND
-// units of continent elevation, on the land side of the coast, so sea level dips only remain right at the coast.
+// Where the continent layer (wavelength 4096) says land, the surface is smoothly floored at LAND_FLOOR, faded in
+// over COAST_BAND units of continent elevation inland of the coast.
 static const float LAND_FLOOR = 1.0f;
 static const float LAND_FLOOR_SMOOTHING = 4.0f; // blocks over which the floor blends into the surface above it
 static const float COAST_BAND = 24.0f;
@@ -74,14 +60,19 @@ static const uint SEED_LAYER_STEP = 0x9e3779b9u;
 
 static const float TAU = 6.28318530718f;
 
-// Deterministic sin/cos and tanh. Hardware transcendentals differ between GPU vendors and from the CPU port
-// (terrain_cpu.cpp), which evaluates these exact polynomials, so both sides agree on terrain heights to a few ulp.
+// Deterministic polynomial transcendentals: hardware sin/cos/exp differ across GPU vendors and from the CPU.
 // Must match sinCosPoly / tanhPoly in terrain_cpu.cpp.
 static const float PIO2_1 = 1.5703125f;
 static const float PIO2_2 = 4.837512969970703125e-4f;
 static const float PIO2_3 = 7.54978995489188216e-8f;
 static const float TWO_OVER_PI = 0.636619772367581343f;
 
+/**
+ * Sine and cosine via Cody-Waite reduction to [-pi/4, pi/4] and minimax polynomials.
+ *
+ * @param s Receives sin(x).
+ * @param c Receives cos(x).
+ */
 void sinCosPoly(float x, out float s, out float c) {
   const float q = floor(x * TWO_OVER_PI + 0.5f);
   const float r = ((x - q * PIO2_1) - q * PIO2_2) - q * PIO2_3; // |r| <= pi/4
@@ -99,6 +90,11 @@ void sinCosPoly(float x, out float s, out float c) {
   }
 }
 
+/**
+ * Polynomial exp(x), with x clamped to [-87, 87].
+ *
+ * @return e^x.
+ */
 float expPoly(float x) {
   x = clamp(x, -87.0f, 87.0f);
   const float n = floor(x * 1.44269504088896341f + 0.5f);
@@ -110,6 +106,11 @@ float expPoly(float x) {
   return p * asfloat(uint(int(n) + 127) << 23u);
 }
 
+/**
+ * Polynomial tanh(x): direct odd polynomial below |x| = 0.625, else 1 - 2 / (e^2|x| + 1).
+ *
+ * @return tanh(x).
+ */
 float tanhPoly(float x) {
   const float a = abs(x);
   float t;
@@ -122,10 +123,21 @@ float tanhPoly(float x) {
   return x < 0.0f ? -t : t;
 }
 
-// hashCell lives in vegetation_shared.hlsl (shared with the CPU tree placement); the SIMD twin is in terrain_cpu.cpp.
+/**
+ * Lattice value of binaryNoise at a cell: +1 or -1 from hashCell (vegetation_shared.hlsl; SIMD twin in
+ * terrain_cpu.cpp).
+ *
+ * @return +1.0 or -1.0.
+ */
 float latticeSign(int2 cell, uint seed) { return (hashCell(cell, seed) & 1u) != 0u ? 1.0f : -1.0f; }
 
-// Value noise with lattice values +-1 and smootherstep interpolation: (value, d/dx, d/dz) in world units.
+/**
+ * Value noise with lattice values +-1 and smootherstep interpolation.
+ *
+ * @param worldPos World-space (x, z), in blocks.
+ * @param wavelength Lattice spacing, in blocks.
+ * @return (value, d/dx, d/dz), derivatives in world units.
+ */
 float3 binaryNoise(float2 worldPos, float wavelength, uint seed) {
   const float2 g = worldPos / wavelength;
   const float2 cellFloor = floor(g);
@@ -142,8 +154,15 @@ float3 binaryNoise(float2 worldPos, float wavelength, uint seed) {
                 du.y * ((c - a) + k * u.x) / wavelength);
 }
 
-// Sum of binaryNoise layers: wavelength halves and amplitude scales by 0.4 per layer. Layers shorter than two
-// voxels are skipped (the first always runs). firstLayer receives the first layer's value alone.
+/**
+ * Sum of binaryNoise layers; wavelength halves and amplitude scales by 0.4 per layer.
+ *
+ * @param wavelength First layer's wavelength, in blocks.
+ * @param amplitude First layer's amplitude.
+ * @param lodScale Voxel size in blocks; layers shorter than two voxels are skipped (the first always runs).
+ * @param firstLayer Receives the first layer's value alone.
+ * @return (value, d/dx, d/dz).
+ */
 float3 layeredNoise(float2 worldPos, float wavelength, float amplitude, uint layers, uint seed, int lodScale,
                     out float firstLayer) {
   const float minWavelength = 2.0f * float(lodScale);
@@ -164,7 +183,13 @@ float3 layeredNoise(float2 worldPos, float wavelength, float amplitude, uint lay
   return sum;
 }
 
-// 2D Perlin noise with derivative: (value in about [-1, 1], d/dx, d/dz) in world units.
+/**
+ * 2D Perlin noise with derivative.
+ *
+ * @param worldPos World-space (x, z), in blocks.
+ * @param wavelength Lattice spacing, in blocks.
+ * @return (value in about [-1, 1], d/dx, d/dz), derivatives in world units.
+ */
 float3 perlinNoise(float2 worldPos, float wavelength, uint seed) {
   static const float2 GRADIENTS[8] = { float2(1.0f, 0.0f),        float2(-1.0f, 0.0f),       float2(0.0f, 1.0f),
                                        float2(0.0f, -1.0f),       float2(0.7071f, 0.7071f),  float2(-0.7071f, 0.7071f),
@@ -190,8 +215,13 @@ float3 perlinNoise(float2 worldPos, float wavelength, uint seed) {
   return float3(value, gradient / wavelength) * 1.4142f;
 }
 
-// Perlin fbm (amplitude halves per octave) normalized to about [-1, 1], with derivative. Octaves shorter than two
-// voxels are skipped (the first always runs).
+/**
+ * Perlin fbm (amplitude halves per octave), normalized to about [-1, 1].
+ *
+ * @param wavelength First octave's wavelength, in blocks.
+ * @param lodScale Voxel size in blocks; octaves shorter than two voxels are skipped (the first always runs).
+ * @return (value, d/dx, d/dz).
+ */
 float3 perlinFbm(float2 worldPos, float wavelength, uint octaves, uint seed, int lodScale) {
   const float minWavelength = 2.0f * float(lodScale);
   float3 sum = 0.0f;
@@ -209,7 +239,17 @@ float3 perlinFbm(float2 worldPos, float wavelength, uint octaves, uint seed, int
   return sum / totalAmplitude;
 }
 
-// Gully erosion on top of height y with gradient grad, faded in by amplitude.
+/**
+ * Gully erosion: sine waves aligned downhill, wavelengths EROSION_MAX_WAVELENGTH down to two voxels. Each octave
+ * bends the slope seen by the next and fades out on crests, so gullies branch.
+ *
+ * @param p World-space (x, z), in blocks.
+ * @param y Height before erosion.
+ * @param grad Slope (d/dx, d/dz) of y that orients the gullies.
+ * @param amplitude Largest octave's amplitude, in blocks.
+ * @param lodScale Voxel size, in blocks.
+ * @return the eroded height.
+ */
 float erode(float2 p, float y, float2 grad, float amplitude, int lodScale) {
   float mask = 1.0f - 1.0f / (dot(grad, grad) * 2.0f + 1.0f);
   const float minWavelength = max(EROSION_MIN_WAVELENGTH, 2.0f * float(lodScale));
@@ -248,19 +288,23 @@ float erode(float2 p, float y, float2 grad, float amplitude, int lodScale) {
   return y;
 }
 
-// smoothstep and its derivative with respect to x: (value, d/dx).
+/**
+ * smoothstep and its derivative with respect to x.
+ *
+ * @return (value, d/dx).
+ */
 float2 smoothstepD(float edge0, float edge1, float x) {
   const float t = saturate((x - edge0) / (edge1 - edge0));
   return float2(t * t * (3.0f - 2.0f * t), 6.0f * t * (1.0f - t) / (edge1 - edge0));
 }
 
-// Base height from raw elevation e: (height, d height / d e, steering slope). The steering slope is d height / d e
-// without the continental-slope and abyss terms; see sampleTerrainHeight.
-//   land   compressed into wide, gently rolling plains that level off near PLAINS_HEIGHT
-//   ocean  stepped like real sea floors: drops off at the beach, levels into a near-flat continental shelf, falls
-//          down a steep continental slope, then a flat abyssal plain that deepens only slightly
-// The slope must be continuous everywhere (C1): erosion aligns its gullies with the slope, so a kink in the slope
-// becomes a cliff-like fault in the eroded surface.
+/**
+ * Base height from raw elevation: land compressed into plains leveling off near PLAINS_HEIGHT; ocean as shelf,
+ * steep continental slope, then abyssal plain. Must stay C1: erosion follows the slope, so a kink becomes a fault.
+ *
+ * @param e Raw elevation (ELEVATION_BIAS applied); >= 0 is land.
+ * @return (height, d height / d e, steering slope = d height / d e without the continental-slope and abyss terms).
+ */
 float3 baseProfile(float e) {
   static const float COAST_SLOPE = PLAINS_HEIGHT / PLAINS_SCALE; // land's d height / d e at the coast
   if (e >= 0.0f) {
@@ -283,7 +327,13 @@ float3 baseProfile(float e) {
   return float3(-depth, dDepth, dShelf); // d(-depth)/de = d depth / d depthIn
 }
 
-// Mountain-range height and its gradient: (height, d/dx, d/dz).
+/**
+ * Mountain ranges: a belt plus foothills around the zero lines of noise r, masked by region, varied by peak noise.
+ *
+ * @param p World-space (x, z), in blocks.
+ * @param lodScale Voxel size, in blocks.
+ * @return (height, d/dx, d/dz).
+ */
 float3 mountainRanges(float2 p, int lodScale) {
   const float3 regionNoise = perlinFbm(p, REGION_WAVELENGTH, 2u, SEED_RANGE_REGIONS, lodScale);
   const float2 region = smoothstepD(-0.3f, 0.1f, regionNoise.x);
@@ -304,8 +354,7 @@ float3 mountainRanges(float2 p, int lodScale) {
 
   // Peaks and passes along the range.
   const float3 peakNoise = perlinFbm(p, PEAK_WAVELENGTH, 3u, SEED_PEAKS, lodScale);
-  // Smooth (C1) ramp from passes (0) to full peaks (1); a hard clamp would kink the slope and erosion would turn
-  // the kink into a fault.
+  // C1 ramp from passes (0) to peaks (1); a hard clamp would kink the slope into an erosion fault.
   const float2 peakRamp = smoothstepD(-1.1f, 0.6f, peakNoise.x);
   const float peaks = peakRamp.x;
   const float dPeaks = peakRamp.y;
@@ -317,8 +366,15 @@ float3 mountainRanges(float2 p, int lodScale) {
   return float3(height, gradient);
 }
 
-// World-space surface height at (worldX, worldZ). lodScale is the voxel size of the chunk being generated.
-float sampleTerrainHeight(int worldX, int worldZ, int lodScale) {
+/**
+ * World-space surface height at a block column.
+ *
+ * @param lodScale Voxel size of the chunk being generated, in blocks.
+ * @param grad Receives the pre-erosion steering slope (d/dx, d/dz). Approximate (no erosion, sea-floor slope terms,
+ *        land floor or clamp) and float, so only for GPU-only decisions (coarse tree LODs).
+ * @return surface height, clamped to [TERRAIN_MIN_HEIGHT, TERRAIN_MAX_HEIGHT].
+ */
+float sampleTerrainHeightGrad(int worldX, int worldZ, int lodScale, out float2 grad) {
   const float2 p = float2(float(worldX), float(worldZ));
 
   float continentLayer;
@@ -331,14 +387,16 @@ float sampleTerrainHeight(int worldX, int worldZ, int lodScale) {
   const float hills = HILL_HEIGHT * shore.x * hillNoise.x;
 
   const float height = base.x + hills + mountains.x;
-  // Slope that steers erosion. Erosion turns any sharp change in slope direction into a cliff-like fault, so this
-  // leaves out the continental-slope and abyss terms of the sea floor (base.z), whose slope changes over a few
-  // blocks. Erosion only acts on mountains, which take their direction from their own slope.
+  // Erosion's steering slope: uses base.z (no continental-slope / abyss terms), whose sharp slope changes would
+  // become erosion faults.
   const float2 gradHeight = base.z * elevation.yz + mountains.yz +
                             HILL_HEIGHT * (shore.x * hillNoise.yz + hillNoise.x * shore.y * base.z * elevation.yz);
 
+  grad = gradHeight;
+
   const float erosionAmplitude = EROSION_AMPLITUDE * saturate(mountains.x / MOUNTAIN_HEIGHT * 3.0f);
-  const float eroded = erode(p, height, gradHeight, erosionAmplitude, lodScale);
+  // Zero amplitude leaves the height unchanged; skip the octaves (terrain_cpu.cpp does the same).
+  const float eroded = erosionAmplitude > 0.0f ? erode(p, height, gradHeight, erosionAmplitude, lodScale) : height;
 
   // Land floor: polynomial smooth max with LAND_FLOOR, faded in from the coast inland.
   const float landWeight = smoothstepD(0.0f, COAST_BAND, continentLayer + ELEVATION_BIAS).x;
@@ -347,4 +405,10 @@ float sampleTerrainHeight(int worldX, int worldZ, int lodScale) {
   const float surface = floored * landWeight + eroded * (1.0f - landWeight); // exact floor where landWeight = 1
 
   return clamp(surface, TERRAIN_MIN_HEIGHT, TERRAIN_MAX_HEIGHT);
+}
+
+/** sampleTerrainHeightGrad without the slope output. */
+float sampleTerrainHeight(int worldX, int worldZ, int lodScale) {
+  float2 grad;
+  return sampleTerrainHeightGrad(worldX, worldZ, lodScale, grad);
 }

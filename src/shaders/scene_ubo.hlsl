@@ -6,8 +6,8 @@ struct UniformBuffer {
   float4x4 mvp;
   float4x4 previousMvp;
   float2 renderSize;
-  uint clusterCount; // unused: each draw pushes its own cluster count (task.slang drawParams)
-  uint historyValid;
+  uint contourMode; // 1: elevation view (H): height color ramp, 4-block bands, lines every 16 blocks
+  float farTintStart; // camera distance where far_tint starts fading in (the LOD 2 distance); full at 4x it
   float lodAoLighteningPerLevel;
   float nearPlane; // projection planes (reverse-Z: depth 1 at near, 0 at far), for view depth from the depth buffer
   float farPlane;

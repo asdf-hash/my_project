@@ -9,8 +9,7 @@ static const uint VERTEX_QUADS_PER_INSTANCE = 16384u;
 // world::kMinTerrainHeight / kMaxTerrainHeight.
 static const int MIN_TERRAIN_HEIGHT = -400;
 static const int MAX_TERRAIN_HEIGHT = 1100;
-// Ocean surface (world::kSeaLevel): empty cells below it are ocean. The GPU clipmap draws only the surface: one +Y
-// quad on the cell below sea level, into the translucent WaterClusters.
+// world::kSeaLevel. The GPU clipmap draws only the ocean surface: one +Y quad per column into WaterClusters.
 static const int SEA_LEVEL = 0;
 // Most vertical chunks one column can need (LOD 0 over the whole envelope): world::kMaxColumnChunks.
 static const uint MAX_COLUMN_CHUNKS = 48u;
@@ -31,21 +30,18 @@ static const uint WORK_POOL_COMPACT_ARGS = 8u; // compactQuads: (16 clusters, wo
 static const uint WORK_POOL_MOVERS = 11u;      // live slots at or above the live count
 static const uint WORK_POOL_TASK_ARGS = 12u;   // drawMeshTasksIndirectEXT over the GPU clipmap's clusters
 
-// sand up to 2 blocks above sea level (beaches), grass to 320, stone to 600, snow above (Big Globe-scale
-// mountains reach ~1000).
+// Layer tops: sand to 2 (beaches), grass to 320, stone to 600, snow above.
 static const int TRANSITION_HEIGHTS[3] = { 2, 320, 600 };
 static const int heightCount = TRANSITION_HEIGHTS.getCount();
-// Each column shifts every boundary by up to this many blocks (transitionDither), so layers meet in ragged,
-// speckled bands instead of flat contour lines. The beach boundary is not dithered: a clean line at sea level.
+// Per-column boundary shift in blocks (transitionDither) for ragged layer bands; the beach line is not dithered.
 static const float TRANSITION_DITHER[3] = { 0.0f, 40.0f, 40.0f };
 static const float DITHER_WAVELENGTH = 160.0f;
 // Blocks of filler (dirt under grass) between a column's top block and its deep block (stone).
 static const int FILLER_DEPTH = 3;
 static const uint SEED_DITHER = 0x4cf5ad43u;
 static const uint SEED_DITHER_WHITE = 0x2545f491u;
-// Edges whose neighbor columns are meshed on the CPU (world::kNeighborCpuFlag in ChunkNeighborLods) floor their
-// border heights from (height - CPU_SEAM_BIAS), as the CPU does across the same seam (world::kCpuSeamBias): the two
-// noise implementations may differ by a few ulp, and this way that can only lengthen a hidden seam wall.
+// Edges next to CPU-meshed columns (world::kNeighborCpuFlag) floor border heights from height - CPU_SEAM_BIAS
+// (world::kCpuSeamBias), so ulp differences between the noise ports can only lengthen a hidden seam wall.
 static const uint NEIGHBOR_CPU_FLAG = 0x8u;
 static const float CPU_SEAM_BIAS = 0.02f;
 
@@ -68,19 +64,23 @@ struct DispatchParams {
 // Heights for one 8x8 meshColumns group plus a 1-column border (AO and neighbor faces reach +-1).
 static const uint TILE_SIZE = 10u;
 static const int NO_MATERIAL_HEIGHT = int(0x80000000u);
+// Bit 9 of a block ID marks a non-opaque block (blocks::kNonOpaqueBit), drawn in the alpha cutout pass.
+static const uint NON_OPAQUE_BLOCK_BIT = 0x200u;
 
-// Prefix-sum total per wave (up to 8 waves of 8+ lanes) and direction pair.
+// Prefix-sum total per wave (up to 8 waves of 8+ lanes) and packed direction pair.
 groupshared uint scanValues[8u * 3u];
 // Top face of each column in the group (index lane): height and merge key (see topFaceKey), for greedy merging.
 groupshared int topFaceHeight[64];
 groupshared uint topFaceKey[64];
 // Length of the x-merged top face run starting at each lane (0: none starts there), for merging runs along z.
 groupshared uint topRunLength[64];
-// Lowest face bottom / highest face top of the group's columns (chunk-local cells), for tight cluster bounds.
 groupshared uint waterRunLength[64]; // ocean surface: x-run length at a run's first lane, else 0
 groupshared uint waterFlag[64];      // ocean surface on this lane's column
 groupshared uint waterQuadCount;
 groupshared uint waterOutputBase;
+// Any lane emitted tree faces (sets the cluster's cutout flag when a tree block is non-opaque).
+groupshared uint groupHasTreeFaces;
+// Lowest face bottom / highest face top of the group's columns (chunk-local cells), for tight cluster bounds.
 groupshared int tileFaceLow;
 groupshared int tileFaceHigh;
 groupshared uint groupOutputBase;
@@ -88,6 +88,13 @@ groupshared int heightTile[TILE_SIZE * TILE_SIZE];
 // Trees over each column of the group (index lane), in this LOD's cells (see computeTreeColumn): log cells
 // [treeLogLo, treeLogHi), leaf cells treeLeafBase + i for each bit i of treeLeafMask.
 groupshared int treeLogLo[64];
+// LOD 0-3: the tree slots of the regions the tile covers (stageTreeSlots; treeSlotHeight 0 = no tree). Ground: LOD 0
+// the trunk column's height, LOD 1-2 its coarse column's height in cells.
+groupshared int treeSlotTrunkX[64];
+groupshared int treeSlotTrunkZ[64];
+groupshared int treeSlotGround[64];
+groupshared int treeSlotHeight[64];
+groupshared uint treeSlotShape[64];
 groupshared int treeLogHi[64];
 groupshared int treeLeafBase[64];
 groupshared uint treeLeafMask[64];
@@ -160,46 +167,85 @@ RWStructuredBuffer<uint> RelocationScratch;
 // pass. Their quads live in QuadBuffer like any other cluster's.
 [[vk::binding(18, 0)]]
 RWStructuredBuffer<QuadCluster> WaterClusters;
-// Downsampled trees for LOD 1-2 (vegetation.hpp buildTreeLodTable), read by computeTreeColumn.
-[[vk::binding(19, 0)]]
-StructuredBuffer<uint> TreeLodTable;
 
+/**
+ * HeightBuffer index of a padded cell.
+ *
+ * @param x Padded column-local x (0 = the -X border).
+ * @param z Padded column-local z (0 = the -Z border).
+ */
 uint heightIndex(uint columnIndex, uint x, uint z) { return columnIndex * HEIGHTS_PER_CHUNK + z * HEIGHT_STRIDE + x; }
 
+/**
+ * Stored height at a chunk-local cell (-1..32 reaches the border), in this LOD's cells.
+ */
 int sampleHeight(uint columnIndex, int x, int z) {
   return HeightBuffer[heightIndex(columnIndex, uint(x + 1), uint(z + 1))];
 }
 
-// x/z are chunk-local; tileOrigin is the chunk-local coordinate of heightTile[0].
+/**
+ * Height from the group's staged heightTile.
+ *
+ * @param tileOrigin Chunk-local (x, z) of heightTile[0].
+ * @param x Chunk-local x.
+ * @param z Chunk-local z.
+ */
 int tileHeight(int2 tileOrigin, int x, int z) {
   return heightTile[uint(z - tileOrigin.y) * TILE_SIZE + uint(x - tileOrigin.x)];
 }
 
+/**
+ * Whether a cell is terrain (heightmap columns are solid all the way down).
+ *
+ * @param y Chunk-local cell y.
+ */
 bool isSolidAt(int2 tileOrigin, int x, int y, int z, int chunkY) {
   const int worldY = chunkY * int(CHUNK_SIZE) + y;
   return worldY < tileHeight(tileOrigin, x, z);
 }
 
+/**
+ * Classic voxel vertex AO from the two edge neighbours and the corner.
+ *
+ * @return occlusion 0..3 (two sides alone give 3).
+ */
 uint vertexAo(bool sideA, bool sideB, bool corner) {
   return sideA && sideB ? 3u : uint(sideA) + uint(sideB) + uint(corner);
 }
 
-// Per-column dither in [-1, 1]: a smooth wiggle plus per-column white noise.
+/**
+ * Per-column layer-boundary dither: a smooth wiggle plus white noise.
+ *
+ * @param lodScale Voxel size, in blocks.
+ * @return dither in [-1, 1].
+ */
 float transitionDither(int worldX, int worldZ, int lodScale) {
   const float wiggle = perlinFbm(float2(float(worldX), float(worldZ)), DITHER_WAVELENGTH, 2u, SEED_DITHER, lodScale).x;
   const float speckle = float(hashCell(int2(worldX, worldZ), SEED_DITHER_WHITE) >> 8u) * (2.0f / 16777216.0f) - 1.0f;
   return clamp(0.65f * wiggle + 0.35f * speckle, -1.0f, 1.0f);
 }
 
+/** Dithered world height of layer boundary i. */
 int transitionHeight(uint i, float dither) { return TRANSITION_HEIGHTS[i] + int(round(dither * TRANSITION_DITHER[i])); }
 
-// Depth in blocks of a cell's top block below the column's top block. A coarse-LOD cell spans `scale` blocks; using
-// its top block (not its bottom) gives the same grass / dirt / stone bands as full detail.
+/**
+ * Depth of a cell's top block below the column's top block. Using the cell's top block (not its bottom) keeps
+ * coarse LODs' grass / dirt / stone bands the same as full detail.
+ *
+ * @param cellsBelowTop Cells between this cell and the column's top cell.
+ * @param scale Voxel size, in blocks.
+ * @return depth in blocks.
+ */
 int cellDepthBelowTop(int cellsBelowTop, int scale) {
   return cellsBelowTop == 0 ? 0 : (cellsBelowTop - 1) * scale + 1;
 }
 
-// depthBelowTop: blocks between this block and the column's top block (0 = the top block itself).
+/**
+ * Terrain block for a world height: the layer's top, filler or deep block.
+ *
+ * @param depthBelowTop Blocks between this block and the column's top block (0 = the top block itself).
+ * @return block ID.
+ */
 uint selectBlockType(int worldY, float dither, int depthBelowTop) {
   uint layerId = 0;
   [unroll]
@@ -214,6 +260,11 @@ uint selectBlockType(int worldY, float dither, int depthBelowTop) {
   return depthBelowTop <= FILLER_DEPTH ? dispatchParams.layerFillerBlocks[layer] : dispatchParams.layerDeepBlocks[layer];
 }
 
+/**
+ * Whether a block lies within one voxel of a dithered layer boundary (its material needs the exact surface height).
+ *
+ * @param scale Voxel size, in blocks.
+ */
 bool isNearLayerTransition(int blockWorldY, int scale, float dither) {
   bool nearTransition = false;
   [unroll]
@@ -224,16 +275,24 @@ bool isNearLayerTransition(int blockWorldY, int scale, float dither) {
   return nearTransition;
 }
 
+/** calculateAoWith over terrain only. */
 uint calculateAo(int2 tileOrigin, int x, int y, int z, int chunkY, uint normalIndex) {
   return calculateAoWith(tileOrigin, x, y, z, chunkY, normalIndex, false);
 }
 
-// Opaque for AO: terrain, plus opaque tree blocks when includeTrees (as on the CPU).
+/** Whether a cell occludes for AO: terrain, plus opaque tree blocks when includeTrees (as on the CPU). */
 bool aoOpaqueAt(int2 tileOrigin, int x, int y, int z, int chunkY, bool includeTrees) {
   return isSolidAt(tileOrigin, x, y, z, chunkY) ||
          (includeTrees && treeBlockOpaque(treeBlockAtColumn(tileOrigin, x, chunkY * int(CHUNK_SIZE) + y, z)));
 }
 
+/**
+ * Packed AO of a face's four corners (layout at aoConstantAlongU).
+ *
+ * @param y Chunk-local cell y.
+ * @param normalIndex Face direction 0..5 (+X, -X, +Y, -Y, +Z, -Z).
+ * @return 8 bits, 2 per corner.
+ */
 uint calculateAoWith(int2 tileOrigin, int x, int y, int z, int chunkY, uint normalIndex, bool includeTrees) {
   const int3 uAxes[6] = { int3(0, 0, 1), int3(0, 0, 1), int3(1, 0, 0), int3(1, 0, 0), int3(1, 0, 0), int3(1, 0, 0) };
   const int3 vAxes[6] = { int3(0, 1, 0), int3(0, 1, 0), int3(0, 0, -1), int3(0, 0, 1), int3(0, 1, 0), int3(0, 1, 0) };
@@ -259,8 +318,13 @@ uint calculateAoWith(int2 tileOrigin, int x, int y, int z, int chunkY, uint norm
          (vertexAo(sideU1, sideV1, corner2) << 4u) | (vertexAo(sideU0, sideV1, corner3) << 6u);
 }
 
-// Surface height used to pick materials near layer transitions. It depends only on the column, so it is
-// evaluated at most once per thread. At scale 1 the sample point matches the height buffer exactly.
+/**
+ * Surface height used to pick materials near layer transitions; per column, so evaluated at most once per thread.
+ *
+ * @param cachedHeight Per-thread cache, NO_MATERIAL_HEIGHT until filled.
+ * @param chunkCoord (chunk x, chunk z, LOD, scale).
+ * @return height in blocks (at scale 1, exactly the stored height).
+ */
 int columnMaterialHeight(inout int cachedHeight, int4 chunkCoord, uint x, uint z, int columnHeight) {
   if (cachedHeight == NO_MATERIAL_HEIGHT) {
     const int scale = chunkCoord.w;
@@ -275,6 +339,13 @@ int columnMaterialHeight(inout int cachedHeight, int4 chunkCoord, uint x, uint z
   return cachedHeight;
 }
 
+/**
+ * Block ID of the face at a cell of this column.
+ *
+ * @param worldY World cell y, in this LOD's cells.
+ * @param columnHeight The column's stored height, in cells.
+ * @return block ID.
+ */
 uint faceBlockType(uint x, uint z, int worldY, int4 chunkCoord, int columnHeight, inout int cachedMaterialHeight,
                    float dither) {
   const int scale = chunkCoord.w;
@@ -287,12 +358,21 @@ uint faceBlockType(uint x, uint z, int worldY, int4 chunkCoord, int columnHeight
 
 // AO corners: bits 0-1 (u0,v0), 2-3 (u1,v0), 4-5 (u1,v1), 6-7 (u0,v1). A merged quad interpolates AO over its whole
 // extent, so faces only merge along an axis the AO doesn't vary on (and with identical AO).
+/** Whether packed AO is the same at u0 and u1. */
 bool aoConstantAlongU(uint ao) { return (ao & 3u) == ((ao >> 2u) & 3u) && ((ao >> 6u) & 3u) == ((ao >> 4u) & 3u); }
+/** Whether packed AO is the same at v0 and v1. */
 bool aoConstantAlongV(uint ao) { return (ao & 3u) == ((ao >> 6u) & 3u) && ((ao >> 2u) & 3u) == ((ao >> 4u) & 3u); }
 
-// length: merged cells along the greedy direction, 1..32 (top faces: +x, side faces: +y). width: merged cells across
-// it, 1..8 (top faces: toward -z from the written cell, see faceV; side faces: along the greedy axis). See
-// decodePackedQuad.
+/**
+ * Pack one quad into QuadBuffer / ChunkOffsets (unpacked by decodePackedQuad in quad_decode.hlsl). Dropped past
+ * MAX_QUAD_COUNT.
+ *
+ * @param x Chunk-local cell x (likewise y, z).
+ * @param ao Packed corner AO (8 bits).
+ * @param length Merged cells along the greedy direction, 1..32 (top faces: +x; side faces: +y).
+ * @param width Merged cells across it, 1..8 (top faces: toward -z from the written cell; side faces: greedy axis).
+ * @param chunkCoord (chunk x, chunk z, LOD, scale).
+ */
 void writeQuad(uint outputIndex, uint x, uint y, uint z, uint normalIndex, uint ao, uint blockType, uint length,
                uint width, int chunkY, int4 chunkCoord) {
   if (outputIndex >= MAX_QUAD_COUNT) {
@@ -303,7 +383,9 @@ void writeQuad(uint outputIndex, uint x, uint y, uint z, uint normalIndex, uint 
   packed |= ((length - 1u) & 0x1fu) << 26u;
   // Texture rotation is chosen per cell in fragMain, so merged faces don't share one. Bits 26-28: width - 1.
   const uint lod = uint(chunkCoord.z) & 0x7u;
-  const uint metadata = blockType | (15u << 10u) | (0xfffu << 14u) | (((width - 1u) & 0x7u) << 26u) | (lod << 29u);
+  // Skylight 15 at every corner: heightmap terrain has no overhangs, so every face sees open sky. Once GPU chunks
+  // hold voxels (3D noise, edited LODs), compute real levels with cpu_light.cpp's rules.
+  const uint metadata = blockType | (0xffffu << 10u) | (((width - 1u) & 0x7u) << 26u) | (lod << 29u);
   QuadBuffer[outputIndex] = (uint64_t(metadata) << 32u) | uint64_t(packed);
 
   const int worldX = chunkCoord.x * int(CHUNK_SIZE);
@@ -316,11 +398,9 @@ void writeQuad(uint outputIndex, uint x, uint y, uint z, uint normalIndex, uint 
 }
 
 // ---- Side faces ----
-// Each column's side faces in one direction are merged vertically into runs of equal block type and AO. Runs are
-// then merged across neighbouring columns of the group along the face's greedy axis (z for x faces, x for z faces)
-// when a neighbour has an identical run (same rows, block and AO, AO constant along that axis). Every lane records
-// its first SIDE_RUN_SLOTS runs per direction in shared memory so its neighbours can look them up; runs past that
-// (very tall, varied walls) are never merged across columns.
+// Merged vertically into runs of equal block and AO, then across neighbouring columns along the greedy axis (z for x
+// faces, x for z faces) when the neighbour has an identical run. Only each lane's first SIDE_RUN_SLOTS runs per
+// direction are shared, so runs past that never merge across columns.
 static const uint SIDE_RUN_SLOTS = 4u;
 static const uint SIDE_RUN_VALID = 1u << 28u;
 // [direction][lane][slot]: SIDE_RUN_VALID | first row (chunk-local) | (length - 1) << 5 | block << 10 | AO << 20.
@@ -330,8 +410,10 @@ static const uint SIDE_MODE_RECORD = 0u; // store this lane's run descriptors
 static const uint SIDE_MODE_COUNT = 1u;  // count the quads this lane emits
 static const uint SIDE_MODE_WRITE = 2u;  // write them
 
+/** sideRunDescs index of a lane's run slot. */
 uint sideRunSlot(uint direction, uint lane, uint slot) { return (direction * 64u + lane) * SIDE_RUN_SLOTS + slot; }
 
+/** Whether a lane recorded exactly this run descriptor in any slot. */
 bool laneHasSideRun(uint direction, uint lane, uint desc) {
   bool found = false;
   [unroll]
@@ -347,8 +429,16 @@ struct SideMergeAxis {
   uint laneStep;
 };
 
-// One vertical run (desc) of this column. RECORD stores it; COUNT / WRITE return the quads it emits: 0 when the
-// previous column along the greedy axis has the same run (that column's quad covers it), else 1.
+/**
+ * Handle one vertical run of this column. RECORD stores it; WRITE also writes its quad, widened over identical runs
+ * of the following columns.
+ *
+ * @param mode SIDE_MODE_*.
+ * @param direction Side direction 0..3 (-X, +X, -Z, +Z).
+ * @param runIndex Run index within the column (only the first SIDE_RUN_SLOTS merge).
+ * @param desc Run descriptor (sideRunDesc).
+ * @return quads emitted (COUNT / WRITE): 0 when the previous column along the axis covers it, else 1; 0 for RECORD.
+ */
 uint sideRun(uint mode, uint direction, uint lane, SideMergeAxis axis, uint runIndex, uint desc, uint outputIndex, uint x,
              uint z, uint normalIndex, int chunkY, int4 chunkCoord) {
   if (mode == SIDE_MODE_RECORD) {
@@ -375,13 +465,26 @@ uint sideRun(uint mode, uint direction, uint lane, SideMergeAxis axis, uint runI
   return 1u;
 }
 
+/**
+ * Pack a side run: SIDE_RUN_VALID | first row | (length - 1) << 5 | block << 10 | AO << 20.
+ *
+ * @param runStart First world cell y of the run.
+ * @param runEnd Exclusive last world cell y.
+ * @param chunkBottom World cell y of the chunk's first row.
+ */
 uint sideRunDesc(int runStart, int runEnd, int chunkBottom, uint blockType, uint ao) {
   return SIDE_RUN_VALID | uint(runStart - chunkBottom) | (uint(runEnd - runStart - 1) << 5u) | (blockType << 10u) |
          (ao << 20u);
 }
 
-// Walks one column's side faces in one direction. RECORD returns the number of runs; COUNT / WRITE the quads emitted
-// (written from outputIndex on). Every mode sees identical inputs, so the runs match.
+/**
+ * Walk one column's side faces in one direction, evaluating blocks and AO. Every mode sees identical inputs, so the
+ * runs match across modes.
+ *
+ * @param faceStart First world cell y with a face (the neighbour's height, clamped to the chunk).
+ * @param faceEnd Exclusive last world cell y.
+ * @return RECORD: run count; COUNT / WRITE: quads emitted (written from outputIndex on).
+ */
 uint sideFaceRuns(uint mode, uint direction, uint lane, SideMergeAxis axis, uint outputIndex, int2 tileOrigin, uint x,
                   uint z, uint normalIndex, int faceStart, int faceEnd, int chunkY, int4 chunkCoord, int columnHeight,
                   inout int cachedMaterialHeight, float dither) {
@@ -417,8 +520,12 @@ uint sideFaceRuns(uint mode, uint direction, uint lane, SideMergeAxis axis, uint
   return mode == SIDE_MODE_RECORD ? runs : quads;
 }
 
-// Same as sideFaceRuns in COUNT / WRITE mode, from the descriptors RECORD stored: no block or AO evaluation. Only
-// valid when every run fit in the slots.
+/**
+ * sideFaceRuns in COUNT / WRITE mode from the RECORDed descriptors, skipping block and AO evaluation. Only valid when
+ * every run fit in the slots.
+ *
+ * @return quads emitted.
+ */
 uint recordedSideRuns(uint mode, uint direction, uint lane, SideMergeAxis axis, uint runCount, uint outputIndex, uint x,
                       uint z, uint normalIndex, int chunkY, int4 chunkCoord) {
   uint quads = 0u;
@@ -429,12 +536,19 @@ uint recordedSideRuns(uint mode, uint direction, uint lane, SideMergeAxis axis, 
   return quads;
 }
 
-int floorDivide(int value, int divisor) { // divisor > 0
+/** Integer division rounding toward -infinity; divisor must be > 0. */
+int floorDivide(int value, int divisor) {
   return value >= 0 ? value / divisor : -((-value + divisor - 1) / divisor);
 }
 
-// Top of the column containing (worldX, worldZ) in a tile of the given scale, in blocks: the same sample point
-// (cell origin), noise detail and rounding generateHeights uses for that tile's own columns.
+/**
+ * Top of the column containing a world block in a tile of another scale, computed exactly as generateHeights does
+ * for that tile's own columns (sample point, noise detail, rounding).
+ *
+ * @param scale The tile's voxel size, in blocks.
+ * @param bias Subtracted from the height before rounding (CPU_SEAM_BIAS next to CPU chunks).
+ * @return column top, in blocks.
+ */
 int columnTopBlocks(int worldX, int worldZ, int scale, float bias) {
   const int originX = floorDivide(worldX, scale) * scale;
   const int originZ = floorDivide(worldZ, scale) * scale;
@@ -442,7 +556,13 @@ int columnTopBlocks(int worldX, int worldZ, int scale, float bias) {
   return max(cells, floorDivide(MIN_TERRAIN_HEIGHT, scale)) * scale;
 }
 
-// Stored height (in the tile's cells, clamped to the envelope floor) of padded cell (localX, localZ) of a column.
+/**
+ * Height to store for a padded cell of a column.
+ *
+ * @param localX Padded column-local x (0 and HEIGHT_STRIDE - 1 are borders).
+ * @param localZ Padded column-local z.
+ * @return height in the tile's cells, clamped to the envelope floor.
+ */
 int columnCellHeight(uint columnIndex, uint localX, uint localZ) {
   const int4 chunkCoord = ChunkCoords[columnIndex];
   const int scale = chunkCoord.w;
@@ -450,10 +570,8 @@ int columnCellHeight(uint columnIndex, uint localX, uint localZ) {
   const int worldZ = chunkCoord.y * int(CHUNK_SIZE) + (int(localZ) - 1) * scale;
   const int minimumHeight = floorDivide(MIN_TERRAIN_HEIGHT, scale);
 
-  // Edge border cells (not corners, which only feed AO) stand for the neighbor tile's columns. Across an LOD seam
-  // that tile has another resolution, so sample it there: walls built against this height then reach down to the
-  // neighbor's real surface, and the seam has no gap. With several LODs along the edge the lowest one wins; any
-  // extra wall height ends up hidden inside the neighbor's terrain.
+  // Edge border cells (not corners, which only feed AO) take the lowest neighbour-LOD top along the edge, so seam
+  // walls reach the neighbour's real surface; extra wall height hides inside the neighbour's terrain.
   const bool borderX = localX == 0u || localX == HEIGHT_STRIDE - 1u;
   const bool borderZ = localZ == 0u || localZ == HEIGHT_STRIDE - 1u;
   int cells;
@@ -485,18 +603,10 @@ int columnCellHeight(uint columnIndex, uint localX, uint localZ) {
 }
 
 // ---- Trees (placement shared with the CPU: vegetation_shared.hlsl) ----
-// Each column of a meshColumns group gets a small vertical description of the tree blocks over it (treeLog* /
-// treeLeaf*). Every tree lies inside one 8x8-block cell and every tile is a whole number of cells, so a tile's trees
-// never reach past it: neighbours outside the tile count as no tree (their faces toward it may be drawn twice,
-// hidden behind leaves).
-//
-// LOD 0 (tile == one cell): the exact blocks the CPU stamps (cpu_world.cpp stampTrees), grounded on the trunk column
-// and its neighbours from heightTile.
-// LOD 1-2 (scale 2, 4): the tree downsampled into this LOD's cells (TreeLodTable, see vegetation_shared.hlsl),
-// standing on the trunk column's coarse ground, with the slope check done in coarse cells.
-// LOD 3 (scale 8): the column is one tree cell; filled (one leaf cell on its own ground) for half of the trees
-// (TREE_LOD3_FILL_CHANCE).
-// LOD 4+ (scale 16+): filled with the probability that LOD 3 fills one of the column's cells (treeFarColumn).
+// Each group column gets a TreeColumn (treeLog* / treeLeaf*) from the tile's regions' staged slots. Trees past the
+// tile count as none for the neighbouring tile's faces (drawn twice at worst). LOD 0 matches the CPU's stampTrees
+// exactly (logs win); LOD 1+ see "Coarse LODs" in vegetation_shared.hlsl.
+// Tree cells over one column, in this LOD's cells: logs [logLo, logHi), leaves leafBase + bit i of leafMask.
 struct TreeColumn {
   int logLo;
   int logHi;
@@ -504,125 +614,202 @@ struct TreeColumn {
   uint leafMask;
 };
 
-// LOD 3's rule for one cell: an accepted tree that wins the fill hash.
-bool treeCellFilledAtLod3(int2 cell) {
-  return treeCandidate(cell).trunkHeight != 0 && (hashCell(cell, SEED_TREE_LOD) & 0xffu) < TREE_LOD3_FILL_CHANCE;
+static const int TREE_LEAF_WINDOW = 16; // leaf cells a column can hold above treeLeafBase (overlapping trees)
+
+/**
+ * Union another tree's cells into a column. Leaves that would not fit the TREE_LEAF_WINDOW are dropped.
+ *
+ * @param logLo First log cell (logLo >= logHi: no logs).
+ * @param logHi Exclusive last log cell.
+ * @param leafBase Cell of leafMask's bit 0.
+ */
+void mergeTreeColumn(inout TreeColumn column, int logLo, int logHi, int leafBase, uint leafMask) {
+  if (logLo < logHi) {
+    // Two trunks in one column share its ground, so the union is the taller one.
+    column.logLo = column.logLo < column.logHi ? min(column.logLo, logLo) : logLo;
+    column.logHi = max(column.logHi, logHi);
+  }
+  if (leafMask == 0u) {
+    return;
+  }
+  if (column.leafMask == 0u) {
+    column.leafBase = leafBase;
+    column.leafMask = leafMask;
+    return;
+  }
+  const int base = min(column.leafBase, leafBase);
+  if (column.leafBase - base >= TREE_LEAF_WINDOW || leafBase - base >= TREE_LEAF_WINDOW) {
+    return;
+  }
+  const uint merged = (column.leafMask << uint(column.leafBase - base)) | (leafMask << uint(leafBase - base));
+  if (firstbithigh(merged) < TREE_LEAF_WINDOW) {
+    column.leafBase = base;
+    column.leafMask = merged;
+  }
 }
 
-// LOD 4+: the column at world block (columnX, columnZ) (its low corner) of size scale is filled when its own hash
-// falls below the share of its cells LOD 3 fills, sampled on an evenly spaced grid of at most 4x4 cells.
-bool treeFarColumn(int columnX, int columnZ, int scale) {
-  const int cellsPerSide = scale >> TREE_CELL_SHIFT;
-  const int samples = min(cellsPerSide, TREE_FAR_SAMPLES);
-  const int stride = cellsPerSide / samples;
-  const int2 firstCell = int2(columnX >> TREE_CELL_SHIFT, columnZ >> TREE_CELL_SHIFT);
-  uint filled = 0u;
-  for (int sz = 0; sz < samples; ++sz) {
-    for (int sx = 0; sx < samples; ++sx) {
-      // Middle cell of each stride block, so the sample grid is centred in the column.
-      filled += treeCellFilledAtLod3(firstCell + int2(sx * stride + stride / 2, sz * stride + stride / 2)) ? 1u : 0u;
+/** Tree regions per tile side: 1 up to scale 4 (tile 8 * scale <= 32 blocks), 2 at scale 8. */
+int treeTileRegionsPerSide(int scale) { return max(1, (8 * scale) >> TREE_REGION_SHIFT); }
+
+/**
+ * Fill the treeSlot* arrays for the tile, one lane per slot of its regions (16 or 64); call before the barrier
+ * after height staging. Ground, band and slope come from a full-octave sample at the trunk, so every LOD and the
+ * CPU agree (LOD 0 takes the ground from HeightBuffer, the same value).
+ *
+ * @param tileX Tile index along x within the chunk, 0..3 (likewise tileZ).
+ * @param chunkCoord (chunk x, chunk z, LOD, scale).
+ */
+void stageTreeSlots(uint lane, uint tileX, uint tileZ, uint columnIndex, int4 chunkCoord) {
+  const int scale = chunkCoord.w;
+  const int regionsPerSide = treeTileRegionsPerSide(scale);
+  if (scale > (1 << TREE_CELL_SHIFT) || lane >= uint(regionsPerSide * regionsPerSide * TREE_SLOTS)) {
+    return;
+  }
+  const int originX = chunkCoord.x * int(CHUNK_SIZE);
+  const int originZ = chunkCoord.y * int(CHUNK_SIZE);
+  const int regionIndex = int(lane) / TREE_SLOTS;
+  const int2 region = int2(((originX + int(tileX) * 8 * scale) >> TREE_REGION_SHIFT) + regionIndex % regionsPerSide,
+                           ((originZ + int(tileZ) * 8 * scale) >> TREE_REGION_SHIFT) + regionIndex / regionsPerSide);
+  TreeInstance tree = treeCandidate(region, lane % uint(TREE_SLOTS));
+  if (tree.trunkHeight != 0) {
+    float2 grad;
+    const int exactGround = int(floor(sampleTerrainHeightGrad(tree.trunkX, tree.trunkZ, 1, grad)));
+    tree.ground = scale == 1 ? sampleHeight(columnIndex, tree.trunkX - originX, tree.trunkZ - originZ) : exactGround;
+    if (!treeGroundOk(tree.ground, treeSteepness(grad.x, grad.y), tree.shape)) {
+      tree.trunkHeight = 0;
     }
   }
-  const uint roll = hashCell(int2(floorDivide(columnX, scale), floorDivide(columnZ, scale)), SEED_TREE_LOD ^ uint(scale)) & 0xffu;
-  return roll * uint(samples * samples) < filled * 256u;
+  treeSlotTrunkX[lane] = tree.trunkX;
+  treeSlotTrunkZ[lane] = tree.trunkZ;
+  treeSlotGround[lane] = tree.ground;
+  treeSlotHeight[lane] = tree.trunkHeight;
+  treeSlotShape[lane] = tree.shape;
 }
 
-// Coarse LODs: the height band (TREE_MIN_GROUND .. TREE_MAX_GROUND) checked against the real surface at a world
-// position, like LOD 0, instead of the column's rounded-down cells. Near sea level those round to y = 0 while the top
-// face still shows grass (materials near layer boundaries come from the real height too, columnMaterialHeight), and
-// a check on the cells dropped every tree there. One noise sample: callers run their hash checks first.
-bool treeBandOkAt(int worldX, int worldZ, int scale) {
-  const int ground = int(floor(sampleTerrainHeight(worldX, worldZ, scale))); // first air block, as LOD 0 stores it
-  return ground >= TREE_MIN_GROUND && ground <= TREE_MAX_GROUND;
-}
-
+/**
+ * Tree cells over one column of the group at this LOD: exact blocks at LOD 0, covering canopies at LOD 1-2, one
+ * leaf cell per shown tree at LOD 3+ (LOD 4+ re-derive candidates instead of using the staged slots).
+ *
+ * @param height The column's stored height, in cells.
+ * @return the column's tree cells (empty past TREE_MAX_LOD).
+ */
 TreeColumn computeTreeColumn(int2 tileOrigin, uint x, uint z, int4 chunkCoord, int height) {
   TreeColumn column = { 0, 0, 0, 0u };
   const int scale = chunkCoord.w;
   if (scale > (1 << TREE_MAX_LOD)) {
     return column;
   }
-  const int originX = chunkCoord.x * int(CHUNK_SIZE);
-  const int originZ = chunkCoord.y * int(CHUNK_SIZE);
-  const int centerX = originX + int(x) * scale + scale / 2;
-  const int centerZ = originZ + int(z) * scale + scale / 2;
+  const int columnX = chunkCoord.x * int(CHUNK_SIZE) + int(x) * scale; // the column's low corner, world blocks
+  const int columnZ = chunkCoord.y * int(CHUNK_SIZE) + int(z) * scale;
   if (scale > (1 << TREE_CELL_SHIFT)) {
-    // Wider than a tree cell: one leaf cell on the column's own ground, in the height band.
-    if (!treeFarColumn(originX + int(x) * scale, originZ + int(z) * scale, scale) ||
-        !treeBandOkAt(centerX, centerZ, scale)) {
-      return column;
-    }
-    column.leafBase = height;
-    column.leafMask = 1u;
-    return column;
-  }
-  const int2 cell = int2(centerX >> TREE_CELL_SHIFT, centerZ >> TREE_CELL_SHIFT);
-  TreeInstance tree = treeCandidate(cell);
-  if (tree.trunkHeight == 0) {
-    return column;
-  }
-  const int dx = centerX - tree.trunkX;
-  const int dz = centerZ - tree.trunkZ;
-  if (scale == 1) {
-    if (abs(dx) > TREE_RADIUS || abs(dz) > TREE_RADIUS) {
-      return column;
-    }
-    const int trunkX = tree.trunkX - originX;
-    const int trunkZ = tree.trunkZ - originZ;
-    tree.ground = tileHeight(tileOrigin, trunkX, trunkZ);
-    if (!treeGroundOk(tree.ground, tileHeight(tileOrigin, trunkX - 1, trunkZ), tileHeight(tileOrigin, trunkX + 1, trunkZ),
-                      tileHeight(tileOrigin, trunkX, trunkZ - 1), tileHeight(tileOrigin, trunkX, trunkZ + 1))) {
-      return column;
-    }
-    column.leafBase = tree.ground + tree.trunkHeight - 2;
-    [unroll]
-    for (uint i = 0u; i < 4u; ++i) {
-      if (treeBlockAt(tree, centerX, column.leafBase + int(i), centerZ) == TREE_LEAVES) {
-        column.leafMask |= 1u << i;
+    // LOD 4+: the column is filled when it holds an accepted trunk whose LOD roll passes. Candidates come from the
+    // regions it covers (position, then roll, then density); slope and band from one full-octave sample at its
+    // centre, taken lazily.
+    const int regionLowX = columnX >> TREE_REGION_SHIFT;
+    const int regionLowZ = columnZ >> TREE_REGION_SHIFT;
+    const int regionHighX = (columnX + scale - 1) >> TREE_REGION_SHIFT;
+    const int regionHighZ = (columnZ + scale - 1) >> TREE_REGION_SHIFT;
+    int steepness = -1; // not sampled yet
+    for (int regionZ = regionLowZ; regionZ <= regionHighZ; ++regionZ) {
+      for (int regionX = regionLowX; regionX <= regionHighX; ++regionX) {
+        const int2 region = int2(regionX, regionZ);
+        for (uint slot = 0u; slot < uint(TREE_SLOTS); ++slot) {
+          const TreeInstance tree = treeCandidateUnfiltered(region, slot);
+          if (tree.trunkX < columnX || tree.trunkX >= columnX + scale || tree.trunkZ < columnZ ||
+              tree.trunkZ >= columnZ + scale || !treeShowsAtScale(tree.trunkX, tree.trunkZ, scale)) {
+            continue;
+          }
+          if (int(treeCandidateHash(region, slot) >> 24u) >= treeChanceAt(tree.trunkX, tree.trunkZ)) {
+            continue;
+          }
+          if (steepness < 0) {
+            float2 grad;
+            const int ground =
+                int(floor(sampleTerrainHeightGrad(columnX + scale / 2, columnZ + scale / 2, 1, grad)));
+            if (ground < TREE_MIN_GROUND || ground > TREE_MAX_GROUND) {
+              return column;
+            }
+            steepness = treeSteepness(grad.x, grad.y);
+          }
+          if (treeSlopeOk(steepness, treeSlopeRoll(tree.shape))) {
+            column.leafBase = height;
+            column.leafMask = 1u;
+            return column;
+          }
+        }
       }
     }
-    if (dx == 0 && dz == 0) {
-      column.logLo = tree.ground;
-      column.logHi = tree.ground + tree.trunkHeight;
+    return column;
+  }
+  const int regionsPerSide = treeTileRegionsPerSide(scale);
+  const uint slotCount = uint(regionsPerSide * regionsPerSide * TREE_SLOTS);
+  if (scale == 1) {
+    for (uint slot = 0u; slot < slotCount; ++slot) {
+      const int trunkHeight = treeSlotHeight[slot];
+      const int dx = columnX - treeSlotTrunkX[slot];
+      const int dz = columnZ - treeSlotTrunkZ[slot];
+      if (trunkHeight == 0 || abs(dx) > TREE_RADIUS || abs(dz) > TREE_RADIUS) {
+        continue;
+      }
+      TreeInstance tree;
+      tree.trunkX = treeSlotTrunkX[slot];
+      tree.trunkZ = treeSlotTrunkZ[slot];
+      tree.ground = treeSlotGround[slot];
+      tree.trunkHeight = trunkHeight;
+      tree.shape = treeSlotShape[slot];
+      const uint style = treeStyle(tree.shape);
+      const int leafBase = tree.ground + treeCanopyLow(style, trunkHeight);
+      const uint leafCount = uint(treeCanopyHigh(style, trunkHeight) - treeCanopyLow(style, trunkHeight));
+      uint leafMask = 0u;
+      for (uint i = 0u; i < leafCount; ++i) {
+        if (treeBlockAt(tree, columnX, leafBase + int(i), columnZ) == TREE_LEAVES) {
+          leafMask |= 1u << i;
+        }
+      }
+      const bool trunk = dx == 0 && dz == 0;
+      mergeTreeColumn(column, trunk ? tree.ground : 0, trunk ? tree.ground + trunkHeight : 0, leafBase, leafMask);
     }
     return column;
   }
-  if (scale >= (1 << TREE_CELL_SHIFT)) {
-    if ((hashCell(cell, SEED_TREE_LOD) & 0xffu) >= TREE_LOD3_FILL_CHANCE || !treeBandOkAt(tree.trunkX, tree.trunkZ, scale)) {
-      return column;
+  if (scale == (1 << TREE_CELL_SHIFT)) {
+    // LOD 3: one leaf cell on the column's top when it holds an accepted trunk whose LOD roll passes.
+    for (uint slot = 0u; slot < slotCount; ++slot) {
+      const int trunkX = treeSlotTrunkX[slot];
+      const int trunkZ = treeSlotTrunkZ[slot];
+      if (treeSlotHeight[slot] != 0 && trunkX >= columnX && trunkX < columnX + scale && trunkZ >= columnZ &&
+          trunkZ < columnZ + scale && treeShowsAtScale(trunkX, trunkZ, scale)) {
+        column.leafBase = height;
+        column.leafMask = 1u;
+        return column;
+      }
     }
-    column.leafBase = height;
-    column.leafMask = 1u;
     return column;
   }
-  // Scale 2 or 4: the trunk's coarse column (inside this tile: cells never cross tiles) gives the ground cell.
-  const int trunkColumnX = (tree.trunkX - originX) / scale;
-  const int trunkColumnZ = (tree.trunkZ - originZ) / scale;
-  const int groundCell = tileHeight(tileOrigin, trunkColumnX, trunkColumnZ);
-  if (!treeBandOkAt(tree.trunkX, tree.trunkZ, scale) ||
-      abs(tileHeight(tileOrigin, trunkColumnX - 1, trunkColumnZ) - groundCell) > 1 ||
-      abs(tileHeight(tileOrigin, trunkColumnX + 1, trunkColumnZ) - groundCell) > 1 ||
-      abs(tileHeight(tileOrigin, trunkColumnX, trunkColumnZ - 1) - groundCell) > 1 ||
-      abs(tileHeight(tileOrigin, trunkColumnX, trunkColumnZ + 1) - groundCell) > 1) {
-    return column;
-  }
-  const int cellOriginX = cell.x << TREE_CELL_SHIFT;
-  const int cellOriginZ = cell.y << TREE_CELL_SHIFT;
-  const uint trunkOffset = uint(tree.trunkX - cellOriginX - TREE_RADIUS) + 4u * uint(tree.trunkZ - cellOriginZ - TREE_RADIUS);
-  const uint entry = TreeLodTable[treeLodTableIndex(scale, trunkOffset, uint(tree.trunkHeight - 4),
-                                                    uint((originX + int(x) * scale - cellOriginX) / scale),
-                                                    uint((originZ + int(z) * scale - cellOriginZ) / scale))];
-  column.leafBase = groundCell;
-  column.leafMask = entry & 0xfu;
-  const int logCells = int((entry >> 4u) & 0xfu);
-  if (logCells != 0) {
-    column.logLo = groundCell;
-    column.logHi = groundCell + logCells;
+  // LOD 1-2: every tree whose canopy covers at least half of the column, or whose trunk stands in it, at its real
+  // height; logs in the trunk's column from the terrain top up to its canopy.
+  for (uint slot = 0u; slot < slotCount; ++slot) {
+    const int trunkHeight = treeSlotHeight[slot];
+    if (trunkHeight == 0) {
+      continue;
+    }
+    const int trunkX = treeSlotTrunkX[slot];
+    const int trunkZ = treeSlotTrunkZ[slot];
+    const bool trunkHere = trunkX >= columnX && trunkX < columnX + scale && trunkZ >= columnZ && trunkZ < columnZ + scale;
+    if (!trunkHere && !treeCanopyShows(treeCanopyOverlap(trunkX, trunkZ, columnX, columnZ, scale), scale)) {
+      continue;
+    }
+    const int2 leaves = treeLeafCells(treeSlotGround[slot], trunkHeight, treeSlotShape[slot], scale, height);
+    const bool logs = trunkHere && leaves.x > height;
+    mergeTreeColumn(column, logs ? height : 0, logs ? leaves.x : 0, leaves.x, (1u << uint(leaves.y)) - 1u);
   }
   return column;
 }
 
-// Tree block of the group's column `lane` at world cell y; cells below the column's terrain top are terrain (it wins).
+/**
+ * Tree block of the group's column `lane` at a world cell; cells below the terrain top are terrain (it wins).
+ *
+ * @return TREE_NONE, TREE_LOG or TREE_LEAVES.
+ */
 uint treeCellBlock(uint lane, int y, int columnHeight) {
   if (y < columnHeight) {
     return TREE_NONE;
@@ -631,40 +818,55 @@ uint treeCellBlock(uint lane, int y, int columnHeight) {
     return TREE_LOG;
   }
   const int i = y - treeLeafBase[lane];
-  return i >= 0 && i < 4 && ((treeLeafMask[lane] >> uint(i)) & 1u) != 0u ? TREE_LEAVES : TREE_NONE;
+  return i >= 0 && i < TREE_LEAF_WINDOW && ((treeLeafMask[lane] >> uint(i)) & 1u) != 0u ? TREE_LEAVES : TREE_NONE;
 }
 
-// Tree block (TREE_*) whose block id is opaque (bit 9 clear, see blocks.txt): logs, and leaves unless
-// `opaque = false`.
+/**
+ * Whether a TREE_* block maps to an opaque block ID (non-opaque bit 9 clear, see blocks.txt).
+ */
 bool treeBlockOpaque(uint block) {
   const uint blockType = block == TREE_LOG ? dispatchParams.logBlock : dispatchParams.leavesBlock;
   return block != TREE_NONE && (blockType & 0x200u) == 0u;
 }
 
-// Tree block at chunk-local column (x, z), world cell y. Columns outside the group's tile hold no tree blocks here.
+/**
+ * Tree block at a chunk-local column and world cell y; columns outside the group's tile hold none.
+ *
+ * @return TREE_NONE, TREE_LOG or TREE_LEAVES.
+ */
 uint treeBlockAtColumn(int2 tileOrigin, int x, int y, int z) {
-  const int tx = x - tileOrigin.x - 1;
-  const int tz = z - tileOrigin.y - 1;
-  if (tx < 0 || tx >= 8 || tz < 0 || tz >= 8) {
+  const int tileLocalX = x - tileOrigin.x - 1;
+  const int tileLocalZ = z - tileOrigin.y - 1;
+  if (tileLocalX < 0 || tileLocalX >= 8 || tileLocalZ < 0 || tileLocalZ >= 8) {
     return TREE_NONE;
   }
-  return treeCellBlock(uint(tz * 8 + tx), y, tileHeight(tileOrigin, x, z));
+  return treeCellBlock(uint(tileLocalZ * 8 + tileLocalX), y, tileHeight(tileOrigin, x, z));
 }
 
-// World cells [x, y) that may hold tree blocks over the group's column `lane` (empty if none).
+/**
+ * World cells that may hold tree blocks over the group's column `lane`.
+ *
+ * @return [x, y) cell range, empty if none.
+ */
 int2 treeCellRange(uint lane) {
   const bool hasLog = treeLogLo[lane] < treeLogHi[lane];
   const bool hasLeaves = treeLeafMask[lane] != 0u;
-  const int leafHi = treeLeafBase[lane] + 4;
+  const int leafHi = treeLeafBase[lane] + int(firstbithigh(treeLeafMask[lane])) + 1;
   if (hasLog && hasLeaves) {
     return int2(min(treeLogLo[lane], treeLeafBase[lane]), max(treeLogHi[lane], leafHi));
   }
   return hasLog ? int2(treeLogLo[lane], treeLogHi[lane]) : (hasLeaves ? int2(treeLeafBase[lane], leafHi) : int2(0, 0));
 }
 
-// The tree faces of this lane's column within the chunk, as 1x1 quads in the cluster's direction runs (+Y, -X, +X,
-// -Z, +Z, -Y). A face shows unless the neighbour is terrain, an opaque tree block, or the same block (like the
-// CPU's binary mesher and emitNonOpaque). Counts into counts[run]; with write, also writes each quad at runBase[run] + counts[run].
+/**
+ * Count (and optionally write) this lane's tree faces within the chunk as 1x1 quads in the cluster's direction runs
+ * (+Y, -X, +X, -Z, +Z, -Y). A face shows unless the neighbour is terrain, an opaque tree block or the same block
+ * (like the CPU's binary mesher and emitNonOpaque).
+ *
+ * @param write Also write each quad at runBase[run] + counts[run].
+ * @param height The column's stored height, in cells.
+ * @param counts Incremented per emitted face, per run.
+ */
 void treeFaces(bool write, int2 tileOrigin, uint lane, uint x, uint z, int height, int chunkY, int4 chunkCoord,
                uint runBase[6], inout uint counts[6]) {
   const int chunkBottom = chunkY * int(CHUNK_SIZE);
@@ -683,13 +885,13 @@ void treeFaces(bool write, int2 tileOrigin, uint lane, uint x, uint z, int heigh
     [unroll]
     for (uint run = 0u; run < 6u; ++run) {
       const int3 n = normalAxes[runNormals[run]];
-      const int nx = int(x) + n.x;
-      const int ny = y + n.y;
-      const int nz = int(z) + n.z;
-      if (ny < tileHeight(tileOrigin, nx, nz)) {
+      const int neighborX = int(x) + n.x;
+      const int neighborY = y + n.y;
+      const int neighborZ = int(z) + n.z;
+      if (neighborY < tileHeight(tileOrigin, neighborX, neighborZ)) {
         continue; // terrain
       }
-      const uint neighbor = treeBlockAtColumn(tileOrigin, nx, ny, nz);
+      const uint neighbor = treeBlockAtColumn(tileOrigin, neighborX, neighborY, neighborZ);
       if (treeBlockOpaque(neighbor) || neighbor == block) {
         continue;
       }
@@ -707,6 +909,10 @@ void treeFaces(bool write, int2 tileOrigin, uint lane, uint x, uint z, int heigh
 groupshared int heightGroupLow;
 groupshared int heightGroupHigh;
 
+/**
+ * Compute and store the padded heights of each new column, and each group's height range for allocateWork.
+ * Dispatched as (HEIGHT_GROUPS, 1, columns), batched through zBase.
+ */
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void generateHeights(uint3 groupThreadID: SV_GroupThreadID, uint3 groupID: SV_GroupID) {
@@ -715,10 +921,9 @@ void generateHeights(uint3 groupThreadID: SV_GroupThreadID, uint3 groupID: SV_Gr
     return;
   }
   const uint columnIndex = ColumnList[item];
-  // Dispatched as (HEIGHT_GROUPS, 1, columns). Groups 0-15 cover the 32x32 interior as 8x8 tiles (2D tiles keep the
-  // noise branches coherent; a plain 1D mapping measured slower). Groups 16-18 walk the 132 border cells as lines:
-  // rows z = 0 and z = 33, then columns x = 0 and x = 33. 1216 threads for 1156 cells instead of 1600 for a 5x5 grid
-  // of 8x8 tiles, and the costly edge cells (they sample neighbour LODs) share warps.
+  // Groups 0-15: 8x8 interior tiles (2D keeps noise branches coherent; 1D measured slower). Groups 16-18: the 132
+  // border cells as lines (rows z = 0, 33, then columns x = 0, 33), so costly edge cells share warps and 1216 threads
+  // cover 1156 cells instead of 1600.
   const uint group = groupID.x;
   const uint lane = groupThreadID.y * 8u + groupThreadID.x;
   uint localX = 0u;
@@ -758,10 +963,11 @@ void generateHeights(uint3 groupThreadID: SV_GroupThreadID, uint3 groupID: SV_Gr
   }
 }
 
-// Picks each new column's vertical chunks from its height range and gives them work slots from the free stack.
-// One thread per new column, after generateHeights. A column's faces span from its lowest neighbour height (side
-// faces start there) to its top cell (height - 1), all inside [low, high - 1] of the padded heights; one more chunk
-// of slack is kept on each end. Appends the work to ChunkWork for meshColumns (indirect, see finalizeWork).
+/**
+ * Pick each new column's vertical chunks from its height range (plus one chunk of slack each end, and the ocean
+ * surface chunk) and pop work slots for them; appends the work to ChunkWork for meshColumns. One thread per new
+ * column, after generateHeights.
+ */
 [numthreads(64, 1, 1)]
 [shader("compute")]
 void allocateWork(uint3 dispatchThreadID: SV_DispatchThreadID) {
@@ -788,9 +994,8 @@ void allocateWork(uint3 dispatchThreadID: SV_DispatchThreadID) {
                              floorDivide(envelopeHigh - 1, int(CHUNK_SIZE)));
   int count = clamp(lastChunkY - firstChunkY + 1, 0, int(MAX_COLUMN_CHUNKS));
 
-  // Pop count slots. Pops and pushes (retireWork) never share a pass, so the stack holds exactly [0, top).
-  // Running dry (or having run dry before: the stack may hold stale entries then) drops the column's chunks and
-  // flags it; the CPU reads the flag back and rebuilds everything.
+  // Pops and pushes (retireWork) never share a pass, so the stack holds exactly [0, top). Running dry (now or
+  // earlier: the stack may be stale) drops the column and flags overflow; the CPU then rebuilds everything.
   int top = 0;
   if (WorkPool[WORK_POOL_OVERFLOW] != 0) {
     count = 0;
@@ -819,8 +1024,10 @@ void allocateWork(uint3 dispatchThreadID: SV_DispatchThreadID) {
   }
 }
 
-// Indirect arguments for this remesh's meshColumns, and for compactQuads and the task-shader draw (both walk the work
-// slots below the high water). Dispatches fold the item count into y (up to 65535) and z.
+/**
+ * Write the indirect arguments for this remesh's meshColumns, compactQuads and the task-shader draw (the latter two
+ * walk work slots below the high water). Item counts fold into y (up to 65535) and z.
+ */
 [numthreads(1, 1, 1)]
 [shader("compute")]
 void finalizeWork() {
@@ -840,7 +1047,7 @@ void finalizeWork() {
   WorkPool[WORK_POOL_MOVERS] = 0;
 }
 
-// Full rebuild: every work slot free, lowest on top so the high water stays low. Dispatched over the capacity.
+/** Full rebuild: every work slot free, lowest on top so the high water stays low. Dispatched over the capacity. */
 [numthreads(256, 1, 1)]
 [shader("compute")]
 void initWorkPool(uint3 dispatchThreadID: SV_DispatchThreadID) {
@@ -860,11 +1067,10 @@ void initWorkPool(uint3 dispatchThreadID: SV_DispatchThreadID) {
   }
 }
 
-// Slot defragmentation, run with quad compaction (after retireWork): moves every live work slot below the live count
-// so the high water, which compactQuads and the task-shader draw walk, drops back to it. Three passes, each
-// dispatched over the capacity (256 threads per group); all skip after an overflow (the stack is stale then).
-//
-// 1. Free slots below the live count (holes) and live slots at or above it (movers). There are as many of each.
+// Slot defragmentation, run with quad compaction (after retireWork): moves live work slots below the live count so
+// the high water drops back to it. Three passes over the capacity; all skip after an overflow (stale stack).
+
+/** Pass 1: list free slots below the live count (holes) and live slots at or above it (movers); counts are equal. */
 [numthreads(256, 1, 1)]
 [shader("compute")]
 void collectRelocations(uint3 dispatchThreadID: SV_DispatchThreadID) {
@@ -885,7 +1091,7 @@ void collectRelocations(uint3 dispatchThreadID: SV_DispatchThreadID) {
   }
 }
 
-// 2. Mover k takes hole k: its clusters (their quads stay put), its owner's ColumnWorkSlots entry, its SlotOwner.
+/** Pass 2: mover k takes hole k: its clusters (quads stay put), its owner's ColumnWorkSlots entry, its SlotOwner. */
 [numthreads(256, 1, 1)]
 [shader("compute")]
 void relocateSlots(uint3 dispatchThreadID: SV_DispatchThreadID) {
@@ -909,7 +1115,7 @@ void relocateSlots(uint3 dispatchThreadID: SV_DispatchThreadID) {
   SlotOwner[from] = INVALID_WORK_SLOT;
 }
 
-// 3. The free slots are now exactly [live, capacity): restack them lowest on top and lower the high water.
+/** Pass 3: free slots are now exactly [live, capacity): restack them lowest on top and lower the high water. */
 [numthreads(256, 1, 1)]
 [shader("compute")]
 void rebuildFreeStack(uint3 dispatchThreadID: SV_DispatchThreadID) {
@@ -927,10 +1133,14 @@ void rebuildFreeStack(uint3 dispatchThreadID: SV_DispatchThreadID) {
   }
 }
 
+/**
+ * Mesh one 8x8-column tile of one chunk (one thread per column): greedy-merged top and side faces, tree faces and
+ * the ocean surface, written as one QuadCluster (six direction runs) plus one WaterClusters entry. Dispatched
+ * indirectly (finalizeWork) as (16 tiles, items folded into y / z).
+ */
 [numthreads(8, 8, 1)]
 [shader("compute")]
 void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID) {
-  // Dispatched indirectly (finalizeWork) as (16 tiles, items folded into y / z).
   const uint item = groupID.y + groupID.z * GROUP_LIMIT;
   if (item >= uint(WorkPool[WORK_POOL_NEW_WORK])) {
     return;
@@ -952,12 +1162,13 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
   const uint waveIndex = lane / waveLanes;
   const uint waveCount = 64u / waveLanes;
 
-  // Stage this group's heights (+1 border) in shared memory; AO and neighbor faces read only from the tile.
-  // The early return above is uniform per group, so these barriers are reached by every thread.
+  // Stage heights (+1 border); AO and neighbour faces read only the tile. The early return is group-uniform, so
+  // every thread reaches the barriers.
   const int2 tileOrigin = int2(int(tileX * 8u) - 1, int(tileZ * 8u) - 1);
   for (uint i = lane; i < TILE_SIZE * TILE_SIZE; i += 64u) {
     heightTile[i] = sampleHeight(columnIndex, tileOrigin.x + int(i % TILE_SIZE), tileOrigin.y + int(i / TILE_SIZE));
   }
+  stageTreeSlots(lane, tileX, tileZ, columnIndex, ChunkCoords[columnIndex]);
   GroupMemoryBarrierWithGroupSync();
 
   const int height = tileHeight(tileOrigin, int(x), int(z));
@@ -1082,9 +1293,8 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
   const uint posXCount = sideCounts[1];
   const uint negZCount = sideCounts[2];
   const uint posZCount = sideCounts[3];
-  // -Y (bottom) faces: a cell whose cell below is air. Heightmap columns are solid all the way down (isSolidAt), so
-  // they have none; the run is plumbed through the cluster, task and mesh shaders for terrain that does
-  // (overhangs, caves). Count them here and write them at faceRunOffsets[5] below.
+  // -Y faces: none for heightmap columns; the run is plumbed through the cluster, task and mesh shaders for future
+  // overhangs / caves (write them at faceRunOffsets[5]).
   const uint negYCount = 0u;
 
   // Tree faces go after this lane's terrain faces in each run.
@@ -1092,11 +1302,14 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
   uint treeCounts[6] = { 0u, 0u, 0u, 0u, 0u, 0u };
   treeFaces(false, tileOrigin, lane, x, z, height, chunkY, chunkCoord, noRunBase, treeCounts);
 
-  // The group's quads are laid out as one run per direction so the per-frame cull can drop a whole run at once.
-  // Two directions share a uint (16 bits each): a run holds at most 64 columns * 32 quads, so fields never carry.
+  // One run per direction so the per-frame cull drops whole runs. Two directions per uint (16 bits each): a run holds
+  // at most 64 columns * 32 quads, so fields never carry.
   const uint packedCounts[3] = { (topCount + treeCounts[0]) | ((negXCount + treeCounts[1]) << 16u),
                                  (posXCount + treeCounts[2]) | ((negZCount + treeCounts[3]) << 16u),
                                  (posZCount + treeCounts[4]) | ((negYCount + treeCounts[5]) << 16u) };
+  if (lane == 0u) {
+    groupHasTreeFaces = 0u; // the other lanes set it only after the barrier below
+  }
   uint packedLanePrefix[3];
   [unroll]
   for (uint k = 0u; k < 3u; ++k) {
@@ -1125,6 +1338,11 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
     groupQuadCount += (packedTotals[d >> 1u] >> shift) & 0xffffu;
   }
 
+  const uint laneTreeFaces =
+      treeCounts[0] + treeCounts[1] + treeCounts[2] + treeCounts[3] + treeCounts[4] + treeCounts[5];
+  if (WaveActiveAnyTrue(laneTreeFaces != 0u) && WaveIsFirstLane()) {
+    InterlockedOr(groupHasTreeFaces, 1u);
+  }
   if (lane == 63u) {
     InterlockedAdd(QuadCount[0], groupQuadCount, groupOutputBase);
     InterlockedAdd(QuadCount[1], groupQuadCount);
@@ -1147,7 +1365,18 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
     cluster.counts23 = packedTotals[1];
     cluster.counts45 = packedTotals[2];
     cluster.boundsMin = float4(boundsMin, 0.0f);
-    cluster.boundsMax = float4(boundsMin + float3(8.0f, float(faceHigh - faceLow), 8.0f) * tileScale, 0.0f);
+    // w: CLUSTER_HAS_CUTOUT (geometry_shared.hlsl) when it may hold non-opaque quads; conservative.
+    const uint terrainBlocks = dispatchParams.layerBlocks.x | dispatchParams.layerBlocks.y |
+                               dispatchParams.layerBlocks.z | dispatchParams.layerBlocks.w |
+                               dispatchParams.layerFillerBlocks.x | dispatchParams.layerFillerBlocks.y |
+                               dispatchParams.layerFillerBlocks.z | dispatchParams.layerFillerBlocks.w |
+                               dispatchParams.layerDeepBlocks.x | dispatchParams.layerDeepBlocks.y |
+                               dispatchParams.layerDeepBlocks.z | dispatchParams.layerDeepBlocks.w;
+    const bool treeCutout = groupHasTreeFaces != 0u &&
+                            ((dispatchParams.logBlock | dispatchParams.leavesBlock) & NON_OPAQUE_BLOCK_BIT) != 0u;
+    const bool terrainCutout = (terrainBlocks & NON_OPAQUE_BLOCK_BIT) != 0u && groupQuadCount != 0u;
+    cluster.boundsMax = float4(boundsMin + float3(8.0f, float(faceHigh - faceLow), 8.0f) * tileScale,
+                               treeCutout || terrainCutout ? 1.0f : 0.0f);
     Clusters[workSlot * 16u + groupID.x] = cluster;
   }
 
@@ -1237,10 +1466,11 @@ void meshColumns(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadI
   }
 }
 
-// Retires the work slots of columns that left the clipmap: their quads stay in QuadBuffer (reclaimed by compaction or
-// the next full rebuild) but get an invalid normal (7) so vertMain discards them, the clusters drop to zero quads so
-// taskMain skips them, and the slots go back on the free stack. Dispatched as (16 clusters, MAX_COLUMN_CHUNKS,
-// retireCount) before this remesh's allocateWork, which may reuse the slots.
+/**
+ * Retire the work slots of columns that left the clipmap: their quads stay in QuadBuffer (until compaction) but get
+ * the invalid normal 7 so vertMain discards them, their clusters drop to zero quads, and the slots return to the
+ * free stack. Dispatched as (16 clusters, MAX_COLUMN_CHUNKS, retireCount) before this remesh's allocateWork.
+ */
 [numthreads(64, 1, 1)]
 [shader("compute")]
 void retireWork(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID) {
@@ -1284,12 +1514,13 @@ void retireWork(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID
   }
 }
 
-// Garbage collection without remeshing: packs the quads of every live cluster into CompactScratch and points the
-// clusters at their new runs. QuadCount[0] must be zeroed first; it becomes the packed size (the live quad count).
-// Dispatched indirectly (finalizeWork) as (16 clusters, work slots below the high water folded into y / z). Cluster order in the output doesn't matter: each cluster keeps its
-// quads contiguous (six runs by direction), which is all taskMain and retireWork rely on.
 groupshared uint compactBase;
 groupshared uint compactWaterBase;
+/**
+ * Garbage-collect quads without remeshing: pack every live cluster's quads into CompactScratch and point the
+ * clusters at their new runs. QuadCount[0] must be zeroed first and becomes the live quad count. Cluster order
+ * doesn't matter; each stays contiguous. Dispatched indirectly as (16 clusters, work slots folded into y / z).
+ */
 [numthreads(64, 1, 1)]
 [shader("compute")]
 void compactQuads(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID) {
@@ -1325,8 +1556,8 @@ void compactQuads(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThread
   }
 }
 
-// Copies compactQuads' output back over QuadBuffer / ChunkOffsets. Grid-stride over the packed size.
 static const uint COPY_COMPACTED_GROUPS = 1024u;
+/** Copy compactQuads' output back over QuadBuffer / ChunkOffsets (grid-stride over the packed size). */
 [numthreads(256, 1, 1)]
 [shader("compute")]
 void copyCompactedQuads(uint3 dispatchThreadID: SV_DispatchThreadID) {
@@ -1337,6 +1568,7 @@ void copyCompactedQuads(uint3 dispatchThreadID: SV_DispatchThreadID) {
   }
 }
 
+/** Write vertMain's indexed indirect draw for the current quad count, and reset the new-work counter. */
 [numthreads(1, 1, 1)]
 [shader("compute")]
 void finalizeVertexDraw() {

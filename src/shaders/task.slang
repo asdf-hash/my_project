@@ -1,10 +1,11 @@
-// Task shader for the mesh path. Kept in its own SPIR-V module: with taskMain and meshMain in one module the NVIDIA
-// driver handed meshMain an empty payload.
+// Task shader for the mesh path. Own SPIR-V module: with taskMain and meshMain in one module the NVIDIA driver handed
+// meshMain an empty payload.
+//
+// One workgroup per CLUSTERS_PER_TASK QuadClusters. CPU-meshed chunks are drawn with drawMeshTasksEXT over runs of
+// CPU-frustum-visible chunk slots (cpuVisibleSlotRuns in renderer.cpp, offset by clusterBase); the GPU clipmap uses
+// drawMeshTasksIndirectEXT. Each lane culls its tile and back-facing direction runs, then the group launches one
+// meshlet per QUADS_PER_MESHLET quads of every surviving run.
 #include "geometry_shared.hlsl"
-
-// Task shader: one workgroup per 32 QuadClusters, drawn directly with drawMeshTasksEXT over drawParams.clusterCount. Each
-// lane frustum tests its tile and drops direction runs that face away from the camera, then the group launches one
-// meshlet per 32 quads of every surviving run. No compute pre-pass and no CPU frustum culling on this path.
 
 // Last frame's Hi-Z (hzb.slang): farthest depth per texel, rendered with ubo.previousMvp.
 [[vk::binding(7, 0)]]
@@ -14,7 +15,11 @@ groupshared TaskPayload taskPayload;
 groupshared uint laneRunCount[CLUSTERS_PER_TASK];
 groupshared uint laneMeshletCount[CLUSTERS_PER_TASK];
 
-// Conservative: true only when all 8 corners are outside the same clip plane (reverse-Z: near at z = w, far at 0).
+/**
+ * Conservative frustum test against ubo.cullMvp (reverse-Z: near at z = w, far at 0).
+ *
+ * @return true only when all 8 box corners are outside the same clip plane.
+ */
 bool boxOutsideFrustum(float3 boundsMin, float3 boundsMax) {
   bool allLeft = true, allRight = true, allBelow = true, allAbove = true, allNear = true, allFar = true;
   [unroll]
@@ -32,9 +37,12 @@ bool boxOutsideFrustum(float3 boundsMin, float3 boundsMax) {
   return allLeft || allRight || allBelow || allAbove || allNear || allFar;
 }
 
-// Occlusion against last frame's depth: true when the box's nearest point (projected with last frame's matrices)
-// lies behind the farthest depth over its whole screen rectangle. Boxes crossing the near plane or the screen edge
-// are never culled. Newly uncovered tiles can therefore show up one frame late.
+/**
+ * Occlusion test against last frame's Hi-Z, projecting with last frame's matrices. Boxes crossing the near plane or
+ * the screen edge are never culled; newly uncovered tiles can show up one frame late.
+ *
+ * @return true when the box's nearest point lies behind the farthest depth over its whole screen rectangle.
+ */
 bool boxOccluded(float3 boundsMin, float3 boundsMax) {
   if (ubo.hzbParams.w == 0.0f) {
     return false;
@@ -56,13 +64,13 @@ bool boxOccluded(float3 boundsMin, float3 boundsMax) {
     uvMax = max(uvMax, uv);
     nearestDepth = max(nearestDepth, c.z / c.w);
   }
-  // Only boxes fully on screen last frame are tested. The off-screen part of a box has no depth to test against
-  // and can turn into view this frame, so clamping it to the screen made tiles pop in while the camera turned.
+  // Only boxes fully on screen last frame are tested: clamping the off-screen part (no depth there) to the screen
+  // made tiles pop in while the camera turned.
   if (any(uvMin < 0.0f) || any(uvMax > 1.0f)) {
     return false;
   }
-  // One level finer than where the rectangle fits in one texel's width: it spans at most 3x3 texels there, a much
-  // tighter fit than the coarser level's 2x2 texels covering up to 4x the area.
+  // One level finer than where the rectangle fits in one texel: <= 3x3 texels there, a much tighter fit than the
+  // coarser level's 2x2 texels covering up to 4x the area.
   const float2 extent = (uvMax - uvMin) * ubo.hzbParams.xy;
   const uint level =
       min(uint(max(ceil(log2(max(max(extent.x, extent.y), 1.0f))) - 1.0f, 0.0f)), uint(ubo.hzbParams.z) - 1u);
@@ -78,26 +86,37 @@ bool boxOccluded(float3 boundsMin, float3 boundsMax) {
   return nearestDepth < farthest;
 }
 
+/**
+ * Culls one QuadCluster per lane and dispatches a meshlet per QUADS_PER_MESHLET quads of every surviving run.
+ *
+ * @param groupID Spread over x and y to stay under the 65535 groups-per-dimension limit.
+ * @param groupThreadID Lane = cluster within the group.
+ */
 [shader("amplification")]
 [numthreads(CLUSTERS_PER_TASK, 1, 1)]
 void taskMain(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID) {
   const uint lane = groupThreadID.x;
-  const uint clusterIndex = (groupID.x + groupID.y * 65535u) * CLUSTERS_PER_TASK + lane;
+  const uint drawCluster = (groupID.x + groupID.y * 65535u) * CLUSTERS_PER_TASK + lane;
+  const uint clusterIndex = drawParams.clusterBase + drawCluster;
 
   // Per run: first quad and quad count, 0 when the run is culled. Indexed only with compile-time constants.
   uint runFirst[RUNS_PER_CLUSTER] = { 0u, 0u, 0u, 0u, 0u, 0u };
   uint runQuads[RUNS_PER_CLUSTER] = { 0u, 0u, 0u, 0u, 0u, 0u };
-  if (clusterIndex < drawParams.clusterCount) {
+  if (drawCluster < drawParams.clusterCount) {
     const QuadCluster cluster = Clusters[clusterIndex];
     const float3 boundsMin = cluster.boundsMin.xyz;
     const float3 boundsMax = cluster.boundsMax.xyz;
-    if (!boxOutsideFrustum(boundsMin, boundsMax) && !boxOccluded(boundsMin, boundsMax)) {
+    // Skip the culls' 16 corner projections for empty clusters (air tiles, freed slots below the high water) and, in
+    // the cutout pass, clusters not flagged as holding cutout quads (most hold none).
+    const bool empty = (cluster.counts01 | cluster.counts23 | cluster.counts45) == 0u ||
+                       (drawParams.pass == GEOMETRY_PASS_CUTOUT && cluster.boundsMax.w != CLUSTER_HAS_CUTOUT);
+    if (!empty && !boxOutsideFrustum(boundsMin, boundsMax) && !boxOccluded(boundsMin, boundsMax)) {
       const float3 camera = ubo.cullCameraPosition.xyz;
       const uint counts[RUNS_PER_CLUSTER] = { cluster.counts01 & 0xffffu, cluster.counts01 >> 16u,
                                               cluster.counts23 & 0xffffu, cluster.counts23 >> 16u,
                                               cluster.counts45 & 0xffffu, cluster.counts45 >> 16u };
       // Same order as the runs. Conservative: a run survives if any face plane in the tile could face the camera.
-      // The translucent pass draws both sides (the water surface is seen from below too).
+      // Translucent pass draws both sides (water is seen from below too).
       const bool bothSides = drawParams.pass == GEOMETRY_PASS_TRANSLUCENT;
       const bool facing[RUNS_PER_CLUSTER] = { bothSides || camera.y > boundsMin.y, bothSides || camera.x < boundsMax.x,
                                               bothSides || camera.x > boundsMin.x, bothSides || camera.z < boundsMax.z,

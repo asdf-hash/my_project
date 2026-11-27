@@ -11,6 +11,9 @@
 #include <cstdint>
 #include <exception>
 #include <mutex>
+
+// Testing (ENGINE_FORCE_LOD): GPU tiles are never finer than this LOD, the CPU square included.
+inline uint32_t gForcedMinLod = 0;
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -18,8 +21,8 @@
 #include <utility>
 #include <vector>
 
-// Every point within this distance of the camera (nearest-point, 3D) is covered by a clipmap tile; beyond it the
-// clipmap ends. The border fog in fragMain is opaque before it (renderer.cpp, ubo.viewRayScale.w).
+// Clipmap tiles cover every point within this 3D distance of the camera. The border fog in fragMain is opaque before
+// it (renderer.cpp, ubo.viewRayScale.w).
 inline constexpr float kClipmapRadius =
     static_cast<float>(world::kRenderDistance * CHUNK_SIZE * (1u << (MAX_LOD - 1u)));
 
@@ -28,56 +31,61 @@ struct ClipmapView {
   std::array<float, 3> forward;
   std::array<float, 3> right;
   std::array<float, 3> up;
-  // LOD distances inside the view frustum (from the current FOV), and outside it (from the base FOV). They differ only
-  // while zoomed: the narrow FOV doubles the distances, and applying that to the whole ring meshed ~3x the quads, all
-  // but a sliver of them off screen (it overflowed QuadBuffer). Outside the frustum the zoom changes nothing.
+  // LOD distances inside the frustum (current FOV) and outside it (base FOV). They differ only while zoomed: applying
+  // the zoomed distances to the whole ring meshed ~3x the quads, mostly off screen, and overflowed QuadBuffer.
   std::array<float, MAX_LOD> lodDistanceSquared;
   std::array<float, MAX_LOD> outsideLodDistanceSquared;
   float verticalFovRadians;
   float aspectRatio;
-  // Drop tiles outside the (margin-padded) view frustum. Only the vertex-pulling path sets this: the mesh path
-  // meshes the whole ring and culls on the GPU in its task shader instead.
+  // Drop tiles outside the margin-padded frustum. Only the vertex-pulling path sets this; the mesh path culls in its
+  // task shader.
   bool frustumCull;
-  // Center chunk column of the CPU-owned square (world::kCpuChunkRadius), or none while the CPU has nothing ready.
-  // Those columns stay quadtree leaves (for neighbor LODs) but get no GPU work; tiles within one more chunk of the
-  // square are forced to LOD 0 so the seam joins two full-resolution meshes.
+  // Center of the CPU-owned square, or none while the CPU has nothing ready. Its columns stay quadtree leaves (for
+  // neighbor LODs) but get no GPU work; tiles within one more chunk are forced to LOD 0 so the seam is full-res.
   std::optional<std::array<int32_t, 2>> cpuRegionCenter;
-
-  bool operator==(const ClipmapView &) const = default;
 };
 
-// GPU-meshed columns only: which of their vertical chunks get meshed is decided on the GPU from the generated heights
-// (allocateWork in chunk_compute.slang).
+// GPU-meshed columns only; their vertical chunks are picked on the GPU (allocateWork in chunk_compute.slang).
 struct ClipmapResult {
   std::vector<world::ChunkLod> chunks;
-  // Per entry of `chunks`: LOD range of the tiles across each edge, so seam border heights can be sampled at the
-  // neighbor's real resolution (generateHeights). Edge e (-X, +X, -Z, +Z) at bits e*8: min LOD | max LOD << 4.
+  // Per entry of `chunks`: LOD range across each edge, so generateHeights samples seam borders at the neighbor's
+  // resolution. Edge e (-X, +X, -Z, +Z) at bits e*8: min LOD | max LOD << 4 | kNeighborCpuFlag.
   std::vector<uint32_t> neighborLods;
-
-  bool operator==(const ClipmapResult &) const = default;
 };
 
+// Most chunks a clipmap can hold; the renderer sizes its buffers from it. Capacity peaks at the narrowest FOV; the
+// multiplier leaves room for chunks kept alive while their replacements mesh.
+inline constexpr std::uint32_t CLIPMAP_KEEP_ALIVE_MULTIPLIER = 4u;
+inline constexpr std::uint32_t kClipmapMaxChunkCount =
+    calculateClipmapCapacity(TARGET_SCREEN_PERCENTAGE, MIN_SUPPORTED_TAN_HALF_FOV, CHUNK_SIZE, world::kRenderDistance) *
+    CLIPMAP_KEEP_ALIVE_MULTIPLIER;
+
+/**
+ * Build the clipmap quadtree around the camera: subdivide coarsest-LOD tiles while they are closer than their LOD's
+ * distance (or touch the CPU square), then pack each GPU leaf's neighbor LOD ranges.
+ *
+ * @param view Camera and LOD parameters.
+ * @return GPU-meshed leaf tiles and their packed neighbor LODs.
+ * @throws std::runtime_error if the result exceeds kClipmapMaxChunkCount.
+ */
 inline ClipmapResult buildVisibleClipmap(const ClipmapView &view) {
-  constexpr std::uint32_t CLIPMAP_KEEP_ALIVE_MULTIPLIER = 4u;
   const int32_t cameraChunkX = static_cast<int32_t>(std::floor(view.position[0] / CHUNK_SIZE));
   const int32_t cameraChunkZ = static_cast<int32_t>(std::floor(view.position[2] / CHUNK_SIZE));
-  const std::uint32_t maxChunkCount = calculateClipmapCapacity(TARGET_SCREEN_PERCENTAGE, MIN_SUPPORTED_TAN_HALF_FOV,
-                                                               CHUNK_SIZE, world::kRenderDistance) *
-                                      CLIPMAP_KEEP_ALIVE_MULTIPLIER;
+  const std::uint32_t maxChunkCount = kClipmapMaxChunkCount;
 
   ClipmapResult result;
   result.chunks.reserve(maxChunkCount);
 
   const float terrainCenterHeight = (world::kMinTerrainHeight + world::kMaxTerrainHeight) * 0.5f;
-  // Vertical distance to the nearest point of the terrain height envelope (0 inside it), matching the nearest-point
-  // x/z distance below. Measuring to the envelope's center instead would push tiles under a camera near the
-  // envelope's top or bottom (sea level, ocean floor, peaks) to coarser LODs.
+  // Vertical distance to the nearest point of the height envelope (0 inside it). Measuring to its center would make
+  // tiles under a camera near the envelope's top or bottom too coarse.
   const float deltaY = std::max({static_cast<float>(world::kMinTerrainHeight) - view.position[1], 0.0f,
                                  view.position[1] - static_cast<float>(world::kMaxTerrainHeight)});
   const float maxRadius = kClipmapRadius;
-  constexpr float motionMargin = static_cast<float>(CHUNK_SIZE * 2);
+  constexpr float motionMargin = static_cast<float>(CHUNK_SIZE * 2); // slack for camera motion before the next rebuild
   const float paddedMaxRadius = maxRadius + motionMargin;
   const float maxRadiusSquared = paddedMaxRadius * paddedMaxRadius;
+  // +0.1: frustum margin. The plane-radius scales turn a bounding-sphere radius into its reach across a side plane.
   const float tanHalfVerticalFov = std::tan(view.verticalFovRadians * 0.5f) + 0.1f;
   const float tanHalfHorizontalFov = tanHalfVerticalFov * view.aspectRatio + 0.1f;
   const float horizontalPlaneRadiusScale = std::sqrt(1.0f + tanHalfHorizontalFov * tanHalfHorizontalFov);
@@ -85,13 +93,15 @@ inline ClipmapResult buildVisibleClipmap(const ClipmapView &view) {
   constexpr float nearPlane = 0.1f;
   constexpr float farPlane = 1000000.0f;
 
+  /** Floor division for negative values. */
   auto floorDivide = [](int32_t value, int32_t divisor) {
     return static_cast<int32_t>(std::floor(static_cast<double>(value) / static_cast<double>(divisor)));
   };
 
-  // Chunk-coordinate overlap of the tile [chunkX, chunkX + scale) x [chunkZ, chunkZ + scale) with the CPU square
-  // grown by `margin` chunks.
-  // Overlap of the chunk rectangle [x0, x1] x [z0, z1] (inclusive) with the CPU square grown by `margin` chunks.
+  /**
+   * Whether the inclusive chunk rectangle [x0, x1] x [z0, z1] overlaps the CPU square grown by `margin` chunks.
+   * False when there is no CPU square.
+   */
   auto overlapsCpuRect = [&](int32_t x0, int32_t x1, int32_t z0, int32_t z1, int32_t margin = 0) {
     if (!view.cpuRegionCenter) {
       return false;
@@ -100,18 +110,25 @@ inline ClipmapResult buildVisibleClipmap(const ClipmapView &view) {
     const auto [centerX, centerZ] = *view.cpuRegionCenter;
     return x0 <= centerX + radius && x1 >= centerX - radius && z0 <= centerZ + radius && z1 >= centerZ - radius;
   };
+  /** overlapsCpuRect for the tile at chunk (chunkX, chunkZ) spanning `scale` chunks per axis. */
   auto overlapsCpuSquare = [&](int32_t chunkX, int32_t chunkZ, int32_t scale, int32_t margin) {
     return overlapsCpuRect(chunkX, chunkX + scale - 1, chunkZ, chunkZ + scale - 1, margin);
   };
 
   // Every quadtree leaf, including tiles without work or outside the frustum, keyed by tileKey.
   std::unordered_set<uint64_t> leaves;
+  /** Leaf key: 24 bits each of chunk x and z, LOD from bit 48. */
   auto tileKey = [](int32_t chunkX, int32_t chunkZ, uint32_t lod) {
     return (static_cast<uint64_t>(static_cast<uint32_t>(chunkX) & 0xffffffu)) |
            (static_cast<uint64_t>(static_cast<uint32_t>(chunkZ) & 0xffffffu) << 24u) |
            (static_cast<uint64_t>(lod) << 48u);
   };
 
+  /**
+   * Recursively subdivide the tile at chunk (chunkX, chunkZ) of LOD `lod`, recording leaves and appending GPU tiles.
+   *
+   * @param self This lambda, for recursion.
+   */
   auto appendTile = [&](auto &&self, int32_t chunkX, int32_t chunkZ, uint32_t lod) -> void {
     const int32_t scale = static_cast<int32_t>(1u << lod);
     const float minX = static_cast<float>(chunkX * CHUNK_SIZE);
@@ -143,14 +160,14 @@ inline ClipmapResult buildVisibleClipmap(const ClipmapView &view) {
         viewDepth + boundsRadius < nearPlane - motionMargin || viewDepth - boundsRadius > farPlane + motionMargin ||
         std::abs(viewX) > viewDepth * tanHalfHorizontalFov + boundsRadius * horizontalPlaneRadiusScale + motionMargin ||
         std::abs(viewY) > viewDepth * tanHalfVerticalFov + boundsRadius * verticalPlaneRadiusScale + motionMargin);
-    // The bounds enclose every child tile, so an invisible tile needs no subdivision either.
+    // The bounds enclose every child, so an invisible tile needs no subdivision either.
     if (view.frustumCull && !visible) {
       return;
     }
 
     const std::array<float, MAX_LOD> &lodDistances = visible ? view.lodDistanceSquared : view.outsideLodDistanceSquared;
-    if (lod > 0 && (selectLodSquared(distanceSquared, lodDistances) < lod ||
-                    overlapsCpuSquare(chunkX, chunkZ, scale, 1))) {
+    if (lod > gForcedMinLod && (selectLodSquared(distanceSquared, lodDistances) < lod ||
+                                overlapsCpuSquare(chunkX, chunkZ, scale, 1))) {
       const int32_t childScale = scale / 2;
       self(self, chunkX, chunkZ, lod - 1);
       self(self, chunkX + childScale, chunkZ, lod - 1);
@@ -178,8 +195,7 @@ inline ClipmapResult buildVisibleClipmap(const ClipmapView &view) {
     }
   }
 
-  // Walk the strip of chunk cells just outside each edge, leaf by leaf, and record the LOD range found there.
-  // Points with no leaf (outside the clipmap, or frustum-culled) don't count; an edge with none keeps the tile's own.
+  /** LOD of the leaf covering chunk (chunkX, chunkZ), or -1 if none (outside the clipmap, or frustum-culled). */
   auto leafLodAt = [&](int32_t chunkX, int32_t chunkZ) -> int32_t {
     for (uint32_t lod = 0; lod < MAX_LOD; ++lod) {
       const int32_t scale = static_cast<int32_t>(1u << lod);
@@ -189,6 +205,7 @@ inline ClipmapResult buildVisibleClipmap(const ClipmapView &view) {
     }
     return -1;
   };
+  // Walk the strip just outside each edge leaf by leaf; an edge with no leaves keeps the tile's own LOD.
   result.neighborLods.reserve(result.chunks.size());
   for (const world::ChunkLod &chunk : result.chunks) {
     uint32_t packed = 0;
@@ -214,7 +231,6 @@ inline ClipmapResult buildVisibleClipmap(const ClipmapView &view) {
       }
       uint32_t edgeBits = static_cast<uint32_t>(minLod) | (static_cast<uint32_t>(maxLod) << 4u);
       // CPU columns across this edge: generateHeights biases the seam border heights (world::kCpuSeamBias).
-      // The strip across the edge is one chunk wide and chunk.scale long.
       const bool cpuAcross = alongZ ? overlapsCpuRect(across, across, start, start + chunk.scale - 1)
                                     : overlapsCpuRect(start, start + chunk.scale - 1, across, across);
       if (cpuAcross) {
@@ -237,6 +253,7 @@ struct ClipmapCompletion {
   ClipmapView view;
 };
 
+// Builds clipmaps on a background thread; only the newest finished build is kept.
 class ClipmapCuller {
 public:
   ClipmapCuller() : worker_([this] { run(); }) {}
@@ -252,6 +269,11 @@ public:
     worker_.join();
   }
 
+  /**
+   * Queue a build, replacing any build not yet started.
+   *
+   * @return sequence number of the build, increasing per submit.
+   */
   std::uint64_t submit(ClipmapView view) {
     std::lock_guard lock(mutex_);
     const std::uint64_t sequence = ++nextSequence_;
@@ -260,6 +282,7 @@ public:
     return sequence;
   }
 
+  /** Take the newest finished build, if any; rethrows an exception from the worker. */
   std::optional<ClipmapCompletion> takeCompletion() {
     std::lock_guard lock(mutex_);
     if (error_) {
@@ -271,6 +294,7 @@ public:
   }
 
 private:
+  /** Worker loop: build each pending view until stopping_. */
   void run() {
     for (;;) {
       std::pair<std::uint64_t, ClipmapView> job;
@@ -297,6 +321,7 @@ private:
     }
   }
 
+  // Shared with the worker; guarded by mutex_.
   std::mutex mutex_;
   std::condition_variable condition_;
   std::optional<std::pair<std::uint64_t, ClipmapView>> pending_;

@@ -1,14 +1,12 @@
-// Hierarchical depth (Hi-Z) for the task shader's occlusion test. Every texel holds the FARTHEST depth of the
-// screen area it covers (reverse-Z: depth 1 = near, 0 = far, compare GREATER; farthest = smallest). Mip 0 is half the next power of two of the
-// screen, so every level after it is an exact 2x2 reduction. Built after the scene pass of the mesh path; the next
-// frame's taskMain reads it together with ubo.previousMvp, the matrices it was rendered with.
+// Hierarchical depth (Hi-Z) for the task shader's occlusion test. Each texel holds the FARTHEST depth it covers
+// (reverse-Z: 1 = near, 0 = far, so farthest = min). Mip 0 is half the next power of two of the screen, so every later
+// level is an exact 2x2 reduction. Built after the mesh path's scene pass; next frame's taskMain reads it with
+// ubo.previousMvp.
 //
-// Two dispatches build the whole pyramid, with one barrier between them:
-//   hzbBuildLow:  one 16x16 group per 16x16 block of mip 0, one thread per texel: depth -> mips 0..4.
-// The depth is the scene pass's single-sample MIN resolve (renderer.cpp, resolvedDepthImages).
+// Two dispatches, one barrier between them:
+//   hzbBuildLow:  one 16x16 group per 16x16 block of mip 0: depth -> mips 0..4.
 //   hzbBuildHigh: a single group: mip 4 -> mips 5..last.
-// Both reduce in shared memory with farther() (min). Depth is <= 1, so 1 is its identity: texels outside a level
-// (non-square or tiny pyramids) read as 1.
+// Texels outside a level (non-square or tiny pyramids) read as 1, the identity of farther().
 
 static const uint MAX_HZB_MIPS = 16u;  // MAX_HZB_MIPS in renderer.cpp
 static const uint LOW_MIPS = 5u;       // mips written by hzbBuildLow (HZB_LOW_MIPS in renderer.cpp)
@@ -18,39 +16,49 @@ struct HzbParams {
   uint2 mip0Size;
   uint2 depthSize;
   uint mipCount;
-  // Reverse-Z depth of HZB_IGNORE_NEAR_DISTANCE (renderer.cpp): nearer samples are stored as the far plane (0), so
-  // geometry right in front of the camera, which disoccludes fast, never culls anything.
+  // Reverse-Z depth of HZB_IGNORE_NEAR_DISTANCE (renderer.cpp): nearer samples store the far plane (0), so geometry
+  // right in front of the camera, which disoccludes fast, never culls anything.
   float ignoreNearerDepth;
 };
 
 [[vk::push_constant]]
 ConstantBuffer<HzbParams> params;
 
-// Single-sample MIN resolve of the scene's MSAA depth: already the farthest sample of each pixel.
-
 static const float NEAREST = 1.0f; // identity of farther()
+
+/** Farther of two reverse-Z depths. */
 float farther(float a, float b) { return min(a, b); }
+
+// Scene pass's single-sample MIN resolve of the MSAA depth (renderer.cpp, resolvedDepthImage): already the farthest
+// sample of each pixel.
 [[vk::binding(0, 0)]]
 Texture2D<float> Depth;
 [[vk::binding(1, 0)]]
 RWTexture2D<float> Mips[MAX_HZB_MIPS];
 
+/** Size of mip level `mip`, at least 1x1. */
 uint2 mipSize(uint mip) { return max(params.mip0Size >> mip, uint2(1u, 1u)); }
 
+/** Depth of one scene pixel, with samples nearer than params.ignoreNearerDepth pushed to the far plane. */
 float farthestSample(uint2 pixel) {
   const float depth = Depth.Load(int3(int2(pixel), 0));
   return depth > params.ignoreNearerDepth ? 0.0f : depth;
 }
 
-// Farthest depth over the depth pixels covered by mip 0 texel `texel`, rounding outward so nothing is missed.
+/**
+ * Farthest depth over the depth pixels covered by a mip 0 texel, rounding outward so nothing is missed.
+ *
+ * @param texel Mip 0 texel coordinate.
+ * @return farthest (smallest) reverse-Z depth in the texel's footprint.
+ */
 float farthestDepth(uint2 texel) {
   const uint2 first = texel * params.depthSize / params.mip0Size;
   const uint2 last =
       min(((texel + 1u) * params.depthSize + params.mip0Size - 1u) / params.mip0Size, params.depthSize) - 1u;
   float farthest = NEAREST;
   if (all(last - first < 3u)) {
-    // Usual case: the screen is at most twice mip 0, so a footprint spans at most 3x3 pixels. Fixed bounds let
-    // every load issue at once; clamped repeats hit the cache.
+    // Usual case: screen <= 2x mip 0, so a footprint spans <= 3x3 pixels. Fixed bounds let every load issue at once;
+    // clamped repeats hit the cache.
     [unroll]
     for (uint y = 0u; y < 3u; ++y) {
       [unroll]
@@ -72,6 +80,12 @@ float farthestDepth(uint2 texel) {
 groupshared float lowA[16 * 16];
 groupshared float lowB[8 * 8];
 
+/**
+ * Builds mips 0..LOW_MIPS-1 from the scene depth, one thread per mip 0 texel.
+ *
+ * @param groupID 16x16 block of mip 0 this group reduces.
+ * @param threadID Texel within the block.
+ */
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void hzbBuildLow(uint3 groupID: SV_GroupID, uint3 threadID: SV_GroupThreadID) {
@@ -86,7 +100,7 @@ void hzbBuildLow(uint3 groupID: SV_GroupID, uint3 threadID: SV_GroupThreadID) {
   GroupMemoryBarrierWithGroupSync();
 
   // Mips 1..4 ping-pong between lowA (16x16 source, 4x4) and lowB (8x8, 2x2); row stride = the level's side.
-  // Mip indices stay compile-time constants (unrolled), so the image array needs no dynamic indexing here.
+  // Unrolled so mip indices are compile-time constants: no dynamic indexing of the image array.
   uint side = 8u;
   [unroll]
   for (uint mip = 1u; mip < LOW_MIPS; ++mip) {
@@ -115,6 +129,7 @@ void hzbBuildLow(uint3 groupID: SV_GroupID, uint3 threadID: SV_GroupThreadID) {
 groupshared float highA[HIGH_SIDE * HIGH_SIDE];
 groupshared float highB[(HIGH_SIDE / 2u) * (HIGH_SIDE / 2u)];
 
+/** Texel of high level `level` from shared memory, or NEAREST outside the level. */
 float highRead(uint level, uint2 texel) {
   const uint2 size = mipSize(level);
   if (any(texel >= size)) {
@@ -124,11 +139,16 @@ float highRead(uint level, uint2 texel) {
   return (level & 1u) != 0u ? highA[i] : highB[i];
 }
 
+/**
+ * Builds mips LOW_MIPS..mipCount-1 in a single 256-thread group, from the last mip hzbBuildLow wrote.
+ *
+ * @param threadID Lane within the group.
+ */
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void hzbBuildHigh(uint3 threadID: SV_GroupThreadID) {
   const uint lane = threadID.x;
-  // First high mip from the last low one, read back from the image hzbBuildLow wrote.
+  // First high mip from the last low one, read back from the image.
   const uint2 size = mipSize(LOW_MIPS);
   const uint2 srcSize = mipSize(LOW_MIPS - 1u);
   for (uint i = lane; i < size.x * size.y; i += 256u) {

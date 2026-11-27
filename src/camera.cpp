@@ -14,7 +14,7 @@ void Camera::updateFront() {
 }
 
 void Camera::initialize(GLFWwindow *window) {
-  updateFront(); // start looking where yaw/pitch say, so the first mouse update can't snap the view
+  updateFront(); // so the first mouse update can't snap the view
   glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
   if (glfwRawMouseMotionSupported()) {
     glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
@@ -37,29 +37,29 @@ void Camera::handleKey(GLFWwindow *window, int key, int action) {
 }
 
 void Camera::updateLook(GLFWwindow *window) {
-  if (!captured) {
+  if (!captured || lookLocked) {
     return;
   }
-  double xpos, ypos;
-  glfwGetCursorPos(window, &xpos, &ypos);
+  double cursorX, cursorY;
+  glfwGetCursorPos(window, &cursorX, &cursorY);
 
   if (firstMouse) {
-    lastMouseX = xpos;
-    lastMouseY = ypos;
+    lastMouseX = cursorX;
+    lastMouseY = cursorY;
     firstMouse = false;
   }
 
-  const double xoffset = (xpos - lastMouseX) * mouseSensitivity;
-  const double yoffset = (lastMouseY - ypos) * mouseSensitivity;
-  lastMouseX = xpos;
-  lastMouseY = ypos;
+  const double yawDelta = (cursorX - lastMouseX) * mouseSensitivity;
+  const double pitchDelta = (lastMouseY - cursorY) * mouseSensitivity;
+  lastMouseX = cursorX;
+  lastMouseY = cursorY;
 
-  cameraYaw += static_cast<float>(xoffset);
-  cameraPitch = glm::clamp(cameraPitch + static_cast<float>(yoffset), -89.f, 89.f);
+  cameraYaw += static_cast<float>(yawDelta);
+  cameraPitch = glm::clamp(cameraPitch + static_cast<float>(pitchDelta), -89.f, 89.f);
 
   updateFront();
   // No recentering: GLFW_CURSOR_DISABLED already gives an unbounded virtual cursor, and on Wayland
-  // glfwSetCursorPos can't warp, so assuming the cursor moved to the center produced a huge first delta.
+  // glfwSetCursorPos can't warp (recentering produced a huge first delta).
 }
 
 glm::mat4 Camera::view(const glm::vec3 &eye) const {

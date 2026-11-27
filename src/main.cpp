@@ -5,6 +5,11 @@
 #include <filesystem>
 #include <iostream>
 
+/**
+ * Run the engine from the executable's directory, so relative asset paths resolve.
+ *
+ * @return EXIT_SUCCESS, or EXIT_FAILURE after printing an uncaught exception.
+ */
 int main(int argc, char **argv) {
   try {
     if (argc > 0) {
