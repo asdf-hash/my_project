@@ -599,23 +599,37 @@ void CpuWorld::tickFluids(double now) {
   }
 
   // Decide every cell against the pre-step state (columns_ changes only in publish), so ocean advances one block.
+  // Water falls first: a cell with air right under it floods that cell instead and waits for a later step, so
+  // water reaching a drop fills downward before it spreads.
   static constexpr int32_t kSides[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
   std::vector<BlockXYZ> flooded;
+  std::vector<BlockXYZ> waiting; // cells that flooded below themselves this step
   for (const BlockXYZ &candidate : candidates) {
     if (candidate[1] >= world::kSeaLevel || !columnLoaded(floorDiv(candidate[0], N), floorDiv(candidate[2], N)) ||
         blockId(candidate[0], candidate[1], candidate[2]) != kAir) {
       continue;
     }
-    for (const auto &side : kSides) {
-      if (blockId(candidate[0] + side[0], candidate[1] + side[1], candidate[2] + side[2]) == ids_.ocean) {
-        flooded.push_back(candidate);
-        break;
-      }
+    const bool touchesOcean = std::ranges::any_of(kSides, [&](const auto &side) {
+      return blockId(candidate[0] + side[0], candidate[1] + side[1], candidate[2] + side[2]) == ids_.ocean;
+    });
+    if (!touchesOcean) {
+      continue;
+    }
+    BlockXYZ target = candidate;
+    if (target[1] - 1 >= world::kMinTerrainHeight && blockId(target[0], target[1] - 1, target[2]) == kAir) {
+      --target[1];
+    }
+    flooded.push_back(target);
+    if (target != candidate) {
+      waiting.push_back(candidate);
     }
   }
   if (flooded.empty()) {
     return;
   }
+  std::sort(flooded.begin(), flooded.end());
+  flooded.erase(std::unique(flooded.begin(), flooded.end()), flooded.end());
+  flowCandidates_.insert(flowCandidates_.end(), waiting.begin(), waiting.end());
   EditBatch batch;
   for (const BlockXYZ &cell : flooded) {
     const int32_t cx = floorDiv(cell[0], N);

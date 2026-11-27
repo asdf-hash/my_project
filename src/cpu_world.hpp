@@ -110,7 +110,8 @@ public:
   bool placeBlock(int32_t x, int32_t y, int32_t z, uint16_t id);
   /**
    * Every kOceanFlowSeconds, flood ocean one block into adjacent air cells below sea level (edited cells, then their
-   * air neighbors), remeshing once per step. Main thread, once per frame.
+   * air neighbors), remeshing once per step. A cell over air floods the cell right below it instead and fills on
+   * a later step. Main thread, once per frame.
    *
    * @param now Current time, in seconds.
    */

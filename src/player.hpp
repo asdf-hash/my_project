@@ -171,8 +171,8 @@ private:
   void respawn();
 
   Mode currentMode = Mode::Walking;
-  GameMode currentGameMode = GameMode::Survival;
-  GameMode lastGameMode = GameMode::Creative;
+  GameMode currentGameMode = GameMode::Creative;
+  GameMode lastGameMode = GameMode::Survival; // so the first F3+F4 starts on survival, like Minecraft
   glm::dvec3 position{0.5, 100.0, 0.5}; // feet, center of the box's bottom face
   glm::dvec3 previousPosition = position;
   glm::dvec3 motion{0.0};

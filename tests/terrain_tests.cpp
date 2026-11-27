@@ -660,28 +660,56 @@ int main() {
       for (int i = 0; i < 100; ++i) CHECK(world.isInfiniteSource(sx, surfaceY, sz), "ocean source changed");
 
       // Tunnel 3 below the lowest surrounding seabed, 6 long toward +x, dug first (stays dry), then a shaft from
-      // the seabed down to it: the ocean floods shaft then tunnel, exactly one cell per step.
+      // the seabed down to it. Expected flood steps come from a reference run of the flow rule on the path alone: each
+      // step, every dry cell touching water floods, or floods the cell right below it instead if that is dry.
       int32_t lowest = sh;
       for (int32_t x = sx - 1; x <= sx + 6; ++x)
         for (int32_t z = sz - 1; z <= sz + 1; ++z) lowest = std::min(lowest, heightAt(x, z));
       const int32_t depth = lowest - 3;
-      std::vector<BlockXYZ> path;
-      for (int32_t y = sh - 1; y > depth; --y) path.push_back({sx, y, sz});
+      std::vector<BlockXYZ> path; // every cell that floods: tunnel, then shaft bottom to top
       for (int32_t x = sx; x < sx + 6; ++x) path.push_back({x, depth, sz});
+      for (int32_t y = depth + 1; y < sh; ++y) path.push_back({sx, y, sz});
+      std::vector<size_t> floodStep(path.size(), 0); // step at which path[i] floods (0: not yet)
+      {
+        const auto indexOf = [&](BlockXYZ cell) -> std::ptrdiff_t {
+          const auto it = std::find(path.begin(), path.end(), cell);
+          return it == path.end() ? -1 : it - path.begin();
+        };
+        const auto wetBefore = [&](BlockXYZ cell, size_t step) {
+          if (cell == (BlockXYZ{sx, sh, sz})) return true; // the seabed cell above the shaft is ocean
+          const std::ptrdiff_t i = indexOf(cell);
+          return i >= 0 && floodStep[i] != 0 && floodStep[i] < step;
+        };
+        static constexpr int32_t kSides[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (size_t step = 1; std::count(floodStep.begin(), floodStep.end(), 0u) > 0 && step < 100; ++step)
+          for (size_t i = 0; i < path.size(); ++i) {
+            if (wetBefore(path[i], step)) continue; // pre-step state, like tickFluids
+            bool touches = false;
+            for (const auto &side : kSides)
+              touches = touches || wetBefore({path[i][0] + side[0], path[i][1] + side[1], path[i][2] + side[2]}, step);
+            if (!touches) continue;
+            const std::ptrdiff_t below = indexOf({path[i][0], path[i][1] - 1, path[i][2]});
+            const size_t target = below >= 0 && !wetBefore(path[below], step) ? static_cast<size_t>(below) : i;
+            if (floodStep[target] == 0) floodStep[target] = step;
+          }
+      }
+      const size_t lastStep = *std::max_element(floodStep.begin(), floodStep.end());
       for (int32_t x = sx; x < sx + 6; ++x) CHECK(world.breakBlock(x, depth, sz), "tunnel dig failed");
       for (int i = 0; i < 3; ++i) step();
       bool dry = true;
       for (int32_t x = sx; x < sx + 6; ++x) dry = dry && world.blockId(x, depth, sz) == kAir;
       CHECK(dry, "unconnected tunnel flooded");
       for (int32_t y = sh - 1; y > depth; --y) CHECK(world.breakBlock(sx, y, sz), "shaft dig failed");
-      for (size_t k = 1; k <= path.size(); ++k) {
+      for (size_t k = 1; k <= lastStep; ++k) {
         step();
-        CHECK(world.blockId(path[k - 1][0], path[k - 1][1], path[k - 1][2]) == kOcean, "path cell %zu not flooded at step %zu", k - 1, k);
-        if (k < path.size())
-          CHECK(world.blockId(path[k][0], path[k][1], path[k][2]) == kAir, "path cell %zu flooded early at step %zu", k, k);
+        for (size_t i = 0; i < path.size(); ++i) {
+          const bool wet = world.blockId(path[i][0], path[i][1], path[i][2]) == kOcean;
+          CHECK(wet == (floodStep[i] <= k), "path cell %zu (%d %d %d) %s at step %zu (expected step %zu)", i, path[i][0],
+                path[i][1], path[i][2], wet ? "flooded" : "dry", k, floodStep[i]);
+        }
       }
-      std::printf("ocean edits: seabed %d at %d %d, flooded %zu-cell shaft + tunnel one per step\n", sh, sx, sz,
-                  path.size());
+      std::printf("ocean edits: seabed %d at %d %d, flooded %zu-cell shaft + tunnel in %zu steps\n", sh, sx,
+                  sz, path.size(), lastStep);
 
       // Meshes around the edits against brute force.
       pump();
