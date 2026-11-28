@@ -55,7 +55,22 @@ struct Block {
   std::array<float, 3> lodTint{1.0f, 1.0f, 1.0f};
   // Color multiplier faded in with distance around LOD 3 (blocks.txt `far_tint`), where a tree is one leaf block.
   std::array<float, 3> farTint{1.0f, 1.0f, 1.0f};
+  // Inventory: name shown in tooltips and creative search (blocks.txt `display_name`, default: the name title-cased),
+  // creative tab (`category`), whether the creative tabs list it (`creative`).
+  std::string displayName;
+  std::string category = "building_blocks";
+  bool creative = true;
+  // What survival breaking drops (blocks.txt `drops = <block> | none`, default the block itself).
+  bool dropsNothing = false;
+  // Dropped-item physics: kg/m^3 (blocks.txt `density`); below water's 1000 floats.
+  float density = 1500.0f;
+  std::uint32_t dropId = 0;
 };
+
+// Creative tab ids accepted by blocks.txt `category`, in vanilla's tab order.
+inline constexpr std::array<std::string_view, 10> kCategories{
+    "building_blocks", "colored_blocks", "natural_blocks", "functional_blocks", "redstone_blocks",
+    "tools",           "combat",         "food",           "ingredients",       "spawn_eggs"};
 
 struct Registry {
   std::vector<Block> blocks;

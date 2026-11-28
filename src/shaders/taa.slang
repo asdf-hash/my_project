@@ -62,6 +62,7 @@ TaaOutput taaFragmentMain(TaaInput input) {
 
   float3 outputColor = current.rgb;
   if ((taaParams.historyValid & 2u) != 0u) {
+    const float3 currentYCoCg = toYCoCg(current.rgb);
     float3 neighborhoodMin = float3(1.0e20f, 1.0e20f, 1.0e20f);
     float3 neighborhoodMax = float3(-1.0e20f, -1.0e20f, -1.0e20f);
     float3 neighborhoodMean = 0.0f;
@@ -70,7 +71,10 @@ TaaOutput taaFragmentMain(TaaInput input) {
       [unroll]
       for (int x = -1; x <= 1; ++x) {
         const float3 sampleColor =
-            toYCoCg(SceneColor.SampleLevel(taaSampler, uv + float2(x, y) * taaParams.inverseRenderSize, 0.0f).rgb);
+            x == 0 && y == 0
+                ? currentYCoCg
+                : toYCoCg(
+                      SceneColor.SampleLevel(taaSampler, uv + float2(x, y) * taaParams.inverseRenderSize, 0.0f).rgb);
         neighborhoodMin = min(neighborhoodMin, sampleColor);
         neighborhoodMax = max(neighborhoodMax, sampleColor);
         neighborhoodMean += sampleColor;
@@ -78,7 +82,6 @@ TaaOutput taaFragmentMain(TaaInput input) {
     }
     neighborhoodMean /= 9.0f;
 
-    const float3 currentYCoCg = toYCoCg(current.rgb);
     const float sharpenedLuma =
         currentYCoCg.x + 0.15f * (currentYCoCg.x - neighborhoodMean.x);
     outputColor = fromYCoCg(float3(sharpenedLuma, currentYCoCg.yz));

@@ -293,6 +293,93 @@ void checkChunk(const Neighborhood &nb, int32_t chunkY, const ChunkMesh &mesh,
           CHECK(count == (face ? 1 : 0), "face %d %d %d n%d covered %d times, expected %d (chunk %d %d %d)", x, y, z,
                 n, count, face ? 1 : 0, column.cx, chunkY, column.cz);
         }
+
+  // Smooth terrain: one 4-vertex quad per opaque face, then per foliage face (non-opaque, non-ocean block next to air
+  // or ocean), carrying its cell's block and direction, each corner within half a block of the chunk's lattice.
+  CHECK(mesh.smoothVertices.size() % 4 == 0, "smooth vertex count %zu not a multiple of 4", mesh.smoothVertices.size());
+  CHECK(mesh.smoothOpaqueVertices % 4 == 0 && mesh.smoothOpaqueVertices <= mesh.smoothVertices.size(),
+        "smooth opaque vertex count %u out of range", mesh.smoothOpaqueVertices);
+  std::map<std::tuple<int, int>, int> smoothFaces, foliageFaces; // (block, direction) -> quads
+  for (size_t q = 0; q + 3 < mesh.smoothVertices.size(); q += 4) {
+    const uint16_t material = mesh.smoothVertices[q].material;
+    for (size_t k = 0; k < 4; ++k) {
+      const SmoothVertex &v = mesh.smoothVertices[q + k];
+      CHECK(v.material == material, "smooth quad corners disagree on material");
+      for (const uint16_t c : {v.x, v.y, v.z}) {
+        CHECK(c >= kSmoothFixedOne / 2 && c <= 33 * kSmoothFixedOne + kSmoothFixedOne / 2,
+              "smooth corner %u outside the chunk (chunk %d %d %d)", c, column.cx, chunkY, column.cz);
+      }
+    }
+    ++(q < mesh.smoothOpaqueVertices ? smoothFaces : foliageFaces)[{material & 0x3ff, material >> 10}];
+  }
+  if (!only && voxels != nullptr) {
+    std::map<std::tuple<int, int>, int> expectedFaces, expectedFoliage;
+    /** Foliage: non-opaque blocks but air and the ocean. */
+    const auto foliageAt = [&](int x, int y, int z) {
+      const uint16_t id = brute.id(x, y, z);
+      return id != kAir && id != kOcean && !blocks::isOpaque(id);
+    };
+    for (int z = 0; z < 32; ++z)
+      for (int y = 0; y < 32; ++y)
+        for (int x = 0; x < 32; ++x)
+          for (int n = 0; n < 6; ++n) {
+            const int nx = x + o[n][0], ny = y + o[n][1], nz = z + o[n][2];
+            if (brute.solid(x, y, z) && !brute.solid(nx, ny, nz)) {
+              ++expectedFaces[{voxels->ids[VoxelChunk::index(x, y, z)], n}];
+            }
+            if (foliageAt(x, y, z) && !brute.solid(nx, ny, nz) && !foliageAt(nx, ny, nz)) {
+              ++expectedFoliage[{voxels->ids[VoxelChunk::index(x, y, z)], n}];
+            }
+          }
+    CHECK(smoothFaces == expectedFaces, "smooth quads do not match the opaque faces (chunk %d %d %d)", column.cx,
+          chunkY, column.cz);
+    CHECK(foliageFaces == expectedFoliage, "smooth foliage quads do not match the foliage faces (chunk %d %d %d)",
+          column.cx, chunkY, column.cz);
+  }
+}
+
+/**
+ * A column of stone up to a float surface `raw(lx, lz)` (column-local, -1..32 for the border; the top is its floor),
+ * air above.
+ */
+std::shared_ptr<Column> makeTestColumnRaw(int32_t cx, int32_t cz, const std::function<float(int32_t, int32_t)> &raw) {
+  auto column = std::make_shared<Column>();
+  column->cx = cx;
+  column->cz = cz;
+  const auto height = [&](int32_t lx, int32_t lz) { return int32_t(std::floor(raw(lx, lz))); };
+  for (int32_t lz = -1; lz <= 32; ++lz)
+    for (int32_t lx = -1; lx <= 32; ++lx) column->rawHeights[Column::padIndex(lx, lz)] = raw(lx, lz);
+  column->firstChunkY = 0;
+  column->chunks.push_back(std::make_unique<VoxelChunk>());
+  VoxelChunk &voxels = *column->chunks[0];
+  for (int32_t lz = 0; lz < 32; ++lz)
+    for (int32_t lx = 0; lx < 32; ++lx) {
+      const int32_t h = height(lx, lz);
+      column->heights[lz * 32 + lx] = h;
+      uint32_t solid = 0;
+      for (int32_t y = 0; y < 32; ++y) {
+        voxels.ids[VoxelChunk::index(lx, y, lz)] = y < h ? uint16_t(2) : kAir;
+        solid |= (y < h ? 1u : 0u) << y;
+      }
+      voxels.solid[lz * 32 + lx] = solid;
+      voxels.ocean[lz * 32 + lx] = 0;
+    }
+  for (int32_t lz = 0; lz < 32; ++lz)
+    for (int32_t lx = 0; lx < 32; ++lx) column->rescanSkyTop(lx, lz);
+  return column;
+}
+
+/** A column of flat ground, top at `height(lx, lz)` (its float surface half a block above), stone below, air above. */
+std::shared_ptr<Column> makeTestColumn(int32_t cx, int32_t cz, const std::function<int32_t(int32_t, int32_t)> &height) {
+  return makeTestColumnRaw(cx, cz, [&](int32_t lx, int32_t lz) { return float(height(lx, lz)) + 0.5f; });
+}
+
+/** Smooth vertex of `mesh` whose position is fixed (x, y, z), or null. */
+const SmoothVertex *findSmoothVertex(const ChunkMesh &mesh, int32_t x, int32_t y, int32_t z) {
+  for (const SmoothVertex &v : mesh.smoothVertices) {
+    if (v.x == x && v.y == y && v.z == z) return &v;
+  }
+  return nullptr;
 }
 
 /** Checks a column's block ids and solid / ocean masks against the fill rule written plainly. */
@@ -784,6 +871,20 @@ int main() {
       tree.shape = (tree.shape & ~(3u << 12u)) | (style << 12u);
       tree.trunkHeight = treeTrunkHeightFor(style, (i / 4) % 2 ? 255u : 0u);
       tree.ground = int32_t(next() % 200u) + 3;
+      // treeLeafLayerMask (coarse LODs' precomputed layers) matches treeBlockAt's leaves on every canopy layer.
+      {
+        const int32_t low = treeCanopyLow(style, tree.trunkHeight), high = treeCanopyHigh(style, tree.trunkHeight);
+        for (int32_t dy = low; dy < high; ++dy) {
+          const uint32_t mask = treeLeafLayerMask(tree.shape, high - 1 - dy);
+          for (int32_t dz = -TREE_RADIUS; dz <= TREE_RADIUS; ++dz)
+            for (int32_t dx = -TREE_RADIUS; dx <= TREE_RADIUS; ++dx) {
+              const bool leaf = treeBlockAt(tree, tree.trunkX + dx, tree.ground + dy, tree.trunkZ + dz) == TREE_LEAVES;
+              const bool bit = (mask >> uint32_t((dz + TREE_RADIUS) * 5 + dx + TREE_RADIUS)) & 1u;
+              CHECK(leaf == bit || (dx == 0 && dz == 0 && dy < tree.trunkHeight), "layer mask style %u layer %d at %d %d: %d vs %d",
+                    style, dy, dx, dz, int(bit), int(leaf));
+            }
+        }
+      }
       const int32_t x0 = cell.x * 32, z0 = cell.y * 32;
       for (int32_t z = z0 - 4; z < z0 + 36; ++z)
         for (int32_t x = x0 - 4; x < x0 + 36; ++x)
@@ -798,8 +899,9 @@ int main() {
     std::printf("trees: candidate checksum %016llx (%zu of 20000 pass the density)\n",
                 (unsigned long long)treeChecksum, accepted);
 
-    // Far LODs show the same trees: a scale-16 / scale-64 column (computeTreeColumn's LOD 4+ rule: candidates whose
-    // trunk is inside, density, slope and band from the column's centre) is filled where the exact trees have a trunk.
+    // Far LODs show the same trees as leaf-topped columns (treeCoversColumn): scale 8 (LOD 3) from the staged exact
+    // trees, 16 and 64 (LOD 4+) with slope and band from the column's centre. Each is checked against the exact trees
+    // under the same rule and for LOD 0's ground cover; LOD 2's downsampled volume is checked below.
     {
       constexpr int32_t kRegions = 32; // 1024 x 1024 blocks
       constexpr int32_t kSize = kRegions * 32;
@@ -836,16 +938,19 @@ int main() {
       for (const int scale : {8, 16, 64}) {
         const int32_t perSide = kSize / scale;
         std::vector<uint8_t> exact(size_t(perSide) * perSide, 0), filled(size_t(perSide) * perSide, 0);
-        for (const TreeInstance &t : exactTrees)
-          if (treeShowsAtScale(t.trunkX, t.trunkZ, scale))
-            exact[size_t((t.trunkZ - baseZ) / scale) * perSide + size_t((t.trunkX - baseX) / scale)] = 1;
+        for (const TreeInstance &t : exactTrees) {
+          for (int32_t cz = (t.trunkZ - TREE_RADIUS - baseZ) / scale; cz <= (t.trunkZ + TREE_RADIUS - baseZ) / scale; ++cz)
+            for (int32_t cx = (t.trunkX - TREE_RADIUS - baseX) / scale; cx <= (t.trunkX + TREE_RADIUS - baseX) / scale; ++cx)
+              if (treeCoversColumn(t, baseX + cx * scale, baseZ + cz * scale, scale))
+                exact[size_t(cz) * perSide + size_t(cx)] = 1;
+        }
         size_t both = 0, exactOnly = 0, farOnly = 0, count = 0;
         for (int32_t cz = 0; cz < perSide; ++cz)
           for (int32_t cx = 0; cx < perSide; ++cx) {
             const int32_t columnX = baseX + cx * scale, columnZ = baseZ + cz * scale;
             bool f = exact[size_t(cz) * perSide + size_t(cx)] != 0; // scale 8: the staged, exact trees
             if (scale > 8) {
-              // computeTreeColumn's LOD 4+ rule: position, roll, density, then slope / band at the column's centre.
+              // computeTreeColumn's far rules, slope / band / ground from one sample at the column's centre.
               int32_t xs[8], zs[8];
               float h[8], gx[8], gz[8];
               for (int l = 0; l < 8; ++l) {
@@ -855,17 +960,15 @@ int main() {
               terrain::sampleHeightsGrad8(xs, zs, h, gx, gz);
               const int32_t ground = int32_t(std::floor(h[0]));
               const int steepness = treeSteepness(gx[0], gz[0]);
+              const bool bandOk = ground >= TREE_MIN_GROUND && ground <= TREE_MAX_GROUND;
+              // computeTreeColumn's LOD 4+ rule: the regions' accepted candidates covering the column.
               f = false;
-              for (int32_t rz = columnZ >> 5; rz <= (columnZ + scale - 1) >> 5 && !f; ++rz)
+              for (int32_t rz = columnZ >> 5; rz <= (columnZ + scale - 1) >> 5 && bandOk && !f; ++rz)
                 for (int32_t rx = columnX >> 5; rx <= (columnX + scale - 1) >> 5 && !f; ++rx)
                   for (uint32_t slot = 0; slot < uint32_t(TREE_SLOTS) && !f; ++slot) {
-                    const TreeInstance t = treeCandidateUnfiltered(int2(rx, rz), slot);
-                    if (t.trunkX < columnX || t.trunkX >= columnX + scale || t.trunkZ < columnZ ||
-                        t.trunkZ >= columnZ + scale || !treeShowsAtScale(t.trunkX, t.trunkZ, scale))
-                      continue;
-                    if (int(treeCandidateHash(int2(rx, rz), slot) >> 24u) >= treeChanceAt(t.trunkX, t.trunkZ)) continue;
-                    f = ground >= TREE_MIN_GROUND && ground <= TREE_MAX_GROUND &&
-                        treeSlopeOk(steepness, treeSlopeRoll(t.shape));
+                    const TreeInstance t = treeCandidate(int2(rx, rz), slot);
+                    f = t.trunkHeight != 0 && treeSlopeOk(steepness, treeSlopeRoll(t.shape)) &&
+                        treeCoversColumn(t, columnX, columnZ, scale);
                   }
             }
             filled[size_t(cz) * perSide + size_t(cx)] = f;
@@ -876,13 +979,13 @@ int main() {
             count += f;
           }
         const double cover = double(count) / double(perSide * perSide);
-        std::printf(", scale %d cover %.4f (%zu on exact trunks, %zu not, %zu missed)", scale, cover, both, farOnly,
+        std::printf(", scale %d cover %.4f (%zu on exact trees, %zu not, %zu missed)", scale, cover, both, farOnly,
                     exactOnly);
         CHECK(std::abs(cover - lod0) < 0.3 * lod0, "scale %d cover %.4f vs LOD 0 %.4f", scale, cover, lod0);
-        CHECK(double(farOnly) <= 0.1 * double(std::max<size_t>(1, count)), "scale %d: cells off the real trunks", scale);
+        CHECK(double(farOnly) <= std::max(2.0, 0.1 * double(count)), "scale %d: cells off the real trees", scale);
         if (scale == 8) filled8 = filled;
         if (scale == 16) {
-          // Nested: a filled scale-16 column (from an exact trunk) has a filled scale-8 child.
+          // Nested: a filled scale-16 column (matching the exact trees) has a filled scale-8 child.
           size_t orphans = 0;
           for (int32_t cz = 0; cz < perSide; ++cz)
             for (int32_t cx = 0; cx < perSide; ++cx) {
@@ -894,6 +997,23 @@ int main() {
             }
           CHECK(orphans == 0, "%zu scale-16 cells without a scale-8 child", orphans);
         }
+      }
+      // Scale 4 (LOD 2) keeps the trees' volume: shown cells, over every column a canopy reaches, against their leaf
+      // blocks (the trunk's own cell counts as leaves, as in treeLeafLayerMask), within 3 sigma of the cell count.
+      {
+        double leafBlocks = 0, shownCells = 0;
+        for (const TreeInstance &t : exactTrees) {
+          const uint32_t style = treeStyle(t.shape);
+          for (int32_t y = treeCanopyLow(style, t.trunkHeight); y < treeCanopyHigh(style, t.trunkHeight); ++y)
+            leafBlocks += vegPopcount(treeLeafLayerMask(t.shape, treeCanopyHigh(style, t.trunkHeight) - 1 - y));
+          for (int32_t z = vegFloorDiv(t.trunkZ - TREE_RADIUS, 4); z <= vegFloorDiv(t.trunkZ + TREE_RADIUS, 4); ++z)
+            for (int32_t x = vegFloorDiv(t.trunkX - TREE_RADIUS, 4); x <= vegFloorDiv(t.trunkX + TREE_RADIUS, 4); ++x)
+              shownCells += vegPopcount(treeCoarseLeaves(t, x * 4, z * 4, 4).mask);
+        }
+        const double expected = leafBlocks / 64.0;
+        std::printf(", scale 4 volume %.3f of LOD 0", shownCells / expected);
+        CHECK(std::abs(shownCells - expected) <= std::max(0.05 * expected, 3.0 * std::sqrt(expected)),
+              "scale 4: %.0f cells vs %.1f expected", shownCells, expected);
       }
       std::printf("\n");
     }
@@ -988,6 +1108,119 @@ int main() {
     }
     CHECK(treeColumns >= 6, "only %zu columns with trees found", treeColumns);
     std::printf("trees: %zu columns (%zu trees) checked, %zu chunks meshed\n", treeColumns, treesSeen, treeChunks);
+  }
+
+  /**
+   * Smooth terrain (Surface Nets): flat ground stays on the grid, a one-block step becomes a 45 degree chamfer, corners
+   * next to a cubic block stay on the grid, and the surface is closed across chunk borders.
+   */
+  {
+    const int before = failures;
+    constexpr int32_t F = kSmoothFixedOne;
+    // Ground at 10, one block higher for x >= 16.
+    const auto stepHeight = [](int32_t lx, int32_t) { return lx >= 16 ? 11 : 10; };
+    auto stepped = makeTestColumn(0, 0, stepHeight);
+    Neighborhood nb;
+    nb.columns[1][1] = stepped.get();
+    ChunkMesh mesh;
+    meshChunk(nb, 0, mesh);
+    checkChunk(nb, 0, mesh);
+    // Flat part: the corner at lattice (5, 10, 5) is unmoved, normal straight up.
+    const SmoothVertex *flat = findSmoothVertex(mesh, 6 * F, 11 * F, 6 * F);
+    CHECK(flat != nullptr, "flat ground corner moved");
+    if (flat) {
+      CHECK(int8_t(flat->normalLight >> 8) == 127 && int8_t(flat->normalLight) == 0, "flat ground normal not up");
+    }
+    // Lower step edge, lattice (16, 10, 8): pulled a quarter block toward -x and up (cells 15 / 16, 9 / 10).
+    CHECK(findSmoothVertex(mesh, 17 * F - F / 4, 11 * F + F / 4, 9 * F) != nullptr, "step corner not chamfered");
+    // Upper step edge, lattice (16, 11, 8): pulled a quarter block toward +x and down.
+    CHECK(findSmoothVertex(mesh, 17 * F + F / 4, 12 * F - F / 4, 9 * F) != nullptr, "step top corner not chamfered");
+
+    // A gentle slope (surface rising 0.2 blocks per block along x) has no terraces: along a row, the top surface's
+    // corners rise strictly with x, though the voxel tops step only every 5 blocks.
+    auto slope = makeTestColumnRaw(0, 0, [](int32_t lx, int32_t) { return 10.25f + 0.2f * float(lx); });
+    nb.columns[1][1] = slope.get();
+    ChunkMesh slopeMesh;
+    meshChunk(nb, 0, slopeMesh);
+    checkChunk(nb, 0, slopeMesh);
+    std::map<int, int> rowHeights; // fixed x -> fixed y of the top surface's corners at z lattice 8
+    for (size_t q = 0; q < slopeMesh.smoothOpaqueVertices; q += 4) {
+      for (size_t k = 0; k < 4; ++k) {
+        const SmoothVertex &v = slopeMesh.smoothVertices[q + k];
+        if (v.z == 9 * F && (v.material >> 10) == 2) rowHeights[v.x] = v.y;
+      }
+    }
+    CHECK(rowHeights.size() > 20, "slope row has only %zu corners", rowHeights.size());
+    int previous = -1, terraces = 0;
+    for (const auto &[x, y] : rowHeights) {
+      if (x <= 2 * F || x >= 32 * F) continue; // away from the border columns
+      terraces += previous >= 0 && y <= previous;
+      previous = y;
+    }
+    CHECK(terraces == 0, "gentle slope has %d flat or falling steps", terraces);
+
+    // Leaves on flat ground form their own (foliage) surface; the ground under them stays part of the opaque one.
+    constexpr uint16_t kLeaf = blocks::kNonOpaqueBit + 1;
+    auto leafy = makeTestColumn(0, 0, [](int32_t, int32_t) { return 10; });
+    VoxelChunk &leafVoxels = *leafy->chunks[0];
+    for (int32_t y = 12; y < 14; ++y)
+      for (int32_t z = 5; z < 8; ++z)
+        for (int32_t x = 5; x < 8; ++x) leafVoxels.ids[VoxelChunk::index(x, y, z)] = kLeaf;
+    leafVoxels.nonOpaqueCount = 18;
+    nb.columns[1][1] = leafy.get();
+    ChunkMesh leafMesh;
+    meshChunk(nb, 0, leafMesh);
+    checkChunk(nb, 0, leafMesh);
+    CHECK(leafMesh.smoothVertices.size() - leafMesh.smoothOpaqueVertices == 4 * (2 * 9 + 4 * 6),
+          "leaf blob has %zu foliage vertices, expected %d", leafMesh.smoothVertices.size() - leafMesh.smoothOpaqueVertices,
+          4 * (2 * 9 + 4 * 6));
+
+    // Closed surface across chunk borders: generated columns (0, 0) and (1, 0) with all neighbors loaded. Every quad
+    // edge well inside the pair (away from the outer column borders) is shared by an even number of quads.
+    std::map<std::pair<int, int>, std::shared_ptr<Column>> cols;
+    for (int32_t cz = -1; cz <= 1; ++cz)
+      for (int32_t cx = -1; cx <= 2; ++cx) cols[{cx, cz}] = generateColumn(cx + 40, cz - 20, kIds);
+    using Point = std::array<int64_t, 3>;
+    std::map<std::pair<Point, Point>, int> edges;
+    size_t seamQuads = 0;
+    for (int32_t cx = 0; cx <= 1; ++cx) {
+      Neighborhood pairNb;
+      for (int dz = -1; dz <= 1; ++dz)
+        for (int dx = -1; dx <= 1; ++dx) pairNb.columns[dz + 1][dx + 1] = cols[{cx + dx, dz}].get();
+      const Column &c = pairNb.center();
+      for (size_t i = 0; i < c.chunks.size(); ++i) {
+        const int32_t chunkY = c.firstChunkY + int32_t(i);
+        ChunkMesh m;
+        meshChunk(pairNb, chunkY, m);
+        const Point origin{int64_t(cx) * 32 * F, int64_t(chunkY) * 32 * F, 0};
+        for (size_t q = 0; q < m.smoothVertices.size(); q += 4) {
+          Point p[4];
+          for (int k = 0; k < 4; ++k) {
+            const SmoothVertex &v = m.smoothVertices[q + size_t(k)];
+            p[k] = {origin[0] + v.x, origin[1] + v.y, origin[2] + v.z};
+          }
+          for (int k = 0; k < 4; ++k) {
+            Point a = p[k], b = p[(k + 1) % 4];
+            if (b < a) std::swap(a, b);
+            ++edges[{a, b}];
+          }
+          ++seamQuads;
+        }
+      }
+    }
+    size_t oddEdges = 0, interiorEdges = 0;
+    for (const auto &[edge, count] : edges) {
+      const auto inside = [&](const Point &p) {
+        const int64_t x = p[0] / F - 1, z = p[2] / F - 1; // world blocks (cells -0.5 .. 0.5 round in)
+        return x >= 2 && x <= 61 && z >= 2 && z <= 29;
+      };
+      if (!inside(edge.first) || !inside(edge.second)) continue;
+      ++interiorEdges;
+      oddEdges += count % 2;
+    }
+    CHECK(interiorEdges > 1000, "only %zu interior smooth edges", interiorEdges);
+    CHECK(oddEdges == 0, "%zu of %zu interior smooth edges are open", oddEdges, interiorEdges);
+    std::printf("smooth: %zu seam quads checked%s\n", seamQuads, failures == before ? "" : " FAILED");
   }
 
   /** Timings: column generation and meshing. */

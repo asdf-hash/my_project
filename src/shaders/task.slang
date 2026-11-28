@@ -140,21 +140,32 @@ void taskMain(uint3 groupID: SV_GroupID, uint3 groupThreadID: SV_GroupThreadID) 
     meshlets += (runQuads[d] + QUADS_PER_MESHLET - 1u) / QUADS_PER_MESHLET;
   }
 
-  // Exclusive prefix over lanes through shared memory: independent of the subgroup size.
-  laneRunCount[lane] = runs;
-  laneMeshletCount[lane] = meshlets;
+  // Prefix within each wave, then combine the small number of wave totals for the group-wide offsets.
+  const uint waveLanes = WaveGetLaneCount();
+  const uint waveIndex = lane / waveLanes;
+  const uint waveCount = (CLUSTERS_PER_TASK + waveLanes - 1u) / waveLanes;
+  const uint waveRunPrefix = WavePrefixSum(runs);
+  const uint waveMeshletPrefix = WavePrefixSum(meshlets);
+  const uint waveRunTotal = WaveActiveSum(runs);
+  const uint waveMeshletTotal = WaveActiveSum(meshlets);
+  if (WaveIsFirstLane()) {
+    laneRunCount[waveIndex] = waveRunTotal;
+    laneMeshletCount[waveIndex] = waveMeshletTotal;
+  }
   GroupMemoryBarrierWithGroupSync();
-  uint runSlot = 0u;
-  uint meshletBase = 0u;
+  uint runSlot = waveRunPrefix;
+  uint meshletBase = waveMeshletPrefix;
   uint totalRuns = 0u;
   uint totalMeshlets = 0u;
-  for (uint i = 0u; i < CLUSTERS_PER_TASK; ++i) {
-    if (i < lane) {
-      runSlot += laneRunCount[i];
-      meshletBase += laneMeshletCount[i];
+  for (uint wave = 0u; wave < waveCount; ++wave) {
+    const uint waveRuns = laneRunCount[wave];
+    const uint waveMeshlets = laneMeshletCount[wave];
+    totalRuns += waveRuns;
+    totalMeshlets += waveMeshlets;
+    if (wave < waveIndex) {
+      runSlot += waveRuns;
+      meshletBase += waveMeshlets;
     }
-    totalRuns += laneRunCount[i];
-    totalMeshlets += laneMeshletCount[i];
   }
   [unroll]
   for (uint d = 0u; d < RUNS_PER_CLUSTER; ++d) {

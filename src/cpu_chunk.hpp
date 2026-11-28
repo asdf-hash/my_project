@@ -190,10 +190,28 @@ struct QuadCluster {
 static_assert(sizeof(QuadCluster) == 48);
 inline constexpr uint32_t kClustersPerChunk = 16;
 
+// One corner of a smooth-terrain quad (renderer smooth mode; slang.slang smoothVertMain). Four per opaque face, in
+// the order the shared {0,1,2, 0,2,3} quad index pattern draws front facing.
+struct SmoothVertex {
+  // Chunk-local position in 1/kSmoothFixedOne blocks, biased by one block (kSmoothFixedOne) so offsets below the
+  // chunk origin stay positive.
+  uint16_t x, y, z;
+  // Block id (bits 0-9) | face direction (10-12, 0..5 = +x, -x, +y, -y, +z, -z).
+  uint16_t material;
+  // Unit normal as signed bytes x (bits 0-7), y (8-15), z (16-23) | skylight 0..15 (26-29).
+  uint32_t normalLight;
+};
+static_assert(sizeof(SmoothVertex) == 12);
+inline constexpr int32_t kSmoothFixedOne = 256;
+
 struct ChunkMesh {
   int32_t cy = 0; // chunk y, in chunks
   // Packed quads (QuadBuffer layout) in cluster order; every quad shares chunkOffset (ChunkOffsets layout).
   std::vector<uint64_t> quads;
+  // Smooth mode's Surface Nets quads (4 vertices each): the opaque surface, then from smoothOpaqueVertices on the
+  // foliage surface (non-opaque blocks but the ocean, drawn in the cutout pass). Ocean faces are only in `quads`.
+  std::vector<SmoothVertex> smoothVertices;
+  uint32_t smoothOpaqueVertices = 0;
   uint64_t chunkOffset = 0;
   std::array<QuadCluster, kClustersPerChunk> clusters{};
   // Translucent (ocean) faces for the blended pass: same tile layout, quads stored after the opaque ones.

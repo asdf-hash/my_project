@@ -1,6 +1,7 @@
 #include "block_registry.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <fstream>
 #include <optional>
@@ -90,6 +91,22 @@ public:
     if (registry_.blocks.empty()) {
       throw std::runtime_error("no blocks defined in " + path_);
     }
+    // `drops` may name a block defined later in the file.
+    for (std::size_t i = 0; i < registry_.blocks.size(); ++i) {
+      Block &block = registry_.blocks[i];
+      const std::string &drops = dropNames_[i];
+      if (drops.empty()) {
+        block.dropId = block.id;
+      } else if (drops == "none") {
+        block.dropsNothing = true;
+      } else {
+        const auto it = std::ranges::find_if(registry_.blocks, [&](const Block &b) { return b.name == drops; });
+        if (it == registry_.blocks.end()) {
+          throw std::runtime_error(path_ + ": block '" + block.name + "' drops unknown block '" + drops + "'");
+        }
+        block.dropId = it->id;
+      }
+    }
     return std::move(registry_);
   }
 
@@ -117,6 +134,18 @@ private:
       fail("duplicate block '" + name + "'");
     }
     registry_.blocks.push_back({.name = name});
+    // Default display name: words title-cased ("oak_log" -> "Oak Log").
+    std::string display = name;
+    for (std::size_t i = 0; i < display.size(); ++i) {
+      if (display[i] == '_') {
+        display[i] = ' ';
+      }
+      if (i == 0 || display[i - 1] == ' ') {
+        display[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(display[i])));
+      }
+    }
+    registry_.blocks.back().displayName = display;
+    dropNames_.emplace_back();
     definedFaces_ = 0;
     hasLodTint_ = false;
     blockLine_ = lineNumber_;
@@ -206,6 +235,35 @@ private:
       } else {
         fail("requires_tool expects true or false");
       }
+    } else if (key == "density") {
+      const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), block.density);
+      if (error != std::errc{} || end != value.data() + value.size() || !(block.density > 0.0f)) {
+        fail("density expects a positive number (kg/m^3)");
+      }
+    } else if (key == "display_name") {
+      std::string_view text = value;
+      if (text.size() >= 2 && text.front() == '"' && text.back() == '"') {
+        text = text.substr(1, text.size() - 2);
+      }
+      if (text.empty()) {
+        fail("display_name expects a name");
+      }
+      block.displayName = std::string(text);
+    } else if (key == "category") {
+      if (std::ranges::find(kCategories, value) == kCategories.end()) {
+        fail("unknown category '" + std::string(value) + "'");
+      }
+      block.category = std::string(value);
+    } else if (key == "creative") {
+      if (value != "true" && value != "false") {
+        fail("creative expects true or false");
+      }
+      block.creative = value == "true";
+    } else if (key == "drops") {
+      if (value.empty()) {
+        fail("drops expects a block name or none");
+      }
+      dropNames_.back() = std::string(value);
     } else if (key == "far_tint") {
       parseColor(key, value, block.farTint);
     } else if (key == "tint") {
@@ -295,6 +353,7 @@ private:
   bool hasLodTint_ = false;
   std::size_t opaqueCount_ = 0;
   std::size_t nonOpaqueCount_ = 0;
+  std::vector<std::string> dropNames_; // per block: blocks.txt `drops` (empty = itself)
 };
 
 } // namespace

@@ -37,8 +37,7 @@ struct ClipmapView {
   std::array<float, MAX_LOD> outsideLodDistanceSquared;
   float verticalFovRadians;
   float aspectRatio;
-  // Drop tiles outside the margin-padded frustum. Only the vertex-pulling path sets this; the mesh path culls in its
-  // task shader.
+  // Drop tiles outside the margin-padded frustum. The renderer leaves this off: its task shader culls clusters.
   bool frustumCull;
   // Center of the CPU-owned square, or none while the CPU has nothing ready. Its columns stay quadtree leaves (for
   // neighbor LODs) but get no GPU work; tiles within one more chunk are forced to LOD 0 so the seam is full-res.

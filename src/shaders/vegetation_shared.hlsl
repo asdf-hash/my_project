@@ -374,60 +374,215 @@ VEG_FN uint treeBlockAt(TreeInstance tree, int x, int y, int z) {
   return TREE_LEAVES;
 }
 
+/**
+ * A canopy layer's leaves as a 5x5 bitmask around the trunk (bit (dz + 2) * 5 + dx + 2), the same blocks as
+ * treeBlockAt: a precomputed mask per TREE_LAYER_* kind, minus the corners the shape bits drop.
+ *
+ * @param fromTop Layer index counted down from the canopy top (0 = top), within the canopy.
+ * @return the layer's leaf mask; the trunk's cell counts as leaves (treeBlockAt makes it a log, solid either way).
+ */
+VEG_FN uint treeLeafLayerMask(uint shape, int fromTop) {
+  const int kind = treeLeafLayerKind(treeStyle(shape), fromTop);
+  if (kind == TREE_LAYER_SINGLE) {
+    return 0x1000u;
+  }
+  if (kind == TREE_LAYER_PLUS) {
+    return 0x23880u;
+  }
+  if (kind == TREE_LAYER_DIAMOND) {
+    return 0x477dc4u;
+  }
+  const uint bits = (shape >> (uint(fromTop % 3) * 4u)) & 0xfu;
+  // Corner c = (dx > 0) | (dz > 0) << 1: (-r, -r), (r, -r), (-r, r), (r, r).
+  const uint drops = kind == TREE_LAYER_FULL ? bits & ((bits >> 1u) | (bits << 3u)) : bits;
+  // Each corner's bit, at radius 1 (SMALL) or 2 (WIDE, FULL).
+  const bool isSmall = kind == TREE_LAYER_SMALL;
+  uint mask = isSmall ? 0x739c0u : 0x1ffffffu;
+  mask &= (drops & 1u) != 0u ? ~(isSmall ? 0x40u : 0x1u) : 0xffffffffu;
+  mask &= (drops & 2u) != 0u ? ~(isSmall ? 0x100u : 0x10u) : 0xffffffffu;
+  mask &= (drops & 4u) != 0u ? ~(isSmall ? 0x10000u : 0x100000u) : 0xffffffffu;
+  mask &= (drops & 8u) != 0u ? ~(isSmall ? 0x40000u : 0x1000000u) : 0xffffffffu;
+  return mask;
+}
+
 // ---- Coarse LODs (chunk_compute.slang computeTreeColumn) ----
-// Every LOD shows the same trees. LOD 1-2: leaves where a canopy covers at least half a column, at the canopy's real
-// height. LOD 3+: one leaf cell per tree whose nested roll passes (chance TREE_CANOPY_AREA / scale^2, so far forests
-// keep the same ground cover); LOD 4+ re-derive candidates and judge slope from one sample at the column centre.
+// Every LOD shows the same trees. LOD 1-4 downsample each tree's real leaves (treeCoarseLeaves, counted from
+// treeLeafLayerMask): LOD 1-2 keep its volume, LOD 3-4 its ground cover. LOD 5+: one leaf cell per tree whose
+// nested roll passes (chance TREE_CANOPY_AREA / scale^2, so
+// far forests keep the same ground cover). LOD 4+ re-derive candidates and judge slope from one sample at the column
+// centre.
 VEG_CONST int TREE_MAX_LOD = 7;
+VEG_CONST int TREE_DOWNSAMPLE_MAX_LOD = 4;
 VEG_CONST uint SEED_TREE_LOD = 0xa54ff53au;
 VEG_CONST int TREE_CANOPY_AREA = 24; // top-down blocks of a canopy: 5x5, corners kept ~3/4 of the time
 
+/** A tree's fixed LOD roll, 0..65535 (treeShowsAtScale, treeCoarseLeaves). */
+VEG_FN uint treeLodRoll(int trunkX, int trunkZ) { return hashCell(int2(trunkX, trunkZ), SEED_TREE_LOD) & 0xffffu; }
+
 /**
- * Whether a tree shows as a cell at a coarse scale: its fixed roll from the trunk position against
- * TREE_CANOPY_AREA / scale^2. Nested: shown at 2s implies shown at s.
+ * LOD 5+: whether a tree shows as a cell: its LOD roll against TREE_CANOPY_AREA / scale^2. Nested: shown at 2s
+ * implies shown at s.
  *
  * @param scale Voxel size, in blocks.
  * @return true if the tree shows.
  */
 VEG_FN bool treeShowsAtScale(int trunkX, int trunkZ, int scale) {
-  const uint roll = hashCell(int2(trunkX, trunkZ), SEED_TREE_LOD) & 0xffffu;
-  return roll * uint(scale * scale) < uint(TREE_CANOPY_AREA) * 65536u;
+  return treeLodRoll(trunkX, trunkZ) * uint(scale * scale) < uint(TREE_CANOPY_AREA) * 65536u;
+}
+
+/** Set bits of a 32-bit value (no intrinsic, so it compiles on both sides). */
+VEG_FN uint vegPopcount(uint v) {
+  v = v - ((v >> 1u) & 0x55555555u);
+  v = (v & 0x33333333u) + ((v >> 2u) & 0x33333333u);
+  return (((v + (v >> 4u)) & 0x0f0f0f0fu) * 0x01010101u) >> 24u;
+}
+
+/** Floor division by a positive divisor. */
+VEG_FN int vegFloorDiv(int value, int divisor) {
+  return value >= 0 ? value / divisor : -((-value + divisor - 1) / divisor);
 }
 
 /**
- * Overlap of a trunk's canopy square with the column [columnX, columnX + scale) x [columnZ, columnZ + scale).
+ * treeLeafLayerMask bits of the trunk offsets [lowX, highX] x [lowZ, highZ], clamped to the 5x5 canopy.
  *
- * @return overlapping blocks, top-down.
+ * @return the mask, 0 if the rectangle misses the canopy.
  */
-VEG_FN int treeCanopyOverlap(int trunkX, int trunkZ, int columnX, int columnZ, int scale) {
-  const int lowX = trunkX - TREE_RADIUS > columnX ? trunkX - TREE_RADIUS : columnX;
-  const int highX = trunkX + TREE_RADIUS + 1 < columnX + scale ? trunkX + TREE_RADIUS + 1 : columnX + scale;
-  const int lowZ = trunkZ - TREE_RADIUS > columnZ ? trunkZ - TREE_RADIUS : columnZ;
-  const int highZ = trunkZ + TREE_RADIUS + 1 < columnZ + scale ? trunkZ + TREE_RADIUS + 1 : columnZ + scale;
-  return highX > lowX && highZ > lowZ ? (highX - lowX) * (highZ - lowZ) : 0;
+VEG_FN uint treeRectMask(int lowX, int highX, int lowZ, int highZ) {
+  lowX = lowX > -TREE_RADIUS ? lowX : -TREE_RADIUS;
+  highX = highX < TREE_RADIUS ? highX : TREE_RADIUS;
+  lowZ = lowZ > -TREE_RADIUS ? lowZ : -TREE_RADIUS;
+  highZ = highZ < TREE_RADIUS ? highZ : TREE_RADIUS;
+  if (lowX > highX || lowZ > highZ) {
+    return 0u;
+  }
+  const uint row = ((1u << uint(highX - lowX + 1)) - 1u) << uint(lowX + TREE_RADIUS);
+  uint mask = 0u;
+  for (int dz = lowZ; dz <= highZ; ++dz) {
+    mask |= row << uint((dz + TREE_RADIUS) * 5);
+  }
+  return mask;
 }
 
-/** LOD 1-2: whether a canopy covers at least half of a column. */
-VEG_FN bool treeCanopyShows(int overlapBlocks, int scale) { return 2 * overlapBlocks >= scale * scale; }
+// A tree's leaf cells over one coarse column: cell base + i for each bit i of mask.
+struct TreeCoarseLeaves {
+  int base;
+  uint mask;
+};
 
 /**
- * Coarse leaf cells of a tree: max(1, round(span / scale)) cells centred on the canopy's middle, lifted to at least
- * columnTop so the terrain never swallows them.
+ * Leaf blocks of a tree inside one coarse cell: its canopy layers in the cell, each masked to the column.
  *
+ * @param rect treeRectMask of the column.
+ * @param low First canopy layer, world blocks (high: exclusive top).
+ * @return the cell's leaf blocks << 8 | the most leaves on one of its layers (at most 25).
+ */
+VEG_FN uint treeCellLeaves(uint shape, uint rect, int cell, int scale, int low, int high) {
+  const int y0 = cell * scale > low ? cell * scale : low;
+  const int y1 = cell * scale + scale < high ? cell * scale + scale : high;
+  uint total = 0u;
+  uint fullest = 0u;
+  for (int y = y0; y < y1; ++y) {
+    const uint count = vegPopcount(treeLeafLayerMask(shape, high - 1 - y) & rect);
+    total += count;
+    fullest = count > fullest ? count : fullest;
+  }
+  return total << 8u | fullest;
+}
+
+/** treeRectMask of the column [columnX, columnX + scale)^2 around a trunk. */
+VEG_FN uint treeColumnRect(TreeInstance tree, int columnX, int columnZ, int scale) {
+  return treeRectMask(columnX - tree.trunkX, columnX + scale - 1 - tree.trunkX, columnZ - tree.trunkZ,
+                      columnZ + scale - 1 - tree.trunkZ);
+}
+
+/**
+ * Downsample a tree's leaves into the column [columnX, columnX + scale)^2, cells of `scale` blocks (scale 2..16).
+ * - Scale 2: a cell is leaves when more than half its 8 blocks are, on exactly half by a fixed per-cell coin, keeping
+ *   the canopy's volume and taper.
+ * - Scale 4: the tree keeps its N fullest cells (over every column it reaches; ties to the lower cell, then column),
+ *   N = its leaf volume / scale^3 dithered by its LOD roll, so the expected volume matches LOD 0. Majority would
+ *   drop most canopies (about one cell of leaves, split across cells), and whole-cell cover doubles them.
+ * - Scale 8+, where a canopy is well under a cell: a cell is leaves when its fullest layer covers more of the
+ *   column's top than the tree's LOD roll (fraction of scale^2), so the expected top-down cover matches LOD 0
+ *   (treeShowsAtScale's rule, generalised to canopies split across columns) and a coarser shown cell implies a
+ *   shown finer one.
+ *
+ * @param tree An accepted tree (trunkHeight != 0), ground in blocks.
  * @param scale Voxel size, in blocks.
- * @param columnTop The column's first air cell, in cells of this scale.
- * @return (first cell, count).
+ * @return its cells, mask 0 if none.
  */
-VEG_FN int2 treeLeafCells(int ground, int trunkHeight, uint shape, int scale, int columnTop) {
-  const uint style = treeStyle(shape);
-  const int low = treeCanopyLow(style, trunkHeight);
-  const int span = treeCanopyHigh(style, trunkHeight) - low;
-  const int count = (span + scale / 2) / scale > 0 ? (span + scale / 2) / scale : 1;
-  const int center2 = 2 * ground + 2 * low + span; // twice the canopy middle (world)
-  const int numerator = center2 - count * scale + scale;
-  // Floor division by 2 * scale.
-  const int first = numerator >= 0 ? numerator / (2 * scale) : -((-numerator + 2 * scale - 1) / (2 * scale));
-  return int2(first > columnTop ? first : columnTop, count);
+VEG_FN TreeCoarseLeaves treeCoarseLeaves(TreeInstance tree, int columnX, int columnZ, int scale) {
+  TreeCoarseLeaves leaves;
+  leaves.base = 0;
+  leaves.mask = 0u;
+  const uint rect = treeColumnRect(tree, columnX, columnZ, scale);
+  if (rect == 0u) {
+    return leaves;
+  }
+  const uint style = treeStyle(tree.shape);
+  const int low = tree.ground + treeCanopyLow(style, tree.trunkHeight);
+  const int high = tree.ground + treeCanopyHigh(style, tree.trunkHeight);
+  const int cellLow = vegFloorDiv(low, scale);
+  const int cellHigh = vegFloorDiv(high - 1, scale) + 1;
+  const uint roll = treeLodRoll(tree.trunkX, tree.trunkZ);
+  leaves.base = cellLow;
+  if (scale == 4) {
+    // Every cell the canopy reaches: columns [firstX, lastX] x [firstZ, lastZ] (column-aligned), cells as above.
+    const int firstX = vegFloorDiv(tree.trunkX - TREE_RADIUS, scale) * scale;
+    const int lastX = vegFloorDiv(tree.trunkX + TREE_RADIUS, scale) * scale;
+    const int firstZ = vegFloorDiv(tree.trunkZ - TREE_RADIUS, scale) * scale;
+    const int lastZ = vegFloorDiv(tree.trunkZ + TREE_RADIUS, scale) * scale;
+    uint volume = 0u;
+    for (int z = firstZ; z <= lastZ; z += scale) {
+      for (int x = firstX; x <= lastX; x += scale) {
+        const uint otherRect = treeColumnRect(tree, x, z, scale);
+        for (int cell = cellLow; cell < cellHigh; ++cell) {
+          volume += treeCellLeaves(tree.shape, otherRect, cell, scale, low, high) >> 8u;
+        }
+      }
+    }
+    const uint cellVolume = uint(scale * scale * scale);
+    const uint keepCount = (volume * 65536u + roll * cellVolume) / (cellVolume * 65536u);
+    for (int cell = cellLow; cell < cellHigh && keepCount != 0u; ++cell) {
+      const uint mine = treeCellLeaves(tree.shape, rect, cell, scale, low, high) >> 8u;
+      if (mine == 0u) {
+        continue;
+      }
+      // Rank: cells fuller than this one, or as full and earlier (cell, then z, then x).
+      uint rank = 0u;
+      for (int z = firstZ; z <= lastZ; z += scale) {
+        for (int x = firstX; x <= lastX; x += scale) {
+          const uint otherRect = treeColumnRect(tree, x, z, scale);
+          for (int other = cellLow; other < cellHigh; ++other) {
+            const uint theirs = treeCellLeaves(tree.shape, otherRect, other, scale, low, high) >> 8u;
+            const bool earlier = other < cell || (other == cell && (z < columnZ || (z == columnZ && x < columnX)));
+            rank += theirs > mine || (theirs == mine && earlier) ? 1u : 0u;
+          }
+        }
+      }
+      if (rank < keepCount) {
+        leaves.mask |= 1u << uint(cell - cellLow);
+      }
+    }
+    return leaves;
+  }
+  const uint threshold = roll * uint(scale * scale);
+  for (int cell = cellLow; cell < cellHigh; ++cell) {
+    const uint counts = treeCellLeaves(tree.shape, rect, cell, scale, low, high);
+    const uint total = counts >> 8u;
+    const uint fullest = counts & 0xffu;
+    bool keep;
+    if (scale == 2) {
+      const bool coin = (hashCell(int2(columnX, columnZ), SEED_TREE_LOD ^ (uint(cell) * 0x9e3779b9u)) & 1u) != 0u;
+      keep = total > 4u || (total == 4u && coin);
+    } else {
+      keep = fullest * 65536u > threshold;
+    }
+    if (keep) {
+      leaves.mask |= 1u << uint(cell - cellLow);
+    }
+  }
+  return leaves;
 }
 
 #ifdef __cplusplus

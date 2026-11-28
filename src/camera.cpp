@@ -26,13 +26,23 @@ void Camera::handleKey(GLFWwindow *window, int key, int action) {
     return;
   }
 
-  captured = !captured;
+  setCaptured(window, !captured);
+}
+
+void Camera::setCaptured(GLFWwindow *window, bool capture) {
+  captured = capture;
   glfwSetInputMode(window, GLFW_CURSOR, captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
   if (glfwRawMouseMotionSupported()) {
     glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, captured ? GLFW_TRUE : GLFW_FALSE);
   }
   if (captured) {
     firstMouse = true;
+  } else {
+    // Free cursor at the window center, like vanilla opening a screen.
+    int width = 0;
+    int height = 0;
+    glfwGetWindowSize(window, &width, &height);
+    glfwSetCursorPos(window, width * 0.5, height * 0.5);
   }
 }
 

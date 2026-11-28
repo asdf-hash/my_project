@@ -11,10 +11,14 @@ static const uint DEBUG_TINT_CPU = 2u; // CPU-meshed: green
 struct GeometryPushConstants {
   uint clusterCount;
   uint debugTint;
-  uint quadBase;  // vertex path: first quad of this draw
-  uint quadCount; // vertex path: quads in this draw (0: up to QuadCount[0])
-  uint pass;      // GEOMETRY_PASS_*
+  uint pass;        // GEOMETRY_PASS_*
   uint clusterBase; // mesh path: first cluster of this draw (CPU frustum culling draws runs of visible chunk slots)
+  int3 smoothOrigin; // smooth path: world block origin of the drawn chunk
+  uint padding;
+  // Smooth LOD terrain (smoothLodFragMain): block ID per height layer (as chunk_compute.slang's DispatchParams).
+  uint4 layerBlocks;
+  uint4 layerFillerBlocks;
+  uint4 layerDeepBlocks;
 };
 static const uint GEOMETRY_PASS_OPAQUE = 0u;      // opaque blocks only: no discard, so early depth testing holds
 static const uint GEOMETRY_PASS_TRANSLUCENT = 1u; // blended water: no back-face culling

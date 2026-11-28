@@ -18,6 +18,9 @@ public:
    */
   void handleKey(GLFWwindow *window, int key, int action);
 
+  /** Capture (mouse look) or release (free cursor, e.g. for an inventory screen) the cursor. */
+  void setCaptured(GLFWwindow *window, bool capture);
+
   /** Apply this frame's mouse movement to yaw / pitch (no-op while uncaptured or locked). */
   void updateLook(GLFWwindow *window);
 

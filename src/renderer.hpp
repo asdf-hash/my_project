@@ -1,7 +1,7 @@
 #pragma once
 
 // Higher values retain finer terrain farther away: 0 maps to 0.005, 100 to 0.003.
-inline constexpr float LOD_DETAIL_PERCENT = 40.f;
+inline constexpr float LOD_DETAIL_PERCENT = 100.f;
 static_assert(LOD_DETAIL_PERCENT >= 0.0f && LOD_DETAIL_PERCENT <= 100.0f);
 
 inline constexpr float TARGET_SCREEN_PERCENTAGE = 0.005f - (LOD_DETAIL_PERCENT / 100.0f) * (0.005f - 0.003f);

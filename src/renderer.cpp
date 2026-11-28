@@ -4,6 +4,11 @@
 #include "chunk_slots.hpp"
 #include "clipmap_culler.hpp"
 #include "cpu_world.hpp"
+#include "gui.hpp"
+#include "inventory.hpp"
+#include "item_entity.hpp"
+#include "job_pool.hpp"
+#include "screens.hpp"
 #include "lod.hpp"
 #include "player.hpp"
 #include "terrain_cpu.hpp"
@@ -44,6 +49,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <stb/stb_image.h> // implementation in stb_image_impl.cpp
+#include <stb/stb_image_write.h>
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
@@ -134,11 +140,16 @@ constexpr uint32_t BLOCK_FACE_FLUID = 1u << 2; // a liquid (drawn in the translu
 struct GeometryPushConstants {
   uint32_t clusterCount;
   uint32_t debugTint;
-  uint32_t quadBase;  // vertex path: first quad of this draw
-  uint32_t quadCount; // vertex path: quads in this draw (0: up to QuadCount[0])
-  uint32_t pass;      // GEOMETRY_PASS_*
+  uint32_t pass;        // GEOMETRY_PASS_*
   uint32_t clusterBase; // mesh path: first cluster of this draw (CPU frustum culling draws runs of visible chunk slots)
+  std::array<int32_t, 3> smoothOrigin; // smooth path: world block origin of the drawn chunk
+  uint32_t padding;
+  // Smooth LOD terrain (smoothLodFragMain): block ID per height layer, as ChunkComputeParams.
+  std::array<uint32_t, 4> layerBlocks;
+  std::array<uint32_t, 4> layerFillerBlocks;
+  std::array<uint32_t, 4> layerDeepBlocks;
 };
+static_assert(sizeof(GeometryPushConstants) == 80);
 constexpr uint32_t GEOMETRY_PASS_OPAQUE = 0u;
 constexpr uint32_t GEOMETRY_PASS_TRANSLUCENT = 1u; // blended water: no back-face culling
 constexpr uint32_t GEOMETRY_PASS_CUTOUT = 2u;      // non-opaque blocks: alpha-tested (fragCutout)
@@ -208,17 +219,21 @@ private:
   vk::raii::Pipeline graphicsPipeline = nullptr;
   // Non-opaque blocks (leaves, glass): alpha-tested fragCutout, drawn after the opaque pipelines (GEOMETRY_PASS_CUTOUT).
   vk::raii::Pipeline cutoutPipeline = nullptr;
-  vk::raii::Pipeline cutoutVertexPullingPipeline = nullptr;
-  // Same packed quads, unpacked in a vertex shader via SV_VertexID instead of the mesh shader. Toggle with V.
-  vk::raii::Pipeline vertexPullingPipeline = nullptr;
-  bool useVertexPulling = false;
+  // Smooth terrain (V): the CPU-meshed chunks' opaque faces as Surface Nets quads (ChunkMesh::smoothVertices) from a
+  // vertex buffer, instead of their greedy cube quads. The GPU clipmap, cutout and water passes stay on the mesh path.
+  vk::raii::Pipeline smoothPipeline = nullptr;
+  vk::raii::Pipeline smoothCutoutPipeline = nullptr; // the foliage surface (smoothFragCutout)
+  // Smooth mode's GPU clipmap: every live column slot a heightfield grid over SmoothHeights (smoothLodVertMain), one
+  // instance per tile in the frustum.
+  vk::raii::Pipeline smoothLodPipeline = nullptr;
+  vk::raii::Pipeline smoothLodWireframePipeline = nullptr;
+  bool smoothTerrain = false;
   // Line-mode copies of the two pipelines above. Toggle with T.
   vk::raii::Pipeline wireframePipeline = nullptr;
-  vk::raii::Pipeline wireframeVertexPullingPipeline = nullptr;
+  vk::raii::Pipeline smoothWireframePipeline = nullptr;
   // Translucent pass (ocean): same shaders, alpha blended, no depth writes (kept out of the Hi-Z and TAA depth), no
   // motion writes, no culling (the surface is seen from below too).
   vk::raii::Pipeline waterPipeline = nullptr;
-  vk::raii::Pipeline waterVertexPullingPipeline = nullptr;
   bool wireframeEnabled = false;
   bool contourEnabled = false; // elevation view (H)
   TerrainView terrainView = TerrainView::Both;
@@ -236,17 +251,16 @@ private:
   vk::raii::Pipeline relocateSlotsPipeline = nullptr;
   vk::raii::Pipeline rebuildFreeStackPipeline = nullptr;
   vk::raii::Pipeline meshColumnsPipeline = nullptr;
-  vk::raii::Pipeline finalizeVertexDrawPipeline = nullptr;
+  vk::raii::Pipeline resetNewWorkPipeline = nullptr;
   vk::raii::Pipeline compactQuadsPipeline = nullptr;
   vk::raii::Pipeline copyCompactedQuadsPipeline = nullptr;
   vk::raii::PipelineLayout overlayPipelineLayout = nullptr;
   vk::raii::Pipeline overlayPipeline = nullptr;
-  vk::raii::Pipeline hudPipeline = nullptr;     // overlayPipelineLayout, alpha blend
+  vk::raii::Pipeline guiPipeline = nullptr;     // overlayPipelineLayout, alpha blend, gui::Quad instances
   vk::raii::Pipeline crosshairPipeline = nullptr; // overlayPipelineLayout, inverting blend
-  vk::raii::Pipeline healthPipeline = nullptr;    // overlayPipelineLayout, alpha blend
-  vk::raii::Pipeline gameModeSwitcherPipeline = nullptr; // overlayPipelineLayout, alpha blend
   vk::raii::PipelineLayout outlinePipelineLayout = nullptr;
   vk::raii::Pipeline outlinePipeline = nullptr;
+  vk::raii::Pipeline itemEntityPipeline = nullptr; // outlinePipelineLayout; item_entity.slang
   vk::raii::Pipeline crackPipeline = nullptr; // outlinePipelineLayout; block-breaking cracks, Minecraft's 2*src*dst blend
   // Hi-Z occlusion (mesh path): farthest-depth pyramid of last frame's depth, read by taskMain (hzb.slang).
   vk::raii::DescriptorSetLayout hzbSetLayout = nullptr;
@@ -321,11 +335,42 @@ private:
   static constexpr uint32_t MAX_TEXTURE_COUNT = 1024;
   uint32_t textureDescriptorCapacity = 0;
   std::vector<vk::raii::Image> textureImages; // one per animation frame
+  std::vector<uint32_t> textureMipLevels;      // per textureImages entry (GUI sprites have 1)
   // Per registry texture index: first bindless slot and frame count (createTextureImages).
   std::vector<uint32_t> textureSlots;
   std::vector<uint32_t> textureFrames;
-  uint32_t hudTextureSlot = 0; // bindless slot of textures/gui/hud.png (after the block textures)
-  // Bindless slot of textures/overlay/destroy_stage_0.png; stages 1-9 follow (after the HUD atlas).
+  // One dropped-item cube; must match ItemInstance in item_entity.slang.
+  struct ItemInstance {
+    glm::vec4 center;           // xyz: world center, w: edge length
+    glm::vec4 previousCenter;   // xyz: last frame's center
+    glm::vec4 rotation;         // quaternion (x, y, z, w)
+    glm::vec4 previousRotation; // last frame's
+    glm::uvec4 faces;           // top, side, bottom texture slots, tint RGBA8
+    glm::vec4 extra;            // x: skylight
+  };
+  static constexpr uint32_t ITEM_MAX_INSTANCES = 16384;
+  // ENGINE_SCREENSHOT: output path, capture time (glfwGetTime seconds), and the readback buffer.
+  std::string screenshotPath;
+  double screenshotSeconds = 8.0;
+  bool screenshotCaptureThisFrame = false;
+  vk::raii::Buffer screenshotBuffer = nullptr;
+  vk::raii::DeviceMemory screenshotMemory = nullptr;
+  // GUI sprites (textures/gui) and the bitmap font, bindless after the block textures (gui.hpp).
+  gui::Sprites guiSprites;
+  gui::Font guiFont;
+  gui::Context guiContext;
+  gui::Batch guiBatch;
+  // Per frame in flight: host-visible instance buffer of gui::Quad (guiPipeline).
+  static constexpr uint32_t GUI_MAX_QUADS = 16384;
+  std::vector<vk::raii::Buffer> guiQuadBuffers;
+  std::vector<vk::raii::DeviceMemory> guiQuadMemories;
+  std::vector<gui::Quad *> guiQuadMapped;
+  // Per frame in flight: item entity cube instances (recordItemEntities).
+  std::vector<vk::raii::Buffer> itemInstanceBuffers;
+  std::vector<vk::raii::DeviceMemory> itemInstanceMemories;
+  std::vector<ItemInstance *> itemInstanceMapped;
+  float lastFrameDeltaSeconds = 0.0f;
+  // Bindless slot of textures/overlay/destroy_stage_0.png; stages 1-9 follow (after the GUI sprites).
   static constexpr uint32_t DESTROY_STAGES = 10;
   uint32_t destroyStageSlot = 0;
   std::vector<vk::raii::DeviceMemory> textureImageMemories;
@@ -348,8 +393,7 @@ private:
   std::vector<void *> uniformBuffersMapped;
 
   static constexpr uint32_t MAX_QUAD_COUNT = 1u << 24u;
-  // Quads covered by one instance of the vertex-pulling draw. 4 vertices per quad must fit a uint16 index.
-  // Must match VERTEX_QUADS_PER_INSTANCE in slang.slang and chunk_compute.slang.
+  // Quads covered by quadIndexBuffer's pattern (one smooth-terrain draw). 4 vertices per quad must fit a uint16 index.
   static constexpr uint32_t VERTEX_QUADS_PER_INSTANCE = 16384u;
   static_assert(VERTEX_QUADS_PER_INSTANCE * 4u - 1u <= UINT16_MAX);
   // Debug text overlay; must match overlay.slang.
@@ -409,7 +453,7 @@ private:
   uint32_t quadCountEpoch = 0;
   std::array<uint32_t, 8> quadCountReadbackEpoch{};
 
-  // Compact once dead quads pass a share of the live ones (vertex path 1/4: it draws dead quads too; mesh path 1/1), or
+  // Compact once dead quads outnumber the live ones, or
   // once the buffer is 3/4 used and compacting would free space. A full rebuild is only for an overflowed QuadBuffer.
   static constexpr uint32_t REBUILD_MIN_DEAD_QUADS = 1u << 18u;
   static constexpr uint32_t COPY_COMPACTED_GROUPS = 1024u; // must match copyCompactedQuads in chunk_compute.slang
@@ -440,10 +484,14 @@ private:
   static constexpr uint32_t CPU_MAX_QUADS = 1u << 22u;
   static constexpr uint32_t CPU_MAX_CHUNK_SLOTS = 8192u;
   static constexpr vk::DeviceSize CPU_STAGING_BYTES = 16ull << 20u; // per frame in flight
+  // Smooth terrain vertices (cpuworld::SmoothVertex, 4 per opaque face): 96 MiB.
+  static constexpr uint32_t CPU_MAX_SMOOTH_VERTICES = 1u << 23u;
   std::unique_ptr<cpuworld::CpuWorld> cpuWorld;
   Player player;
   vk::raii::Buffer cpuQuadBuffer = nullptr;
   vk::raii::DeviceMemory cpuQuadBufferMemory = nullptr;
+  vk::raii::Buffer cpuSmoothVertexBuffer = nullptr; // vertex buffer of the smooth pipelines
+  vk::raii::DeviceMemory cpuSmoothVertexBufferMemory = nullptr;
   vk::raii::Buffer cpuChunkOffsetBuffer = nullptr;
   vk::raii::DeviceMemory cpuChunkOffsetBufferMemory = nullptr;
   vk::raii::Buffer cpuClusterBuffer = nullptr;
@@ -451,7 +499,7 @@ private:
   // Same layout for the translucent (ocean) clusters; their quads follow the opaque ones in each allocation.
   vk::raii::Buffer cpuTranslucentClusterBuffer = nullptr;
   vk::raii::DeviceMemory cpuTranslucentClusterBufferMemory = nullptr;
-  vk::raii::Buffer cpuQuadCountBuffer = nullptr; // binding 4 of the CPU set: quad high water, for vertMain
+  vk::raii::Buffer cpuQuadCountBuffer = nullptr; // binding 4 of the CPU set: quad high water (no shader reads it now)
   vk::raii::DeviceMemory cpuQuadCountBufferMemory = nullptr;
   std::vector<vk::raii::Buffer> cpuStagingBuffers;
   std::vector<vk::raii::DeviceMemory> cpuStagingMemories;
@@ -463,7 +511,9 @@ private:
     uint32_t quadCount;
     std::array<cpuworld::QuadCluster, cpuworld::kClustersPerChunk> clusters;            // rebased onto quadOffset
     std::array<cpuworld::QuadCluster, cpuworld::kClustersPerChunk> translucentClusters; // rebased too
-    uint32_t opaqueQuadCount; // quads [0, opaqueQuadCount) are opaque, the rest translucent (vertex path)
+    uint32_t smoothOffset;        // first vertex in cpuSmoothVertexBuffer
+    uint32_t smoothCount;         // vertices (4 per quad)
+    uint32_t smoothOpaqueCount;   // of those, the opaque surface's; the rest are foliage (cutout pass)
   };
   struct CpuColumnGpu {
     int32_t cx; // chunk column x, in chunks
@@ -478,6 +528,7 @@ private:
   std::vector<uint8_t> cpuSlotVisible;
   std::vector<std::pair<uint32_t, uint32_t>> cpuVisibleSlotRuns; // [first slot, slot count)
   RangeAllocator cpuQuadRanges{CPU_MAX_QUADS};
+  RangeAllocator cpuSmoothRanges{CPU_MAX_SMOOTH_VERTICES};
   std::deque<cpuworld::ColumnMeshEvent> cpuPendingEvents; // waiting for staging space
   // Center offered to the clipmap: the CPU's ready center, once all of its geometry is uploaded.
   std::optional<cpuworld::ChunkXZ> cpuAdvertisedCenter;
@@ -497,6 +548,7 @@ private:
   // This frame's CPU geometry transfers, recorded by recordCpuUploads.
   std::vector<vk::BufferCopy> cpuQuadCopies;
   std::vector<vk::BufferCopy> cpuOffsetCopies;
+  std::vector<vk::BufferCopy> cpuSmoothCopies;
   std::vector<vk::BufferCopy> cpuClusterCopies;
   std::vector<vk::BufferCopy> cpuTranslucentClusterCopies;
   std::vector<uint32_t> cpuClearedSlots;
@@ -512,6 +564,18 @@ private:
   vk::raii::DeviceMemory chunkOffsetBufferMemory = nullptr;
   vk::raii::Buffer chunkHeightBuffer = nullptr;
   vk::raii::DeviceMemory chunkHeightBufferMemory = nullptr;
+  // SmoothHeights (chunk_compute.slang): float surface height and layer dither per padded column corner and slot.
+  vk::raii::Buffer smoothHeightBuffer = nullptr;
+  vk::raii::DeviceMemory smoothHeightBufferMemory = nullptr;
+  // Smooth LOD grid: LOD_GRID_SIDE^2 vertices (33 x 33 tile corners plus a skirt ring), uint16 triangle list.
+  static constexpr uint32_t LOD_GRID_SIDE = CHUNK_SIZE + 3u;
+  static constexpr uint32_t LOD_GRID_INDEX_COUNT = (LOD_GRID_SIDE - 1u) * (LOD_GRID_SIDE - 1u) * 6u;
+  vk::raii::Buffer lodGridIndexBuffer = nullptr;
+  vk::raii::DeviceMemory lodGridIndexBufferMemory = nullptr;
+  // Per frame in flight: the smooth LOD draw's instances (column slot, tile origin x / z in blocks, scale).
+  std::vector<vk::raii::Buffer> smoothLodInstanceBuffers;
+  std::vector<vk::raii::DeviceMemory> smoothLodInstanceBufferMemories;
+  std::vector<std::array<int32_t, 4> *> smoothLodInstancesMapped;
   vk::raii::Buffer quadCountBuffer = nullptr;
   vk::raii::DeviceMemory quadCountBufferMemory = nullptr;
   vk::raii::Buffer quadIndexBuffer = nullptr;
@@ -521,8 +585,6 @@ private:
   // Same layout: each tile's ocean surface quads (translucent pass). Binding 18 of the compute set.
   vk::raii::Buffer waterClusterBuffer = nullptr;
   vk::raii::DeviceMemory waterClusterBufferMemory = nullptr;
-  vk::raii::Buffer vertexDrawArgumentsBuffer = nullptr; // vertMain's indexed indirect args (finalizeVertexDraw)
-  vk::raii::DeviceMemory vertexDrawArgumentsBufferMemory = nullptr;
   std::vector<vk::raii::Buffer> chunkCoordinateBuffers;
   std::vector<vk::raii::DeviceMemory> chunkCoordinateBufferMemories;
   std::vector<void *> chunkCoordinateBuffersMapped;
@@ -579,7 +641,10 @@ private:
 
 #pragma region Input State
   bool framebufferResized = false;
-  bool fpsLimitEnabled = true;
+  bool fpsLimitEnabled = true; // L: cap the frame rate at 144 (on by default)
+  // F11: windowed / fullscreen on the window's monitor (starts fullscreen). The windowed placement is restored.
+  bool fullscreen = false;
+  std::array<int, 4> windowedRect{0, 0, static_cast<int>(WIDTH), static_cast<int>(HEIGHT)}; // x, y, width, height
   // Debug overlay (top right): frames counted over a short window, shown as FPS.
   std::chrono::steady_clock::time_point fpsWindowStart = std::chrono::steady_clock::now();
   uint32_t fpsWindowFrames = 0;
@@ -606,6 +671,27 @@ private:
   double timestampPeriodNs = 0.0; // nanoseconds per timestamp tick
   std::array<bool, MAX_FRAMES_IN_FLIGHT> timestampsPending{};
   std::array<double, GPU_TIMESTAMP_COUNT> gpuTimeSumsMs{}; // [0]: whole frame
+  // CPU side of the same report: where each frame's wall time goes, and the slowest frame of the window.
+  enum CpuTiming : uint32_t { CPU_POLL, CPU_FENCE, CPU_ACQUIRE, CPU_UPDATE, CPU_RECORD, CPU_SUBMIT, CPU_PRESENT,
+                              CPU_TIMING_COUNT };
+  static constexpr std::array<const char *, CPU_TIMING_COUNT> CPU_TIMING_NAMES{
+      "poll", "fence", "acquire", "update", "record", "submit", "present"};
+  std::array<double, CPU_TIMING_COUNT> cpuTimeSumsMs{};
+  double cpuFrameSumMs = 0.0;
+  double cpuFrameMaxMs = 0.0;
+  uint32_t cpuFrameSamples = 0;
+  std::chrono::steady_clock::time_point cpuStageStart{};
+  std::chrono::steady_clock::time_point cpuFrameStart{};
+
+  /** Close CPU timing stage `stage` (it ran since the previous call) while GPU timing is on. */
+  void markCpuStage(CpuTiming stage) {
+    if (!gpuTimingEnabled) {
+      return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    cpuTimeSumsMs[stage] += std::chrono::duration<double, std::milli>(now - cpuStageStart).count();
+    cpuStageStart = now;
+  }
   uint32_t gpuTimeSamples = 0;
   std::chrono::steady_clock::time_point gpuTimeWindowStart{};
   Camera camera;
@@ -624,9 +710,38 @@ private:
   int useDelayTicks = 0;
   std::optional<cpuworld::BlockXYZ> destroyTarget; // survival: block being broken
   float destroyProgress = 0.0f;                    // 0..1 on destroyTarget
-  // Hotbar slot 0-8 (keys 1-9 or the scroll wheel); slot i holds blockRegistry.blocks[i], if there is one.
-  static constexpr size_t HOTBAR_SLOTS = 9;
-  size_t selectedBlockIndex = 0;
+  // The player's inventory; inventory.selected is the hotbar slot (keys 1-9 or the scroll wheel).
+  inv::Inventory inventory;
+  bool pickClickPending = false; // middle mouse: pick block
+  // Open inventory screen (E), if any; the cursor is free while it is open.
+  std::optional<gui::InventoryScreen> screen;
+  std::vector<gui::CreativeItem> creativeCatalog; // registry blocks listed by the creative tabs
+  gui::SavedHotbars savedHotbars{};
+  bool cursorPinned = false; // ENGINE_CURSOR: ignore real mouse motion in screens
+  // Dropped items: 20 Hz physics on a small worker pool (the terrain workers stay busy generating).
+  ItemEntityWorld items;
+  std::unique_ptr<JobPool> itemPool = std::make_unique<JobPool>(2);
+  double itemTickAccumulator = 0.0;
+  // Picked-up / merged items flying to the player or their new stack (vanilla ItemPickupParticle: 3 ticks).
+  struct ItemFlightAnimation {
+    ItemEntityWorld::Flight flight;
+    double seconds = 0.0; // time since it started
+  };
+  static constexpr double ITEM_FLIGHT_SECONDS = 3.0 / 20.0;
+  std::vector<ItemFlightAnimation> itemFlights;
+  uint32_t itemSeed = 0;
+  uint32_t handledDeaths = 0;
+  // CpuWorld cells for item physics. Read-only on the item pool while the main thread waits in tick(), so no edit
+  // can run concurrently (CpuWorld's const queries are safe for concurrent readers then).
+  struct CpuWorldCells final : collision::CellQuery {
+    const cpuworld::CpuWorld *world = nullptr;
+    bool collidable(int32_t x, int32_t y, int32_t z) const override { return world->isCollidable(x, y, z); }
+    bool water(int32_t x, int32_t y, int32_t z) const override { return world->isInfiniteSource(x, y, z); }
+    bool loaded(int32_t x, int32_t z) const override {
+      const auto floorDiv = [](int32_t a) { return a >= 0 ? a / CHUNK_SIZE : -((-a + CHUNK_SIZE - 1) / CHUNK_SIZE); };
+      return world->columnLoaded(floorDiv(x), floorDiv(z));
+    }
+  };
   // F3+F4 game mode switcher: opens on F4 while F3 is held, F4 again cycles, releasing F3 applies the selection.
   bool f3Held = false;
   bool gameModeSwitcherOpen = false;
@@ -664,7 +779,32 @@ private:
     glfwSetKeyCallback(window, keyCallback);
     glfwSetMouseButtonCallback(window, mouseButtonCallback);
     glfwSetScrollCallback(window, scrollCallback);
+    glfwSetCursorPosCallback(window, cursorPosCallback);
+    glfwSetCharCallback(window, charCallback);
     camera.initialize(window);
+    // Starts windowed; F11 toggles fullscreen.
+  }
+
+  /** Switch between a window and fullscreen at the current monitor's video mode (F11). */
+  void setFullscreen(bool enable) {
+    if (enable == fullscreen) {
+      return;
+    }
+    if (enable) {
+      GLFWmonitor *monitor = glfwGetPrimaryMonitor();
+      if (monitor == nullptr) {
+        return;
+      }
+      glfwGetWindowPos(window, &windowedRect[0], &windowedRect[1]);
+      glfwGetWindowSize(window, &windowedRect[2], &windowedRect[3]);
+      const GLFWvidmode *mode = glfwGetVideoMode(monitor);
+      glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+    } else {
+      glfwSetWindowMonitor(window, nullptr, windowedRect[0], windowedRect[1], windowedRect[2], windowedRect[3],
+                           GLFW_DONT_CARE);
+    }
+    fullscreen = enable;
+    framebufferResized = true; // recreate the swapchain at the new size
   }
 
   /** GLFW resize callback: flags the swapchain for recreation. */
@@ -688,13 +828,28 @@ private:
   }
 
   /** GLFW mouse callback: queues a block break (left) or place (right) for the next frame. */
-  static void mouseButtonCallback(GLFWwindow *window, int button, int action, int /*mods*/) {
+  static void mouseButtonCallback(GLFWwindow *window, int button, int action, int mods) {
     auto app = reinterpret_cast<VulkanEngine *>(glfwGetWindowUserPointer(window));
+    if (app->screen) {
+      const int screenButton = button == GLFW_MOUSE_BUTTON_LEFT    ? 0
+                               : button == GLFW_MOUSE_BUTTON_RIGHT ? 1
+                               : button == GLFW_MOUSE_BUTTON_MIDDLE ? 2
+                                                                    : -1;
+      if (action == GLFW_PRESS) {
+        app->screen->mousePress(screenButton, (mods & GLFW_MOD_SHIFT) != 0, glfwGetTime());
+      } else if (action == GLFW_RELEASE) {
+        app->screen->mouseRelease(screenButton);
+      }
+      return;
+    }
     if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
       app->breakClickPending = true; // a click shorter than a frame still breaks
     }
     if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS) {
       app->placeClickPending = true;
+    }
+    if (button == GLFW_MOUSE_BUTTON_MIDDLE && action == GLFW_PRESS) {
+      app->pickClickPending = true;
     }
   }
 
@@ -718,6 +873,10 @@ private:
    */
   static void scrollCallback(GLFWwindow *window, double /*xOffset*/, double yOffset) {
     auto app = reinterpret_cast<VulkanEngine *>(glfwGetWindowUserPointer(window));
+    if (app->screen) {
+      app->screen->scroll(yOffset);
+      return;
+    }
     const int steps = yOffset > 0.0 ? 1 : (yOffset < 0.0 ? -1 : 0);
     if (steps == 0) {
       return;
@@ -726,9 +885,8 @@ private:
       app->player.scrollSpectatorSpeed(steps);
       return;
     }
-    const auto slots = static_cast<int>(HOTBAR_SLOTS);
-    app->selectedBlockIndex =
-        static_cast<size_t>(((static_cast<int>(app->selectedBlockIndex) - steps) % slots + slots) % slots);
+    constexpr int slots = inv::kHotbarSlots;
+    app->inventory.selected = ((app->inventory.selected - steps) % slots + slots) % slots;
   }
 
   /**
@@ -745,6 +903,7 @@ private:
         f3Held = false;
         if (gameModeSwitcherOpen) {
           gameModeSwitcherOpen = false;
+          closeInventory(); // its layout depends on the game mode
           player.setGameMode(gameModeSelection);
           std::clog << "Game mode: " << gameModeName(gameModeSelection) << '\n';
         }
@@ -770,10 +929,126 @@ private:
     return false;
   }
 
+  /** Open the inventory screen for the current game mode and free the cursor. */
+  void openInventory() {
+    screen.emplace(inventory, player.gameMode() == Player::GameMode::Creative, creativeCatalog, &savedHotbars,
+                   [this](const ItemStack &stack) { dropItem(stack); });
+    camera.setCaptured(window, true); // reset mouse-look state before releasing
+    camera.setCaptured(window, false);
+    double x = 0.0;
+    double y = 0.0;
+    glfwGetCursorPos(window, &x, &y);
+    const glm::dvec2 gui = cursorToGui(x, y);
+    screen->mouseMove(gui.x, gui.y);
+  }
+
+  /** Close the inventory screen (the carried stack returns to the inventory) and capture the cursor. */
+  void closeInventory() {
+    if (!screen) {
+      return;
+    }
+    screen->close();
+    screen.reset();
+    camera.setCaptured(window, true);
+  }
+
+  /** Window cursor coordinates to GUI pixels. */
+  glm::dvec2 cursorToGui(double x, double y) const {
+    int windowWidth = 0;
+    int windowHeight = 0;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    const double toFramebufferX = windowWidth > 0 ? swapChainExtent.width / static_cast<double>(windowWidth) : 1.0;
+    const double toFramebufferY = windowHeight > 0 ? swapChainExtent.height / static_cast<double>(windowHeight) : 1.0;
+    const double scale = gui::guiScale(static_cast<int>(swapChainExtent.height));
+    return {x * toFramebufferX / scale, y * toFramebufferY / scale};
+  }
+
+  /** GLFW cursor callback: hover and drags in the inventory screen. */
+  static void cursorPosCallback(GLFWwindow *window, double x, double y) {
+    auto app = reinterpret_cast<VulkanEngine *>(glfwGetWindowUserPointer(window));
+    if (app->screen && !app->cursorPinned) {
+      const glm::dvec2 gui = app->cursorToGui(x, y);
+      app->screen->mouseMove(gui.x, gui.y);
+    }
+  }
+
+  /** GLFW text callback: creative search. */
+  static void charCallback(GLFWwindow *window, unsigned codepoint) {
+    auto app = reinterpret_cast<VulkanEngine *>(glfwGetWindowUserPointer(window));
+    if (app->screen) {
+      app->screen->character(codepoint);
+    }
+  }
+
+  /** Keys while a screen is open: E / Esc close it, 1-9 / F / Q act on the hovered slot. */
+  void handleScreenKey(int key, int action, int mods) {
+    if (action != GLFW_PRESS && action != GLFW_REPEAT) {
+      return;
+    }
+    if (key == GLFW_KEY_ESCAPE || (key == GLFW_KEY_E && action == GLFW_PRESS && !screen->typing())) {
+      closeInventory();
+      return;
+    }
+    if (key == GLFW_KEY_BACKSPACE) {
+      screen->backspace();
+      return;
+    }
+    if (screen->typing() || action != GLFW_PRESS) {
+      return;
+    }
+    if (key >= GLFW_KEY_1 && key <= GLFW_KEY_9) {
+      screen->hotbarKey(key - GLFW_KEY_1);
+    } else if (key == GLFW_KEY_F) {
+      screen->offhandKey();
+    } else if (key == GLFW_KEY_Q) {
+      screen->dropKey((mods & GLFW_MOD_CONTROL) != 0);
+    }
+  }
+
+  /**
+   * Creative saved hotbars (vanilla): C+1..9 saves the hotbar into that row, X+1..9 loads it.
+   *
+   * @return true if the key was consumed.
+   */
+  bool handleSavedHotbarKey(int key, int action) {
+    if (action != GLFW_PRESS || key < GLFW_KEY_1 || key > GLFW_KEY_9 ||
+        player.gameMode() != Player::GameMode::Creative || (screen && screen->typing())) {
+      return false;
+    }
+    const bool save = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
+    const bool load = glfwGetKey(window, GLFW_KEY_X) == GLFW_PRESS;
+    if (save == load) {
+      return false;
+    }
+    auto &row = savedHotbars[static_cast<size_t>(key - GLFW_KEY_1)];
+    if (save) {
+      std::copy_n(inventory.items.begin(), inv::kHotbarSlots, row.begin());
+      std::clog << "Saved hotbar " << (key - GLFW_KEY_1 + 1) << '\n';
+    } else {
+      std::copy(row.begin(), row.end(), inventory.items.begin());
+    }
+    if (screen && screen->selectedTab() == gui::InventoryScreen::kSavedHotbars) {
+      screen->selectTab(gui::InventoryScreen::kSavedHotbars); // refresh the rows
+    }
+    return true;
+  }
+
   /** GLFW key callback: F3 combos, the camera and player, then hotbar slots (1-9) and debug toggles. */
-  static void keyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int /*mods*/) {
+  static void keyCallback(GLFWwindow *window, int key, int /*scancode*/, int action, int mods) {
     auto app = reinterpret_cast<VulkanEngine *>(glfwGetWindowUserPointer(window));
     if (app->handleDebugCombo(key, action)) {
+      return;
+    }
+    if (app->handleSavedHotbarKey(key, action)) {
+      return;
+    }
+    if (app->screen) {
+      app->handleScreenKey(key, action, mods);
+      return;
+    }
+    if (key == GLFW_KEY_E && action == GLFW_PRESS && app->player.gameMode() != Player::GameMode::Spectator &&
+        !app->gameModeSwitcherOpen) {
+      app->openInventory();
       return;
     }
     app->camera.handleKey(window, key, action);
@@ -783,9 +1058,18 @@ private:
     }
 
     if (key >= GLFW_KEY_1 && key <= GLFW_KEY_9) {
-      app->selectedBlockIndex = static_cast<size_t>(key - GLFW_KEY_1);
+      app->inventory.selected = key - GLFW_KEY_1;
     }
-    if (key == GLFW_KEY_F) {
+    if (key == GLFW_KEY_F11) {
+      app->setFullscreen(!app->fullscreen);
+    }
+    if (key == GLFW_KEY_Q && app->player.gameMode() != Player::GameMode::Spectator) {
+      app->dropSelected((mods & GLFW_MOD_CONTROL) != 0);
+    }
+    if (key == GLFW_KEY_F && app->player.gameMode() != Player::GameMode::Spectator) {
+      std::swap(app->inventory.selectedStack(), app->inventory.offhand()); // vanilla swap-offhand
+    }
+    if (key == GLFW_KEY_L) {
       app->fpsLimitEnabled = !app->fpsLimitEnabled;
       std::clog << "FPS limit " << (app->fpsLimitEnabled ? "enabled" : "disabled") << '\n';
     }
@@ -806,8 +1090,8 @@ private:
       std::clog << "Terrain view: " << terrainViewName(app->terrainView) << '\n';
     }
     if (key == GLFW_KEY_V) {
-      app->useVertexPulling = !app->useVertexPulling;
-      std::clog << "Quad path: " << (app->useVertexPulling ? "vertex shader (vertex pulling)" : "mesh shader") << '\n';
+      app->smoothTerrain = !app->smoothTerrain;
+      std::clog << "Near terrain: " << (app->smoothTerrain ? "smooth (Surface Nets)" : "blocks (greedy mesh)") << '\n';
     }
     if (key == GLFW_KEY_P) {
       if (app->timestampMask == 0u) {
@@ -869,7 +1153,7 @@ private:
 #pragma endregion
 
 #pragma region Main Loop
-  /** Poll events and draw frames until the window closes, capping at 144 FPS while the limit is on. */
+  /** Poll events and draw frames until the window closes, capping at 144 FPS while the limit (L) is on. */
   void mainLoop() {
     using Clock = std::chrono::steady_clock;
     constexpr auto frameDuration =
@@ -877,7 +1161,19 @@ private:
     auto nextFrame = Clock::now();
 
     while (!glfwWindowShouldClose(window)) {
+      if (gpuTimingEnabled) {
+        const auto now = std::chrono::steady_clock::now();
+        if (cpuFrameStart != std::chrono::steady_clock::time_point{}) {
+          const double frameMs = std::chrono::duration<double, std::milli>(now - cpuFrameStart).count();
+          cpuFrameSumMs += frameMs;
+          cpuFrameMaxMs = std::max(cpuFrameMaxMs, frameMs);
+          ++cpuFrameSamples;
+        }
+        cpuFrameStart = now;
+        cpuStageStart = now;
+      }
       glfwPollEvents();
+      markCpuStage(CPU_POLL);
       drawFrame();
       ++fpsWindowFrames;
       const auto fpsNow = std::chrono::steady_clock::now();
@@ -908,20 +1204,21 @@ private:
   /** Destroy the pipelines that depend on the swapchain (its surface format only: viewport and scissor are dynamic). */
   void destroySwapChainPipelines() {
     graphicsPipeline = nullptr;
-    vertexPullingPipeline = nullptr;
+    smoothPipeline = nullptr;
+    smoothCutoutPipeline = nullptr;
+    smoothLodPipeline = nullptr;
+    smoothLodWireframePipeline = nullptr;
     cutoutPipeline = nullptr;
-    cutoutVertexPullingPipeline = nullptr;
     wireframePipeline = nullptr;
-    wireframeVertexPullingPipeline = nullptr;
+    smoothWireframePipeline = nullptr;
     waterPipeline = nullptr;
-    waterVertexPullingPipeline = nullptr;
     taaPipeline = nullptr;
     overlayPipeline = nullptr;
     crosshairPipeline = nullptr;
-    healthPipeline = nullptr;
-    gameModeSwitcherPipeline = nullptr;
+    guiPipeline = nullptr;
     outlinePipeline = nullptr;
     crackPipeline = nullptr;
+    itemEntityPipeline = nullptr;
   }
 
   /** Destroy the swapchain and every swapchain-sized resource, and invalidate the history that depended on them. */
@@ -1229,6 +1526,7 @@ private:
 
     std::vector<vk::PresentModeKHR> availablePresentModes = physicalDevice.getSurfacePresentModesKHR(*surface);
     vk::PresentModeKHR presentMode = chooseSwapPresentMode(availablePresentModes);
+    std::clog << "Present mode: " << vk::to_string(presentMode) << '\n';
 
     vk::SwapchainCreateInfoKHR swapChainCreateInfo{.surface = *surface,
                                                    .minImageCount = minImageCount,
@@ -1236,7 +1534,13 @@ private:
                                                    .imageColorSpace = swapChainSurfaceFormat.colorSpace,
                                                    .imageExtent = swapChainExtent,
                                                    .imageArrayLayers = 1,
-                                                   .imageUsage = vk::ImageUsageFlagBits::eColorAttachment,
+                                                   // Transfer source only for ENGINE_SCREENSHOT: the extra usage can
+                                                   // turn off framebuffer compression on some GPUs.
+                                                   .imageUsage = vk::ImageUsageFlagBits::eColorAttachment |
+                                                                 (std::getenv("ENGINE_SCREENSHOT") != nullptr
+                                                                      ? surfaceCapabilities.supportedUsageFlags &
+                                                                            vk::ImageUsageFlagBits::eTransferSrc
+                                                                      : vk::ImageUsageFlags{}),
                                                    .imageSharingMode = vk::SharingMode::eExclusive,
                                                    .preTransform = surfaceCapabilities.currentTransform,
                                                    .compositeAlpha = vk::CompositeAlphaFlagBitsKHR::eOpaque,
@@ -1292,7 +1596,7 @@ private:
           .descriptorType = vk::DescriptorType::eStorageBuffer,
           .descriptorCount = 1,
           .stageFlags = geometryStages},
-         {.binding = 4, // QuadCount, vertex path
+         {.binding = 4, // SmoothHeights: smoothLodVertMain
           .descriptorType = vk::DescriptorType::eStorageBuffer,
           .descriptorCount = 1,
           .stageFlags = vk::ShaderStageFlagBits::eVertex},
@@ -1300,7 +1604,7 @@ private:
           .descriptorType = vk::DescriptorType::eSampledImage,
           .descriptorCount = textureDescriptorCapacity,
           .stageFlags = vk::ShaderStageFlagBits::eFragment},
-         {.binding = 5, // BlockFaces: fragMain, and vertMain (liquid quads per pass)
+         {.binding = 5, // BlockFaces: fragment shaders
           .descriptorType = vk::DescriptorType::eStorageBuffer,
           .descriptorCount = 1,
           .stageFlags = vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex},
@@ -1373,9 +1677,36 @@ private:
     vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
         .stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "fragMain"};
     vk::PipelineShaderStageCreateInfo shaderStages[] = {taskShaderStageInfo, meshShaderStageInfo, fragShaderStageInfo};
-    vk::PipelineShaderStageCreateInfo vertexShaderStageInfo{
-        .stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = "vertMain"};
-    vk::PipelineShaderStageCreateInfo vertexPullingStages[] = {vertexShaderStageInfo, fragShaderStageInfo};
+    vk::PipelineShaderStageCreateInfo smoothStages[] = {
+        {.stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = "smoothVertMain"},
+        {.stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "smoothFragMain"}};
+    const vk::PipelineShaderStageCreateInfo smoothLodStages[] = {
+        {.stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = "smoothLodVertMain"},
+        {.stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "smoothLodFragMain"}};
+    // Smooth LOD instances: (column slot, tile origin x, tile origin z, scale) per tile.
+    const vk::VertexInputBindingDescription smoothLodBinding{
+        .binding = 0, .stride = sizeof(std::array<int32_t, 4>), .inputRate = vk::VertexInputRate::eInstance};
+    const vk::VertexInputAttributeDescription smoothLodAttribute{
+        .location = 0, .binding = 0, .format = vk::Format::eR32G32B32A32Sint, .offset = 0};
+    const vk::PipelineVertexInputStateCreateInfo smoothLodVertexInput{.vertexBindingDescriptionCount = 1,
+                                                                      .pVertexBindingDescriptions = &smoothLodBinding,
+                                                                      .vertexAttributeDescriptionCount = 1,
+                                                                      .pVertexAttributeDescriptions =
+                                                                          &smoothLodAttribute};
+    // cpuworld::SmoothVertex: (x, y, z, material) as uint16 x4, then the packed normal / AO / skylight word.
+    const vk::VertexInputBindingDescription smoothBinding{
+        .binding = 0, .stride = sizeof(cpuworld::SmoothVertex), .inputRate = vk::VertexInputRate::eVertex};
+    const std::array<vk::VertexInputAttributeDescription, 2> smoothAttributes{
+        {{.location = 0, .binding = 0, .format = vk::Format::eR16G16B16A16Uint, .offset = 0},
+         {.location = 1,
+          .binding = 0,
+          .format = vk::Format::eR32Uint,
+          .offset = offsetof(cpuworld::SmoothVertex, normalLight)}}};
+    const vk::PipelineVertexInputStateCreateInfo smoothVertexInput{
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &smoothBinding,
+        .vertexAttributeDescriptionCount = static_cast<uint32_t>(smoothAttributes.size()),
+        .pVertexAttributeDescriptions = smoothAttributes.data()};
 
     vk::PipelineVertexInputStateCreateInfo vertexInputInfo{};
     vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleList};
@@ -1447,36 +1778,37 @@ private:
     graphicsPipeline =
         vk::raii::Pipeline(device, pipelineCache, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
 
-    // Vertex input stays empty: the vertex shader pulls from QuadBuffer itself.
-    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().stageCount = 2;
-    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().pStages = vertexPullingStages;
-    vertexPullingPipeline =
-        vk::raii::Pipeline(device, pipelineCache, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
-
-    // Cutout: separate from the opaque pipelines so theirs has no discard and keeps early depth testing.
+    // Cutout: separate from the opaque pipeline so its shader has no discard and keeps early depth testing.
     shaderStages[2].pName = "fragCutout";
-    vertexPullingStages[1].pName = "fragCutout";
-    cutoutVertexPullingPipeline =
-        vk::raii::Pipeline(device, pipelineCache, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
-    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().stageCount = 3;
-    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().pStages = shaderStages;
     cutoutPipeline =
         vk::raii::Pipeline(device, pipelineCache, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
     shaderStages[2].pName = "fragMain";
-    vertexPullingStages[1].pName = "fragMain";
-    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().stageCount = 2;
-    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().pStages = vertexPullingStages;
 
     rasterizer.polygonMode = vk::PolygonMode::eLine;
-    wireframeVertexPullingPipeline =
-        vk::raii::Pipeline(device, pipelineCache, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
-    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().stageCount = 3;
-    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().pStages = shaderStages;
     wireframePipeline =
         vk::raii::Pipeline(device, pipelineCache, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
 
-    // Water: blended over the terrain, keeping its depth and motion.
+    // Smooth terrain: same state, vertex + fragment stages with a real vertex buffer.
+    auto &smoothInfo = pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>();
+    smoothInfo.stageCount = 2;
+    smoothInfo.pStages = smoothStages;
+    smoothInfo.pVertexInputState = &smoothVertexInput;
+    smoothWireframePipeline = vk::raii::Pipeline(device, pipelineCache, smoothInfo);
+    smoothInfo.pStages = smoothLodStages;
+    smoothInfo.pVertexInputState = &smoothLodVertexInput;
+    smoothLodWireframePipeline = vk::raii::Pipeline(device, pipelineCache, smoothInfo);
     rasterizer.polygonMode = vk::PolygonMode::eFill;
+    smoothLodPipeline = vk::raii::Pipeline(device, pipelineCache, smoothInfo);
+    smoothInfo.pStages = smoothStages;
+    smoothInfo.pVertexInputState = &smoothVertexInput;
+    smoothPipeline = vk::raii::Pipeline(device, pipelineCache, smoothInfo);
+    smoothStages[1].pName = "smoothFragCutout";
+    smoothCutoutPipeline = vk::raii::Pipeline(device, pipelineCache, smoothInfo);
+    smoothInfo.stageCount = 3;
+    smoothInfo.pStages = shaderStages;
+    smoothInfo.pVertexInputState = &vertexInputInfo;
+
+    // Water: blended over the terrain, keeping its depth and motion.
     rasterizer.cullMode = vk::CullModeFlagBits::eNone;
     depthStencil.depthWriteEnable = vk::False;
     const vk::PipelineColorBlendAttachmentState waterColorBlend{
@@ -1493,12 +1825,7 @@ private:
     const std::array<vk::PipelineColorBlendAttachmentState, 2> waterBlendAttachments{waterColorBlend, waterMotionBlend};
     colorBlending.pAttachments = waterBlendAttachments.data();
     shaderStages[2].pName = "fragWater";
-    vertexPullingStages[1].pName = "fragWater";
     waterPipeline = vk::raii::Pipeline(device, pipelineCache, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
-    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().stageCount = 2;
-    pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>().pStages = vertexPullingStages;
-    waterVertexPullingPipeline =
-        vk::raii::Pipeline(device, pipelineCache, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
   }
 
   /** Create the TAA resolve pipeline, writing the swapchain image and the next history image. */
@@ -1572,15 +1899,24 @@ private:
                                                                       .pPushConstantRanges = &pushConstantRange});
     overlayPipeline = createOverlayStylePipeline(shaderModule, "overlayVertexMain", "overlayFragmentMain",
                                                  vk::BlendFactor::eSrcAlpha, vk::BlendFactor::eOneMinusSrcAlpha);
-    hudPipeline = createOverlayStylePipeline(shaderModule, "hudVertexMain", "hudFragmentMain",
-                                             vk::BlendFactor::eSrcAlpha, vk::BlendFactor::eOneMinusSrcAlpha);
     crosshairPipeline = createOverlayStylePipeline(shaderModule, "crosshairVertexMain", "crosshairFragmentMain",
                                                    vk::BlendFactor::eOneMinusDstColor, vk::BlendFactor::eZero);
-    healthPipeline = createOverlayStylePipeline(shaderModule, "healthVertexMain", "healthFragmentMain",
-                                                vk::BlendFactor::eSrcAlpha, vk::BlendFactor::eOneMinusSrcAlpha);
-    gameModeSwitcherPipeline =
-        createOverlayStylePipeline(shaderModule, "switcherVertexMain", "switcherFragmentMain",
-                                   vk::BlendFactor::eSrcAlpha, vk::BlendFactor::eOneMinusSrcAlpha);
+    vk::raii::ShaderModule guiModule = createShaderModule(readFile("shaders/gui.spv"));
+    // gui::Quad per instance: rect, source, extent (vec4 each), then texture / color / kind / extra.
+    const vk::VertexInputBindingDescription guiBinding{
+        .binding = 0, .stride = sizeof(gui::Quad), .inputRate = vk::VertexInputRate::eInstance};
+    const std::array<vk::VertexInputAttributeDescription, 4> guiAttributes{
+        {{.location = 0, .binding = 0, .format = vk::Format::eR32G32B32A32Sfloat, .offset = offsetof(gui::Quad, rect)},
+         {.location = 1, .binding = 0, .format = vk::Format::eR32G32B32A32Sfloat, .offset = offsetof(gui::Quad, source)},
+         {.location = 2, .binding = 0, .format = vk::Format::eR32G32B32A32Sfloat, .offset = offsetof(gui::Quad, extent)},
+         {.location = 3, .binding = 0, .format = vk::Format::eR32G32B32A32Uint, .offset = offsetof(gui::Quad, texture)}}};
+    const vk::PipelineVertexInputStateCreateInfo guiVertexInput{
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &guiBinding,
+        .vertexAttributeDescriptionCount = static_cast<uint32_t>(guiAttributes.size()),
+        .pVertexAttributeDescriptions = guiAttributes.data()};
+    guiPipeline = createOverlayStylePipeline(guiModule, "guiVertexMain", "guiFragmentMain", vk::BlendFactor::eSrcAlpha,
+                                             vk::BlendFactor::eOneMinusSrcAlpha, &guiVertexInput);
     createOutlinePipeline();
   }
 
@@ -1673,6 +2009,123 @@ private:
     crackInfo.pStages = crackStages.data();
     crackInfo.pColorBlendState = &crackColorBlending;
     crackPipeline = vk::raii::Pipeline(device, pipelineCache, crackInfo);
+
+    // Item entities: opaque cubes in the opaque pass, depth written, one ItemInstance per instance.
+    vk::raii::ShaderModule itemModule = createShaderModule(readFile("shaders/item_entity.spv"));
+    const std::array<vk::PipelineShaderStageCreateInfo, 2> itemStages{
+        {{.stage = vk::ShaderStageFlagBits::eVertex, .module = itemModule, .pName = "itemVertexMain"},
+         {.stage = vk::ShaderStageFlagBits::eFragment, .module = itemModule, .pName = "itemFragmentMain"}}};
+    const vk::VertexInputBindingDescription itemBinding{
+        .binding = 0, .stride = sizeof(ItemInstance), .inputRate = vk::VertexInputRate::eInstance};
+    const std::array<vk::VertexInputAttributeDescription, 6> itemAttributes{
+        {{.location = 0, .binding = 0, .format = vk::Format::eR32G32B32A32Sfloat, .offset = offsetof(ItemInstance, center)},
+         {.location = 1, .binding = 0, .format = vk::Format::eR32G32B32A32Sfloat,
+          .offset = offsetof(ItemInstance, previousCenter)},
+         {.location = 2, .binding = 0, .format = vk::Format::eR32G32B32A32Sfloat, .offset = offsetof(ItemInstance, rotation)},
+         {.location = 3, .binding = 0, .format = vk::Format::eR32G32B32A32Sfloat,
+          .offset = offsetof(ItemInstance, previousRotation)},
+         {.location = 4, .binding = 0, .format = vk::Format::eR32G32B32A32Uint, .offset = offsetof(ItemInstance, faces)},
+         {.location = 5, .binding = 0, .format = vk::Format::eR32G32B32A32Sfloat, .offset = offsetof(ItemInstance, extra)}}};
+    const vk::PipelineVertexInputStateCreateInfo itemVertexInput{
+        .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &itemBinding,
+        .vertexAttributeDescriptionCount = static_cast<uint32_t>(itemAttributes.size()),
+        .pVertexAttributeDescriptions = itemAttributes.data()};
+    const vk::PipelineDepthStencilStateCreateInfo itemDepth{
+        .depthTestEnable = vk::True, .depthWriteEnable = vk::True, .depthCompareOp = vk::CompareOp::eGreaterOrEqual};
+    const vk::PipelineColorBlendAttachmentState opaqueAttachment{
+        .blendEnable = vk::False,
+        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+    const std::array<vk::PipelineColorBlendAttachmentState, 2> itemBlends{opaqueAttachment, motionAttachment};
+    const vk::PipelineColorBlendStateCreateInfo itemColorBlending{
+        .attachmentCount = static_cast<uint32_t>(itemBlends.size()), .pAttachments = itemBlends.data()};
+    auto &itemInfo = pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>();
+    itemInfo.pStages = itemStages.data();
+    itemInfo.pVertexInputState = &itemVertexInput;
+    itemInfo.pDepthStencilState = &itemDepth;
+    itemInfo.pColorBlendState = &itemColorBlending;
+    itemEntityPipeline = vk::raii::Pipeline(device, pipelineCache, itemInfo);
+  }
+
+  /**
+   * Draw the dropped items (item_entity.slang) at the end of the opaque pass: build this frame's cube instances,
+   * interpolated between ticks, bobbing and spinning like vanilla's ItemEntityRenderer.
+   */
+  void recordItemEntities(vk::raii::CommandBuffer &commandBuffer) {
+    if (items.size() == 0 && itemFlights.empty()) {
+      return;
+    }
+    const double partial = std::clamp(itemTickAccumulator / INTERACTION_TICK_SECONDS, 0.0, 1.0);
+    // Last frame's pose for motion vectors: the same interpolation one frame earlier (clamped to the last tick).
+    const double previousPartial = std::max(partial - static_cast<double>(lastFrameDeltaSeconds) / INTERACTION_TICK_SECONDS, 0.0);
+    const glm::dvec3 camera = player.feetPosition();
+    constexpr double kRenderDistance = 64.0;
+    ItemInstance *out = itemInstanceMapped[frameIndex];
+    uint32_t count = 0;
+    // One body: vanilla shows more models for bigger stacks; here smaller cubes inside the body, offset in body space
+    // so they tumble with it.
+    const auto pushBody = [&](const ItemStack &stack, const glm::dvec3 &center, const glm::dvec3 &previousCenter,
+                              const glm::dquat &rotation, const glm::dquat &previousRotation) {
+      if (stack.block >= guiContext.icons.size() || !guiContext.icons[stack.block].valid) {
+        return;
+      }
+      const gui::BlockIcon &icon = guiContext.icons[stack.block];
+      const std::optional<uint32_t> light = cpuWorld->skyLightAt(static_cast<int32_t>(std::floor(center.x)),
+                                                                 static_cast<int32_t>(std::floor(center.y)),
+                                                                 static_cast<int32_t>(std::floor(center.z)));
+      const int copies = stack.count > 48 ? 5 : stack.count > 32 ? 4 : stack.count > 16 ? 3 : stack.count > 1 ? 2 : 1;
+      static constexpr std::array<glm::dvec3, 5> kCopyOffsets{
+          glm::dvec3(0.0), glm::dvec3(0.04, 0.03, -0.03), glm::dvec3(-0.035, -0.03, 0.04),
+          glm::dvec3(0.03, -0.04, 0.035), glm::dvec3(-0.04, 0.04, -0.035)};
+      const double copyScale = copies > 1 ? 0.8 : 1.0;
+      const glm::vec4 quat(static_cast<float>(rotation.x), static_cast<float>(rotation.y), static_cast<float>(rotation.z),
+                           static_cast<float>(rotation.w));
+      const glm::vec4 previousQuat(static_cast<float>(previousRotation.x), static_cast<float>(previousRotation.y),
+                                   static_cast<float>(previousRotation.z), static_cast<float>(previousRotation.w));
+      for (int copy = 0; copy < copies && count < ITEM_MAX_INSTANCES; ++copy) {
+        const glm::dvec3 offset = kCopyOffsets[static_cast<size_t>(copy)] * (copies > 1 ? 1.0 : 0.0);
+        out[count++] = ItemInstance{
+            .center = glm::vec4(glm::vec3(center + rotation * offset),
+                                static_cast<float>(ItemEntityWorld::kSize * copyScale)),
+            .previousCenter = glm::vec4(glm::vec3(previousCenter + previousRotation * offset), 0.0f),
+            .rotation = quat,
+            .previousRotation = previousQuat,
+            .faces = glm::uvec4(icon.top, icon.side, icon.bottom, icon.tint),
+            .extra = glm::vec4(static_cast<float>(light.value_or(15u)), 0.0f, 0.0f, 0.0f)};
+      }
+    };
+    for (size_t i = 0; i < items.size() && count < ITEM_MAX_INSTANCES; ++i) {
+      const glm::dvec3 center = glm::mix(items.previousPosition[i], items.position[i], partial);
+      const glm::dvec3 offsetToCamera = center - camera;
+      if (glm::dot(offsetToCamera, offsetToCamera) > kRenderDistance * kRenderDistance) {
+        continue;
+      }
+      pushBody(items.stack[i], center, glm::mix(items.previousPosition[i], items.position[i], previousPartial),
+               glm::slerp(items.previousOrientation[i], items.orientation[i], partial),
+               glm::slerp(items.previousOrientation[i], items.orientation[i], previousPartial));
+    }
+    // Flights: ease in (t^2, like ItemPickupParticle) from where the item was to the player's middle (followed while
+    // it moves) or to the stack it merged into.
+    const glm::dvec3 playerMiddle = glm::dvec3(player.eyePosition()) - glm::dvec3(0.0, 1.62 - 0.5, 0.0);
+    for (const ItemFlightAnimation &animation : itemFlights) {
+      const ItemEntityWorld::Flight &flight = animation.flight;
+      const glm::dvec3 to = flight.toCollector ? playerMiddle : flight.to;
+      const auto at = [&](double seconds) {
+        const double t = std::clamp(seconds / ITEM_FLIGHT_SECONDS, 0.0, 1.0);
+        return glm::mix(flight.from, to, t * t);
+      };
+      pushBody(flight.stack, at(animation.seconds), at(animation.seconds - lastFrameDeltaSeconds), flight.orientation,
+               flight.orientation);
+    }
+    if (count == 0) {
+      return;
+    }
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *itemEntityPipeline);
+    commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *outlinePipelineLayout, 0,
+                                     *descriptorSets[frameIndex], nullptr);
+    commandBuffer.bindVertexBuffers(0, *itemInstanceBuffers[frameIndex], vk::DeviceSize{0});
+    commandBuffer.draw(36, count, 0, 0);
   }
 
   /** Draw the targeted block's outline; last draw of the scene pass (reuses its viewport and scissor). */
@@ -1712,11 +2165,13 @@ private:
    * @param fragmentEntry Fragment entry point name in `shaderModule`.
    * @param srcColorFactor Source color blend factor.
    * @param dstColorFactor Destination color blend factor.
+   * @param vertexInput Vertex input state (default: none, the shader builds its vertices).
    * @return the pipeline.
    */
   vk::raii::Pipeline createOverlayStylePipeline(const vk::raii::ShaderModule &shaderModule, const char *vertexEntry,
                                                 const char *fragmentEntry, vk::BlendFactor srcColorFactor,
-                                                vk::BlendFactor dstColorFactor) {
+                                                vk::BlendFactor dstColorFactor,
+                                                const vk::PipelineVertexInputStateCreateInfo *vertexInput = nullptr) {
     const std::array<vk::PipelineShaderStageCreateInfo, 2> shaderStages{
         {{.stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = vertexEntry},
          {.stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = fragmentEntry}}};
@@ -1744,7 +2199,7 @@ private:
     vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineCreateInfoChain = {
         {.stageCount = static_cast<uint32_t>(shaderStages.size()),
          .pStages = shaderStages.data(),
-         .pVertexInputState = &vertexInputInfo,
+         .pVertexInputState = vertexInput != nullptr ? vertexInput : &vertexInputInfo,
          .pInputAssemblyState = &inputAssembly,
          .pViewportState = &viewportState,
          .pRasterizationState = &rasterizer,
@@ -1805,7 +2260,7 @@ private:
     } else {
       print(0, "FPS %d", static_cast<int>(std::lround(displayedFps)));
     }
-    print(1, "%s %s%s", useVertexPulling ? "VERTEX" : "MESH", gameModeLabel, mode);
+    print(1, "%s %s%s", smoothTerrain ? "SMOOTH" : "MESH", gameModeLabel, mode);
     print(2, "VIEW %s", terrainViewName(terrainView));
     print(3, "XYZ %lld %lld %lld", static_cast<long long>(std::floor(feet.x)), static_cast<long long>(std::floor(feet.y)),
           static_cast<long long>(std::floor(feet.z)));
@@ -1856,84 +2311,108 @@ private:
     if (player.gameMode() != Player::GameMode::Spectator) {
       commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *crosshairPipeline);
       commandBuffer.draw(18, 1, 0, 0);
-
-      // Hotbar, XP bar and hunger (overlay.slang hudFragmentMain): slots 1-9 hold the first 9 registry blocks.
-      OverlayParams hudParams{.screenSize = params.screenSize, .scale = params.scale, .columns = 0, .text = {}};
-      const size_t slotCount = std::min<size_t>(blockRegistry.blocks.size(), 9);
-      hudParams.columns = static_cast<uint32_t>(selectedBlockIndex) | (player.survivalLike() ? 0x100u : 0u); // | XP, hunger
-      for (size_t slot = 0; slot < slotCount; ++slot) {
-        const blocks::Block &block = blockRegistry.blocks[slot];
-        const uint32_t topTexture = textureSlots[block.faces[2].texture]; // +y
-        const uint32_t sideTexture = textureSlots[block.faces[4].texture]; // +z
-        hudParams.text[slot] = topTexture | (sideTexture << 16u);
-        const auto channel = [&](size_t i) {
-          return static_cast<uint32_t>(std::lround(std::clamp(block.tint[i], 0.0f, 1.0f) * 255.0f));
-        };
-        hudParams.text[9 + slot] = channel(0) | (channel(1) << 8u) | (channel(2) << 16u) | 0xff000000u;
-      }
-      hudParams.text[18] = hudTextureSlot;
-      hudParams.text[19] = static_cast<uint32_t>(slotCount);
-      commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *hudPipeline);
-      commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *overlayPipelineLayout, 0,
-                                       *descriptorSets[frameIndex], nullptr);
-      commandBuffer.pushConstants(*overlayPipelineLayout,
-                                  vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-                                  sizeof(hudParams), &hudParams);
-      commandBuffer.draw(6, 1, 0, 0);
-
-      OverlayParams healthParams{
-          .screenSize = params.screenSize,
-          .scale = params.scale,
-          .columns = static_cast<uint32_t>(std::ceil(std::max(player.health(), 0.0f))),
-          .text = {}};
-      healthParams.text[0] = player.hurtFlashing() ? 1u : 0u;
-      if (player.survivalLike()) {
-        commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *healthPipeline);
-        commandBuffer.pushConstants(*overlayPipelineLayout,
-                                    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-                                    sizeof(healthParams), &healthParams);
-        commandBuffer.draw(6, 1, 0, 0);
-      }
     }
-    if (gameModeSwitcherOpen) {
-      recordGameModeSwitcher(commandBuffer, params.screenSize);
-    }
+    recordGui(commandBuffer);
     commandBuffer.endRendering();
   }
 
-  /** MC_FONT index (overlay.slang) of a switcher text character; space for anything missing. */
-  static uint8_t minecraftGlyphIndex(char c) {
-    static constexpr std::string_view glyphs = " CSAMNFacdeilnoprtuvx4";
-    const size_t index = glyphs.find(c);
-    return index == std::string_view::npos ? 0u : static_cast<uint8_t>(index);
+  /** Copy the swapchain image (color attachment, after the overlay) to screenshotBuffer; leaves it transfer-source. */
+  void recordScreenshotCopy(vk::raii::CommandBuffer &commandBuffer, uint32_t imageIndex) {
+    const vk::DeviceSize bytes = static_cast<vk::DeviceSize>(swapChainExtent.width) * swapChainExtent.height * 4u;
+    auto [buffer, memory] = createBuffer(bytes, vk::BufferUsageFlagBits::eTransferDst,
+                                         vk::MemoryPropertyFlagBits::eHostVisible |
+                                             vk::MemoryPropertyFlagBits::eHostCoherent);
+    screenshotBuffer = std::move(buffer);
+    screenshotMemory = std::move(memory);
+    transition_image_layout(swapChainImages[imageIndex], vk::ImageLayout::eColorAttachmentOptimal,
+                            vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eColorAttachmentWrite,
+                            vk::AccessFlagBits2::eTransferRead, vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                            vk::PipelineStageFlagBits2::eTransfer, vk::ImageAspectFlagBits::eColor);
+    const vk::BufferImageCopy region{
+        .bufferOffset = 0,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .mipLevel = 0, .baseArrayLayer = 0,
+                             .layerCount = 1},
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {swapChainExtent.width, swapChainExtent.height, 1}};
+    commandBuffer.copyImageToBuffer(swapChainImages[imageIndex], vk::ImageLayout::eTransferSrcOptimal,
+                                    *screenshotBuffer, region);
   }
 
-  /**
-   * Draw the F3+F4 game mode switcher (overlay.slang switcherFragmentMain): params.columns = selected mode, text line
-   * 0 = its title, line 1 = the "F4 Next" hint (MC_FONT indices, length in each line's last byte), text[18] = the
-   * HUD atlas slot.
-   */
-  void recordGameModeSwitcher(vk::raii::CommandBuffer &commandBuffer, const glm::vec2 &screenSize) {
-    OverlayParams switcherParams{.screenSize = screenSize, .scale = 1.0f, .columns = 0, .text = {}};
-    switcherParams.columns = static_cast<uint32_t>(gameModeSelection);
-    std::array<uint8_t, OVERLAY_LINES * OVERLAY_COLUMNS> glyphs{};
-    const auto writeLine = [&](uint32_t row, std::string_view line) {
-      for (size_t i = 0; i < std::min<size_t>(line.size(), OVERLAY_COLUMNS); ++i) {
-        glyphs[row * OVERLAY_COLUMNS + i] = minecraftGlyphIndex(line[i]);
+  /** Wait for the frame with the screenshot copy, write it as a PNG (RGBA), and close the window. */
+  void writeScreenshot() {
+    queue.waitIdle();
+    const uint32_t width = swapChainExtent.width;
+    const uint32_t height = swapChainExtent.height;
+    const size_t bytes = static_cast<size_t>(width) * height * 4u;
+    auto *pixels = static_cast<uint8_t *>(screenshotMemory.mapMemory(0, bytes));
+    std::vector<uint8_t> rgba(pixels, pixels + bytes);
+    screenshotMemory.unmapMemory();
+    const vk::Format format = swapChainSurfaceFormat.format;
+    if (format == vk::Format::eB8G8R8A8Srgb || format == vk::Format::eB8G8R8A8Unorm) {
+      for (size_t i = 0; i < bytes; i += 4) {
+        std::swap(rgba[i], rgba[i + 2]);
       }
-      glyphs[row * OVERLAY_COLUMNS + OVERLAY_COLUMNS - 1] = static_cast<uint8_t>(std::min<size_t>(line.size(), OVERLAY_COLUMNS - 1));
-    };
-    writeLine(0, gameModeName(gameModeSelection));
-    writeLine(1, "F4 Next");
-    std::memcpy(switcherParams.text.data(), glyphs.data(), glyphs.size());
-    switcherParams.text[18] = hudTextureSlot; // after lines 0-1, where the shader's atlasTexel looks
-    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *gameModeSwitcherPipeline);
+    }
+    for (size_t i = 3; i < bytes; i += 4) {
+      rgba[i] = 255;
+    }
+    if (stbi_write_png(screenshotPath.c_str(), static_cast<int>(width), static_cast<int>(height), 4, rgba.data(),
+                       static_cast<int>(width * 4u)) == 0) {
+      std::cerr << "failed to write screenshot " << screenshotPath << '\n';
+    } else {
+      std::clog << "Screenshot: " << screenshotPath << '\n';
+    }
+    screenshotPath.clear();
+    glfwSetWindowShouldClose(window, GLFW_TRUE);
+  }
+
+  /** Build this frame's GUI (gui.hpp): HUD and the F3+F4 switcher, then draw it in one instanced call. */
+  void recordGui(vk::raii::CommandBuffer &commandBuffer) {
+    guiBatch.begin(static_cast<int>(swapChainExtent.width), static_cast<int>(swapChainExtent.height),
+                   gui::guiScale(static_cast<int>(swapChainExtent.height)));
+    // Minecraft's HUD per game mode: spectator shows none of it, creative only the hotbar, survival and adventure
+    // add health, hunger and XP.
+    if (player.gameMode() != Player::GameMode::Spectator) {
+      gui::HudState hud;
+      std::copy_n(inventory.items.begin(), inv::kHotbarSlots, hud.hotbar.begin());
+      hud.offhand = inventory.offhand();
+      hud.selected = inventory.selected;
+      hud.survivalLike = player.survivalLike();
+      hud.health = static_cast<int>(std::ceil(std::max(player.health(), 0.0f)));
+      hud.hurtFlash = player.hurtFlashing();
+      gui::drawHud(guiBatch, guiContext, hud);
+    }
+    if (gameModeSwitcherOpen) {
+      const auto iconBlock = [&](std::string_view name) {
+        const auto it = std::ranges::find_if(blockRegistry.blocks, [&](const blocks::Block &b) { return b.name == name; });
+        return static_cast<uint16_t>(it != blockRegistry.blocks.end() ? it->id : 0u);
+      };
+      // Switcher order (Player::GameMode): creative, survival, adventure, spectator.
+      gui::drawGameModeSwitcher(guiBatch, guiContext, static_cast<int>(gameModeSelection),
+                                gameModeName(gameModeSelection),
+                                {iconBlock("grass"), iconBlock("log"), iconBlock("stone"), iconBlock("leaves")});
+    }
+    if (screen) {
+      screen->layout(guiBatch.width(), guiBatch.height());
+      screen->draw(guiBatch, guiContext);
+    }
+    const auto &quads = guiBatch.quads();
+    const auto quadCount = static_cast<uint32_t>(std::min<size_t>(quads.size(), GUI_MAX_QUADS));
+    if (quadCount == 0) {
+      return;
+    }
+    std::memcpy(guiQuadMapped[frameIndex], quads.data(), sizeof(gui::Quad) * quadCount);
+    const glm::vec2 screenSize{static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height)};
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *guiPipeline);
     commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *overlayPipelineLayout, 0,
                                      *descriptorSets[frameIndex], nullptr);
     commandBuffer.pushConstants(*overlayPipelineLayout,
                                 vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-                                sizeof(switcherParams), &switcherParams);
-    commandBuffer.draw(6, 1, 0, 0);
+                                sizeof(screenSize), &screenSize);
+    commandBuffer.bindVertexBuffers(0, *guiQuadBuffers[frameIndex], vk::DeviceSize{0});
+    commandBuffer.draw(6, quadCount, 0, 0);
   }
 
   /** Create the Hi-Z set layout, pipeline layout and the two pyramid build pipelines (hzb.slang). */
@@ -2150,7 +2629,7 @@ private:
     relocateSlotsPipeline = createComputePipeline("relocateSlots");
     rebuildFreeStackPipeline = createComputePipeline("rebuildFreeStack");
     meshColumnsPipeline = createComputePipeline("meshColumns");
-    finalizeVertexDrawPipeline = createComputePipeline("finalizeVertexDraw");
+    resetNewWorkPipeline = createComputePipeline("resetNewWork");
     compactQuadsPipeline = createComputePipeline("compactQuads");
     copyCompactedQuadsPipeline = createComputePipeline("copyCompactedQuads");
     createHzbPipelines();
@@ -2251,7 +2730,8 @@ private:
    * @param imageMemory Receives its memory.
    */
   void createTextureImage(const stbi_uc *pixels, int texWidth, int texHeight, vk::raii::Image &image,
-                          vk::raii::DeviceMemory &imageMemory) {
+                          vk::raii::DeviceMemory &imageMemory, uint32_t mipLevels = TEXTURE_MIP_LEVELS) {
+    textureMipLevels.push_back(mipLevels);
     const auto formatFeatures = physicalDevice.getFormatProperties(TEXTURE_FORMAT).optimalTilingFeatures;
     constexpr auto requiredBlitFeatures = vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst |
                                           vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
@@ -2271,17 +2751,17 @@ private:
     std::tie(image, imageMemory) = createImage(
         texWidth, texHeight, TEXTURE_FORMAT, vk::ImageTiling::eOptimal,
         vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
-        vk::MemoryPropertyFlagBits::eDeviceLocal, TEXTURE_MIP_LEVELS);
+        vk::MemoryPropertyFlagBits::eDeviceLocal, mipLevels);
 
     vk::raii::CommandBuffer commandBuffer = beginSingleTimeCommands();
     transitionImageLayout(commandBuffer, image, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal, 0,
-                          TEXTURE_MIP_LEVELS);
+                          mipLevels);
     copyBufferToImage(commandBuffer, stagingBuffer, image, static_cast<uint32_t>(texWidth),
                       static_cast<uint32_t>(texHeight));
 
     int32_t mipWidth = texWidth;
     int32_t mipHeight = texHeight;
-    for (uint32_t mipLevel = 1; mipLevel < TEXTURE_MIP_LEVELS; ++mipLevel) {
+    for (uint32_t mipLevel = 1; mipLevel < mipLevels; ++mipLevel) {
       transitionImageLayout(commandBuffer, image, vk::ImageLayout::eTransferDstOptimal,
                             vk::ImageLayout::eTransferSrcOptimal, mipLevel - 1u, 1);
 
@@ -2308,7 +2788,7 @@ private:
       mipHeight = nextMipHeight;
     }
     transitionImageLayout(commandBuffer, image, vk::ImageLayout::eTransferDstOptimal,
-                          vk::ImageLayout::eShaderReadOnlyOptimal, TEXTURE_MIP_LEVELS - 1u, 1);
+                          vk::ImageLayout::eShaderReadOnlyOptimal, mipLevels - 1u, 1);
     endSingleTimeCommands(std::move(commandBuffer));
   }
 
@@ -2358,21 +2838,63 @@ private:
       stbi_image_free(pixels);
     }
 
-    // HUD sprite atlas (overlay.slang hudFragmentMain), right after the block textures.
-    int hudWidth, hudHeight, hudChannels;
-    stbi_uc *hudPixels = stbi_load("textures/gui/hud.png", &hudWidth, &hudHeight, &hudChannels, STBI_rgb_alpha);
-    if (!hudPixels) {
-      throw std::runtime_error("failed to load texture image: textures/gui/hud.png");
+    // GUI sprites and the font (gui.hpp), right after the block textures; each is its own bindless texture.
+    const auto loadGuiTexture = [&](const std::string &path, int &width, int &height) {
+      int channels;
+      stbi_uc *pixels = stbi_load(path.c_str(), &width, &height, &channels, STBI_rgb_alpha);
+      if (!pixels) {
+        throw std::runtime_error("failed to load texture image: " + path);
+      }
+      if (textureImages.size() >= textureDescriptorCapacity) {
+        stbi_image_free(pixels);
+        throw std::runtime_error("texture descriptor capacity is too small for the GUI sprites");
+      }
+      const auto slot = static_cast<uint32_t>(textureImages.size());
+      textureImages.emplace_back(nullptr);
+      textureImageMemories.emplace_back(nullptr);
+      createTextureImage(pixels, width, height, textureImages.back(), textureImageMemories.back(), 1); // texel Loads
+      return std::pair{slot, pixels};
+    };
+    guiSprites.byName.clear();
+    for (const std::string_view name : gui::spriteNames()) {
+      const std::string path = "textures/gui/" + std::string(name) + ".png";
+      gui::Sprite sprite;
+      auto [slot, pixels] = loadGuiTexture(path, sprite.width, sprite.height);
+      stbi_image_free(pixels);
+      sprite.texture = slot;
+      if (std::ifstream meta(path + ".mcmeta"); meta) {
+        const std::string text((std::istreambuf_iterator<char>(meta)), std::istreambuf_iterator<char>());
+        gui::parseScaling(text, sprite);
+      }
+      guiSprites.byName.emplace(std::string(name), sprite);
     }
-    if (textureImages.size() >= textureDescriptorCapacity) {
-      stbi_image_free(hudPixels);
-      throw std::runtime_error("texture descriptor capacity is too small for the HUD atlas");
+    {
+      int width, height;
+      auto [slot, pixels] = loadGuiTexture("textures/font/ascii.png", width, height);
+      guiFont = gui::Font::fromPixels(pixels, width, height, slot);
+      stbi_image_free(pixels);
     }
-    hudTextureSlot = static_cast<uint32_t>(textureImages.size());
-    textureImages.emplace_back(nullptr);
-    textureImageMemories.emplace_back(nullptr);
-    createTextureImage(hudPixels, hudWidth, hudHeight, textureImages.back(), textureImageMemories.back());
-    stbi_image_free(hudPixels);
+    guiContext.sprites = &guiSprites;
+    guiContext.font = &guiFont;
+    guiContext.icons.assign(blockRegistry.maxId() + 1u, gui::BlockIcon{});
+    for (const blocks::Block &block : blockRegistry.blocks) {
+      const auto channel = [&](size_t i) {
+        return static_cast<uint32_t>(std::lround(std::clamp(block.tint[i], 0.0f, 1.0f) * 255.0f));
+      };
+      guiContext.icons[block.id] = gui::BlockIcon{
+          .top = textureSlots[block.faces[2].texture],  // +y
+          .side = textureSlots[block.faces[4].texture], // +z
+          .bottom = textureSlots[block.faces[3].texture], // -y
+          .tint = channel(0) | (channel(1) << 8u) | (channel(2) << 16u) | 0xff000000u,
+          .valid = true};
+    }
+    creativeCatalog.clear();
+    for (const blocks::Block &block : blockRegistry.blocks) {
+      if (block.creative) {
+        creativeCatalog.push_back(
+            gui::CreativeItem{.block = static_cast<uint16_t>(block.id), .name = block.displayName, .category = block.category});
+      }
+    }
 
     // Block-breaking crack stages (outline.slang crackFragmentMain), after the atlas.
     destroyStageSlot = static_cast<uint32_t>(textureImages.size());
@@ -2434,9 +2956,9 @@ private:
   /** Create a mipmapped view per texture frame. */
   void createTextureImageViews() {
     textureImageViews.reserve(textureImages.size());
-    for (const auto &image : textureImages) {
+    for (size_t i = 0; i < textureImages.size(); ++i) {
       textureImageViews.emplace_back(
-          createImageView(*image, TEXTURE_FORMAT, vk::ImageAspectFlagBits::eColor, TEXTURE_MIP_LEVELS));
+          createImageView(*textureImages[i], TEXTURE_FORMAT, vk::ImageAspectFlagBits::eColor, textureMipLevels[i]));
     }
   }
 
@@ -2619,6 +3141,22 @@ private:
       uniformBuffersMemory.emplace_back(std::move(bufferMemory));
       uniformBuffersMapped.emplace_back(uniformBuffersMemory.back().mapMemory(0, bufferSize));
     }
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+      const vk::DeviceSize guiBytes = sizeof(gui::Quad) * GUI_MAX_QUADS;
+      auto [buffer, bufferMemory] =
+          createBuffer(guiBytes, vk::BufferUsageFlagBits::eVertexBuffer,
+                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      guiQuadBuffers.emplace_back(std::move(buffer));
+      guiQuadMemories.emplace_back(std::move(bufferMemory));
+      guiQuadMapped.push_back(static_cast<gui::Quad *>(guiQuadMemories.back().mapMemory(0, guiBytes)));
+      const vk::DeviceSize itemBytes = sizeof(ItemInstance) * ITEM_MAX_INSTANCES;
+      auto [itemBuffer, itemMemory] =
+          createBuffer(itemBytes, vk::BufferUsageFlagBits::eVertexBuffer,
+                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      itemInstanceBuffers.emplace_back(std::move(itemBuffer));
+      itemInstanceMemories.emplace_back(std::move(itemMemory));
+      itemInstanceMapped.push_back(static_cast<ItemInstance *>(itemInstanceMemories.back().mapMemory(0, itemBytes)));
+    }
   }
 
   /**
@@ -2650,6 +3188,19 @@ private:
         heightBufferSize, vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eDeviceLocal);
     chunkHeightBuffer = std::move(heightBufferValue);
     chunkHeightBufferMemory = std::move(heightBufferMemoryValue);
+    std::tie(smoothHeightBuffer, smoothHeightBufferMemory) =
+        createBuffer(2u * sizeof(float) * MAX_HORIZONTAL_CHUNK_COUNT * HEIGHT_STRIDE * HEIGHT_STRIDE,
+                     vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    for (size_t frame = 0; frame < MAX_FRAMES_IN_FLIGHT; ++frame) {
+      const vk::DeviceSize instanceBytes = sizeof(std::array<int32_t, 4>) * MAX_HORIZONTAL_CHUNK_COUNT;
+      auto [instanceBuffer, instanceMemory] =
+          createBuffer(instanceBytes, vk::BufferUsageFlagBits::eVertexBuffer,
+                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      smoothLodInstanceBuffers.emplace_back(std::move(instanceBuffer));
+      smoothLodInstanceBufferMemories.emplace_back(std::move(instanceMemory));
+      smoothLodInstancesMapped.push_back(
+          static_cast<std::array<int32_t, 4> *>(smoothLodInstanceBufferMemories.back().mapMemory(0, instanceBytes)));
+    }
 
     auto [quadCountBufferValue, quadCountBufferMemoryValue] =
         createBuffer(2u * sizeof(uint32_t),
@@ -2659,8 +3210,31 @@ private:
     quadCountBuffer = std::move(quadCountBufferValue);
     quadCountBufferMemory = std::move(quadCountBufferMemoryValue);
 
-    // Static {0,1,2, 0,2,3} + 4q pattern for VERTEX_QUADS_PER_INSTANCE quads, staged into device-local memory since
-    // every vertex-pulling draw reads it.
+    // Smooth LOD grid triangles, front facing like the mesh path's +Y faces (rows are z, columns x).
+    {
+      std::vector<uint16_t> indices;
+      indices.reserve(LOD_GRID_INDEX_COUNT);
+      const auto at = [](uint32_t i, uint32_t j) { return static_cast<uint16_t>(j * LOD_GRID_SIDE + i); };
+      for (uint32_t j = 0; j + 1u < LOD_GRID_SIDE; ++j) {
+        for (uint32_t i = 0; i + 1u < LOD_GRID_SIDE; ++i) {
+          indices.insert(indices.end(), {at(i, j + 1u), at(i + 1u, j + 1u), at(i + 1u, j)});
+          indices.insert(indices.end(), {at(i, j + 1u), at(i + 1u, j), at(i, j)});
+        }
+      }
+      const vk::DeviceSize bytes = sizeof(uint16_t) * indices.size();
+      auto [stagingBuffer, stagingBufferMemory] =
+          createBuffer(bytes, vk::BufferUsageFlagBits::eTransferSrc,
+                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      std::memcpy(stagingBufferMemory.mapMemory(0, bytes), indices.data(), bytes);
+      stagingBufferMemory.unmapMemory();
+      std::tie(lodGridIndexBuffer, lodGridIndexBufferMemory) =
+          createBuffer(bytes, vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+                       vk::MemoryPropertyFlagBits::eDeviceLocal);
+      copyBuffer(stagingBuffer, lodGridIndexBuffer, bytes);
+    }
+
+    // Static {0,1,2, 0,2,3} + 4q pattern for VERTEX_QUADS_PER_INSTANCE quads (smooth near terrain), staged into
+    // device-local memory.
     {
       const vk::DeviceSize indexBufferSize = sizeof(uint16_t) * 6u * VERTEX_QUADS_PER_INSTANCE;
       auto [stagingBuffer, stagingBufferMemory] =
@@ -2682,13 +3256,6 @@ private:
     }
 
     createWorkPoolBuffers();
-
-    auto [vertexDrawArgumentsValue, vertexDrawArgumentsMemoryValue] =
-        createBuffer(sizeof(vk::DrawIndexedIndirectCommand),
-                     vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eIndirectBuffer,
-                     vk::MemoryPropertyFlagBits::eDeviceLocal);
-    vertexDrawArgumentsBuffer = std::move(vertexDrawArgumentsValue);
-    vertexDrawArgumentsBufferMemory = std::move(vertexDrawArgumentsMemoryValue);
 
     const vk::DeviceSize coordinateBufferSize = sizeof(world::ChunkLod) * MAX_HORIZONTAL_CHUNK_COUNT;
     const vk::BufferUsageFlags gpuOnly = vk::BufferUsageFlagBits::eStorageBuffer;
@@ -2832,6 +3399,10 @@ private:
         createBuffer(quadBytes, deviceUsage, vk::MemoryPropertyFlagBits::eDeviceLocal);
     std::tie(cpuChunkOffsetBuffer, cpuChunkOffsetBufferMemory) =
         createBuffer(quadBytes, deviceUsage, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    std::tie(cpuSmoothVertexBuffer, cpuSmoothVertexBufferMemory) =
+        createBuffer(sizeof(cpuworld::SmoothVertex) * CPU_MAX_SMOOTH_VERTICES,
+                     vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+                     vk::MemoryPropertyFlagBits::eDeviceLocal);
     std::tie(cpuClusterBuffer, cpuClusterBufferMemory) =
         createBuffer(QUAD_CLUSTER_SIZE * QUAD_CLUSTERS_PER_CHUNK * CPU_MAX_CHUNK_SLOTS, deviceUsage,
                      vk::MemoryPropertyFlagBits::eDeviceLocal);
@@ -2865,6 +3436,7 @@ private:
   void updateBlockInteraction(const glm::vec3 &eye, float frameDeltaSeconds) {
     const bool breakClicked = std::exchange(breakClickPending, false) && camera.cursorCaptured();
     const bool placeClicked = std::exchange(placeClickPending, false) && camera.cursorCaptured();
+    const bool pickClicked = std::exchange(pickClickPending, false) && camera.cursorCaptured();
     outlineTarget.reset();
     cpuWorld->tickFluids(glfwGetTime()); // ocean flowing into dug cells, one block per flow step
     const Player::GameMode gameMode = player.gameMode();
@@ -2879,20 +3451,36 @@ private:
     };
     std::optional<cpuworld::BlockHit> hit = raycastTarget();
     const auto breakTarget = [&] {
-      cpuWorld->breakBlock(hit->block[0], hit->block[1], hit->block[2]);
+      const uint16_t brokenId = cpuWorld->blockId(hit->block[0], hit->block[1], hit->block[2]);
+      if (cpuWorld->breakBlock(hit->block[0], hit->block[1], hit->block[2])) {
+        items.wakeAround(hit->block[0], hit->block[1], hit->block[2]);
+        if (gameMode != Player::GameMode::Creative) {
+          dropBrokenBlock(hit->block, brokenId);
+        }
+      }
       destroyTarget.reset();
       destroyProgress = 0.0f;
       hit = raycastTarget();
     };
     const auto placeOnTarget = [&] {
-      if (!hit || hit->normal == cpuworld::BlockXYZ{} || selectedBlockIndex >= blockRegistry.blocks.size()) {
+      // Main hand, else the offhand (vanilla tries both hands).
+      ItemStack *held = !inventory.selectedStack().empty() ? &inventory.selectedStack()
+                        : !inventory.offhand().empty()     ? &inventory.offhand()
+                                                           : nullptr;
+      if (!hit || hit->normal == cpuworld::BlockXYZ{} || held == nullptr) {
         return;
       }
       const cpuworld::BlockXYZ cell{hit->block[0] + hit->normal[0], hit->block[1] + hit->normal[1],
                                     hit->block[2] + hit->normal[2]};
       if (!player.overlapsBlock(cell[0], cell[1], cell[2])) {
-        const auto blockId = static_cast<uint16_t>(blockRegistry.blocks[selectedBlockIndex].id);
-        if (cpuWorld->placeBlock(cell[0], cell[1], cell[2], blockId)) {
+        if (cpuWorld->placeBlock(cell[0], cell[1], cell[2], held->block)) {
+          items.wakeAround(cell[0], cell[1], cell[2]);
+          if (gameMode != Player::GameMode::Creative) {
+            --held->count;
+            if (held->empty()) {
+              *held = {};
+            }
+          }
           hit = raycastTarget();
         }
       }
@@ -2911,6 +3499,9 @@ private:
     if (placeClicked && canEdit) {
       placeOnTarget();
       useDelayTicks = BLOCK_USE_DELAY_TICKS;
+    }
+    if (pickClicked && hit) {
+      pickBlock(cpuWorld->blockId(hit->block[0], hit->block[1], hit->block[2]), gameMode == Player::GameMode::Creative);
     }
 
     const bool breakHeld = camera.cursorCaptured() && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
@@ -2953,6 +3544,159 @@ private:
     }
     if (hit) {
       outlineTarget = hit->block;
+    }
+  }
+
+  /**
+   * Pick block (middle click), like vanilla: select the block's hotbar slot if it has one; otherwise creative puts a
+   * stack in an empty hotbar slot (or the selected one), survival swaps it in from main storage if it is there.
+   */
+  void pickBlock(uint16_t block, bool creative) {
+    if (block >= guiContext.icons.size() || !guiContext.icons[block].valid) {
+      return;
+    }
+    const int found = inventory.find(block);
+    if (found >= 0 && found < inv::kHotbarSlots) {
+      inventory.selected = found;
+      return;
+    }
+    if (creative) {
+      const int free = inventory.freeHotbarSlot();
+      if (free >= 0) {
+        inventory.selected = free;
+      }
+      inventory.selectedStack() = ItemStack{.block = block, .count = 1};
+      return;
+    }
+    if (found >= 0) {
+      const int free = inventory.freeHotbarSlot();
+      if (free >= 0) {
+        inventory.selected = free;
+      }
+      std::swap(inventory.selectedStack(), inventory.items[static_cast<size_t>(found)]);
+    }
+  }
+
+  /** Q: drop one item from the selected slot (Ctrl: the whole stack). */
+  void dropSelected(bool wholeStack) {
+    ItemStack &held = inventory.selectedStack();
+    if (held.empty()) {
+      return;
+    }
+    const auto count = static_cast<uint16_t>(wholeStack ? held.count : 1);
+    dropItem(ItemStack{.block = held.block, .count = count});
+    held.count = static_cast<uint16_t>(held.count - count);
+    if (held.empty()) {
+      held = {};
+    }
+  }
+
+  /** Throw a stack from the player as an item entity (Q, or out of a screen), like vanilla Player.drop. */
+  void dropItem(const ItemStack &stack) {
+    if (stack.empty()) {
+      return;
+    }
+    std::uint32_t state = ++itemSeed * 0x9e3779b9u + 1u;
+    const auto random = [&] {
+      state ^= state << 13u;
+      state ^= state >> 17u;
+      state ^= state << 5u;
+      return static_cast<double>(state >> 8u) / 16777216.0;
+    };
+    // From just below the eyes, along the look direction with a little random spread.
+    const glm::dvec3 eye = glm::dvec3(player.eyePosition());
+    const glm::dvec3 center = eye - glm::dvec3(0.0, 0.3, 0.0);
+    const glm::dvec3 look = glm::dvec3(camera.front());
+    const double angle = random() * 2.0 * 3.14159265358979;
+    const double spread = 0.02 * random();
+    const glm::dvec3 velocity =
+        look * 0.3 + glm::dvec3(std::cos(angle) * spread, 0.1 + (random() - random()) * 0.1, std::sin(angle) * spread);
+    // Vanilla speeds are blocks per tick; bodies use m/s.
+    items.spawn(center, velocity / ItemEntityWorld::kTickSeconds, randomSpin(itemSeed), itemDensity(stack.block), stack,
+                ItemEntityWorld::kThrowPickupDelay, itemSeed, ItemEntityWorld::kThrowMergeDelay);
+  }
+
+  /** Density (kg/m^3) of a block's dropped item. */
+  double itemDensity(uint16_t blockId) const {
+    const auto block = std::ranges::find_if(blockRegistry.blocks, [&](const blocks::Block &b) { return b.id == blockId; });
+    return block != blockRegistry.blocks.end() ? block->density : 1500.0;
+  }
+
+  /** Random spin for a new drop, rad/s. */
+  glm::dvec3 randomSpin(std::uint32_t seed) const {
+    const double a = seed * 2.399963;
+    return glm::dvec3(std::sin(a), std::cos(a * 1.7), std::sin(a * 2.3)) * 4.0;
+  }
+
+  /** Survival break: the block's drop pops out of the cell (vanilla Block.popResource). */
+  void dropBrokenBlock(const cpuworld::BlockXYZ &cell, uint16_t blockId) {
+    const auto block = std::ranges::find_if(blockRegistry.blocks, [&](const blocks::Block &b) { return b.id == blockId; });
+    if (block == blockRegistry.blocks.end() || block->dropsNothing) {
+      return;
+    }
+    std::uint32_t state = ++itemSeed * 0x9e3779b9u + 7u;
+    const auto random = [&] {
+      state ^= state << 13u;
+      state ^= state >> 17u;
+      state ^= state << 5u;
+      return static_cast<double>(state >> 8u) / 16777216.0;
+    };
+    const glm::dvec3 center(cell[0] + 0.5 + (random() - 0.5) * 0.5, cell[1] + 0.5 + (random() - 0.5) * 0.5,
+                            cell[2] + 0.5 + (random() - 0.5) * 0.5);
+    const glm::dvec3 velocity(random() * 0.2 - 0.1, 0.2, random() * 0.2 - 0.1); // blocks per tick (vanilla)
+    const auto dropId = static_cast<uint16_t>(block->dropId);
+    items.spawn(center, velocity / ItemEntityWorld::kTickSeconds, randomSpin(itemSeed), itemDensity(dropId),
+                ItemStack{.block = dropId, .count = 1}, ItemEntityWorld::kDropPickupDelay, itemSeed);
+  }
+
+  /**
+   * Run the item entities' 20 Hz ticks for this frame (physics on itemPool, then merging and pickup), and drop the
+   * inventory when the player has died since the last call.
+   */
+  void updateItems(float frameDeltaSeconds) {
+    for (ItemFlightAnimation &animation : itemFlights) {
+      animation.seconds += frameDeltaSeconds;
+    }
+    std::erase_if(itemFlights, [](const ItemFlightAnimation &a) { return a.seconds >= ITEM_FLIGHT_SECONDS; });
+    if (player.deathCount() != handledDeaths) {
+      handledDeaths = player.deathCount();
+      const glm::dvec3 deathFeet = player.deathPosition();
+      for (ItemStack &stack : inventory.items) {
+        if (!stack.empty()) {
+          const std::uint32_t seed = ++itemSeed;
+          const double angle = seed * 2.399963; // golden angle: spread around the death spot
+          const double speed = 0.1 + 0.4 * std::fmod(seed * 0.618034, 1.0);
+          items.spawn(deathFeet + glm::dvec3(0.0, 1.0, 0.0),
+                      glm::dvec3(-std::sin(angle) * speed, 0.2, std::cos(angle) * speed) / ItemEntityWorld::kTickSeconds,
+                      randomSpin(seed), itemDensity(stack.block), stack, ItemEntityWorld::kThrowPickupDelay, seed,
+                      ItemEntityWorld::kThrowMergeDelay);
+          stack = {};
+        }
+      }
+    }
+    itemTickAccumulator = std::min(itemTickAccumulator + frameDeltaSeconds, 10.0 * INTERACTION_TICK_SECONDS);
+    if (itemTickAccumulator < INTERACTION_TICK_SECONDS) {
+      return;
+    }
+    CpuWorldCells cells;
+    cells.world = cpuWorld.get();
+    const glm::dvec3 feet = player.feetPosition();
+    const bool canCollect = player.gameMode() != Player::GameMode::Spectator;
+    const ItemEntityWorld::Collector pickup{
+        .box = {feet - glm::dvec3(0.3, 0.0, 0.3), feet + glm::dvec3(0.3, 1.8, 0.3)},
+        .take = [&](const ItemStack &stack) {
+          const int fits = inventory.room(stack.block, stack.count);
+          if (fits > 0) {
+            inventory.add(ItemStack{.block = stack.block, .count = static_cast<uint16_t>(fits)});
+          }
+          return fits;
+        }};
+    while (itemTickAccumulator >= INTERACTION_TICK_SECONDS) {
+      itemTickAccumulator -= INTERACTION_TICK_SECONDS;
+      items.tick(cells, itemPool.get(), canCollect ? &pickup : nullptr);
+    }
+    for (ItemEntityWorld::Flight &flight : items.takeFlights()) {
+      itemFlights.push_back(ItemFlightAnimation{.flight = flight, .seconds = 0.0});
     }
   }
 
@@ -3067,6 +3811,7 @@ private:
 
     cpuQuadCopies.clear();
     cpuOffsetCopies.clear();
+    cpuSmoothCopies.clear();
     cpuClusterCopies.clear();
     cpuTranslucentClusterCopies.clear();
     cpuClearedSlots.clear();
@@ -3094,7 +3839,8 @@ private:
       cpuworld::ColumnMeshEvent &event = cpuPendingEvents.front();
       vk::DeviceSize bytes = 0;
       for (const cpuworld::ChunkMesh &mesh : event.chunks) {
-        bytes += 2u * sizeof(uint64_t) * mesh.quads.size() + sizeof(mesh.clusters) + sizeof(mesh.translucentClusters);
+        bytes += 2u * sizeof(uint64_t) * mesh.quads.size() + sizeof(cpuworld::SmoothVertex) * mesh.smoothVertices.size() +
+                 sizeof(mesh.clusters) + sizeof(mesh.translucentClusters);
       }
       if (cpuStagingUsed != 0u && cpuStagingUsed + bytes > CPU_STAGING_BYTES) {
         break; // next frame
@@ -3107,6 +3853,7 @@ private:
       const auto releaseChunk = [&](const CpuChunkAllocation &chunk) {
         cpuClearedSlots.push_back(chunk.slot);
         cpuQuadRanges.release(chunk.quadOffset, chunk.quadCount);
+        cpuSmoothRanges.release(chunk.smoothOffset, chunk.smoothCount);
         cpuChunkSlots.release(chunk.slot);
         cpuQuadCountDirty = true;
       };
@@ -3116,10 +3863,15 @@ private:
         if (quadCount == 0u) {
           return;
         }
+        const uint32_t smoothCount = static_cast<uint32_t>(mesh.smoothVertices.size());
         const std::optional<uint32_t> quadOffset = cpuQuadRanges.allocate(quadCount);
-        if (!quadOffset || cpuChunkSlots.highWater() >= CPU_MAX_CHUNK_SLOTS) {
+        const std::optional<uint32_t> smoothOffset = cpuSmoothRanges.allocate(smoothCount);
+        if (!quadOffset || !smoothOffset || cpuChunkSlots.highWater() >= CPU_MAX_CHUNK_SLOTS) {
           if (quadOffset) {
             cpuQuadRanges.release(*quadOffset, quadCount);
+          }
+          if (smoothOffset) {
+            cpuSmoothRanges.release(*smoothOffset, smoothCount);
           }
           if (!cpuCapacityWarned) {
             std::clog << "CPU chunk buffers are full; some near chunks are not drawn\n";
@@ -3127,14 +3879,9 @@ private:
           }
           return;
         }
-        // counts01/23/45: two 16-bit per-face quad counts each.
-        uint32_t opaqueQuadCount = 0;
-        for (const cpuworld::QuadCluster &cluster : mesh.clusters) {
-          opaqueQuadCount += (cluster.counts01 & 0xffffu) + (cluster.counts01 >> 16u) + (cluster.counts23 & 0xffffu) +
-                             (cluster.counts23 >> 16u) + (cluster.counts45 & 0xffffu) + (cluster.counts45 >> 16u);
-        }
-        CpuChunkAllocation chunk{mesh.cy,       cpuChunkSlots.allocate(), *quadOffset,    quadCount,
-                                 mesh.clusters, mesh.translucentClusters, opaqueQuadCount};
+        CpuChunkAllocation chunk{mesh.cy,       cpuChunkSlots.allocate(), *quadOffset,  quadCount,
+                                 mesh.clusters, mesh.translucentClusters, *smoothOffset, smoothCount,
+                                 mesh.smoothOpaqueVertices};
         for (cpuworld::QuadCluster &cluster : chunk.clusters) {
           cluster.base += *quadOffset;
         }
@@ -3149,6 +3896,13 @@ private:
         std::fill_n(reinterpret_cast<uint64_t *>(staging + cpuStagingUsed), quadCount, mesh.chunkOffset);
         cpuOffsetCopies.push_back({cpuStagingUsed, sizeof(uint64_t) * *quadOffset, quadBytes});
         cpuStagingUsed += quadBytes;
+        if (smoothCount != 0u) {
+          const vk::DeviceSize smoothBytes = sizeof(cpuworld::SmoothVertex) * smoothCount;
+          std::memcpy(staging + cpuStagingUsed, mesh.smoothVertices.data(), smoothBytes);
+          cpuSmoothCopies.push_back(
+              {cpuStagingUsed, sizeof(cpuworld::SmoothVertex) * static_cast<vk::DeviceSize>(*smoothOffset), smoothBytes});
+          cpuStagingUsed += smoothBytes;
+        }
         // Hidden chunks leave their slot zeroed (freed slots are cleared, new ones start at zero).
         if (column.visible) {
           stageCpuClusters(chunk, frame);
@@ -3204,8 +3958,10 @@ private:
     }
     const vk::MemoryBarrier2 afterDraws{.srcStageMask = vk::PipelineStageFlagBits2::eTaskShaderEXT |
                                                         vk::PipelineStageFlagBits2::eMeshShaderEXT |
-                                                        vk::PipelineStageFlagBits2::eVertexShader,
-                                        .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+                                                        vk::PipelineStageFlagBits2::eVertexShader |
+                                                        vk::PipelineStageFlagBits2::eVertexAttributeInput,
+                                        .srcAccessMask = vk::AccessFlagBits2::eShaderRead |
+                                                         vk::AccessFlagBits2::eVertexAttributeRead,
                                         .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
                                         .dstAccessMask = vk::AccessFlagBits2::eTransferWrite};
     commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &afterDraws});
@@ -3229,6 +3985,9 @@ private:
       commandBuffer.copyBuffer(staging, *cpuQuadBuffer, cpuQuadCopies);
       commandBuffer.copyBuffer(staging, *cpuChunkOffsetBuffer, cpuOffsetCopies);
     }
+    if (!cpuSmoothCopies.empty()) {
+      commandBuffer.copyBuffer(staging, *cpuSmoothVertexBuffer, cpuSmoothCopies);
+    }
     if (!cpuClusterCopies.empty()) {
       commandBuffer.copyBuffer(staging, *cpuClusterBuffer, cpuClusterCopies);
       commandBuffer.copyBuffer(staging, *cpuTranslucentClusterBuffer, cpuTranslucentClusterCopies);
@@ -3243,11 +4002,14 @@ private:
                                          .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
                                          .dstStageMask = vk::PipelineStageFlagBits2::eTaskShaderEXT |
                                                          vk::PipelineStageFlagBits2::eMeshShaderEXT |
-                                                         vk::PipelineStageFlagBits2::eVertexShader,
-                                         .dstAccessMask = vk::AccessFlagBits2::eShaderRead};
+                                                         vk::PipelineStageFlagBits2::eVertexShader |
+                                                         vk::PipelineStageFlagBits2::eVertexAttributeInput,
+                                         .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+                                                          vk::AccessFlagBits2::eVertexAttributeRead};
     commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &uploadsDone});
     cpuQuadCopies.clear();
     cpuOffsetCopies.clear();
+    cpuSmoothCopies.clear();
     cpuClusterCopies.clear();
     cpuTranslucentClusterCopies.clear();
     cpuClearedSlots.clear();
@@ -3429,8 +4191,7 @@ private:
           .sampler = textureSampler, .imageView = nullptr, .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
 
       vk::DescriptorBufferInfo blockFaceBufferInfo{.buffer = blockFaceBuffer, .offset = 0, .range = vk::WholeSize};
-      vk::DescriptorBufferInfo quadCountBufferInfo{
-          .buffer = cpuSet ? *cpuQuadCountBuffer : *quadCountBuffer, .offset = 0, .range = sizeof(uint32_t)};
+      vk::DescriptorBufferInfo smoothHeightBufferInfo{.buffer = smoothHeightBuffer, .offset = 0, .range = vk::WholeSize};
       vk::DescriptorBufferInfo clusterBufferInfo{
           .buffer = cpuSet ? (translucentSet ? *cpuTranslucentClusterBuffer : *cpuClusterBuffer)
                            : (translucentSet ? *waterClusterBuffer : *quadClusterBuffer),
@@ -3478,7 +4239,7 @@ private:
            .dstArrayElement = 0,
            .descriptorCount = 1,
            .descriptorType = vk::DescriptorType::eStorageBuffer,
-           .pBufferInfo = &quadCountBufferInfo},
+           .pBufferInfo = &smoothHeightBufferInfo},
           {.dstSet = set,
            .dstBinding = 6,
            .dstArrayElement = 0,
@@ -3507,7 +4268,7 @@ private:
           {.buffer = quadCountBuffer, .offset = 0, .range = 2u * sizeof(uint32_t)},
           {.buffer = chunkWorkBuffer, .offset = 0, .range = vk::WholeSize},
           {.buffer = quadClusterBuffer, .offset = 0, .range = vk::WholeSize},
-          {.buffer = vertexDrawArgumentsBuffer, .offset = 0, .range = sizeof(vk::DrawIndexedIndirectCommand)},
+          {.buffer = smoothHeightBuffer, .offset = 0, .range = vk::WholeSize},
           {.buffer = chunkNeighborLodBuffers[i], .offset = 0, .range = sizeof(uint32_t) * MAX_HORIZONTAL_CHUNK_COUNT},
           {.buffer = columnListBuffers[i], .offset = 0, .range = vk::WholeSize},
           {.buffer = retireListBuffers[i], .offset = 0, .range = vk::WholeSize},
@@ -3651,6 +4412,37 @@ private:
    * slots, so the mesh path only launches task groups over those. Gaps of up to 2 slots are merged to keep the draw
    * count down; the task shader's per-cluster test drops what slips through.
    */
+  /**
+   * Smooth mode: write this frame's smooth LOD instances, one per live GPU column whose tile (over the whole terrain
+   * height range) is in the culling frustum.
+   *
+   * @return instance count.
+   */
+  uint32_t buildSmoothLodInstances() {
+    const glm::mat4 &m = cullMvpCpu;
+    const auto row = [&](int index) { return glm::vec4(m[0][index], m[1][index], m[2][index], m[3][index]); };
+    const std::array<glm::vec4, 5> planes{row(3) + row(0), row(3) - row(0), row(3) + row(1), row(3) - row(1),
+                                          row(3) - row(2)};
+    std::array<int32_t, 4> *instances = smoothLodInstancesMapped[frameIndex];
+    uint32_t count = 0;
+    chunkSlots.forEachColumn([&](uint32_t slot, const world::ChunkLod &tile) {
+      const float size = static_cast<float>(CHUNK_SIZE * tile.scale) + 1.0f;
+      const glm::vec3 low{static_cast<float>(tile.x * CHUNK_SIZE), static_cast<float>(world::kMinTerrainHeight) - 64.0f,
+                          static_cast<float>(tile.z * CHUNK_SIZE)};
+      const glm::vec3 high{low.x + size, static_cast<float>(world::kMaxTerrainHeight) + 64.0f, low.z + size};
+      for (const glm::vec4 &plane : planes) {
+        // The box corner farthest along the plane normal; outside if even it is behind the plane.
+        const glm::vec3 far{plane.x >= 0.0f ? high.x : low.x, plane.y >= 0.0f ? high.y : low.y,
+                            plane.z >= 0.0f ? high.z : low.z};
+        if (glm::dot(glm::vec3(plane), far) + plane.w < 0.0f) {
+          return;
+        }
+      }
+      instances[count++] = {static_cast<int32_t>(slot), tile.x * CHUNK_SIZE, tile.z * CHUNK_SIZE, tile.scale};
+    });
+    return count;
+  }
+
   void buildCpuVisibleSlotRuns() {
     cpuVisibleSlotRuns.clear();
     const uint32_t slotCount = cpuChunkSlots.highWater();
@@ -3667,7 +4459,8 @@ private:
     constexpr float half = static_cast<float>(CHUNK_SIZE) * 0.5f;
     std::array<float, 5> radius{}; // projected half-extent of the cube on each plane normal
     for (size_t plane = 0; plane < planes.size(); ++plane) {
-      radius[plane] = (std::abs(planes[plane].x) + std::abs(planes[plane].y) + std::abs(planes[plane].z)) * half;
+      // + 1: smooth terrain corners reach up to half a block outside their chunk.
+      radius[plane] = (std::abs(planes[plane].x) + std::abs(planes[plane].y) + std::abs(planes[plane].z)) * (half + 1.0f);
     }
     for (const auto &[columnKey, column] : cpuColumns) {
       if (!column.visible) {
@@ -3811,9 +4604,7 @@ private:
 
     commandBuffer.beginRendering(renderingInfo);
     commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
-                               wireframeEnabled
-                                   ? (useVertexPulling ? *wireframeVertexPullingPipeline : *wireframePipeline)
-                                   : (useVertexPulling ? *vertexPullingPipeline : *graphicsPipeline));
+                               wireframeEnabled ? *wireframePipeline : *graphicsPipeline);
     commandBuffer.setCullMode(frozenLodView ? vk::CullModeFlagBits::eNone : vk::CullModeFlagBits::eBack);
     // Negative height flips Y for Vulkan.
     commandBuffer.setViewport(0, vk::Viewport(0.0f, static_cast<float>(swapChainExtent.height),
@@ -3823,42 +4614,111 @@ private:
     const bool debugView = terrainView == TerrainView::Debug;
     uint32_t geometryPass = GEOMETRY_PASS_OPAQUE;
     // Push GeometryPushConstants for the next draw (in the current geometryPass).
-    const auto pushGeometry = [&](uint32_t clusterCount, uint32_t debugTint, uint32_t quadBase = 0u,
-                                  uint32_t quadCount = 0u, uint32_t clusterBase = 0u) {
-      const GeometryPushConstants push{clusterCount, debugView ? debugTint : DEBUG_TINT_OFF, quadBase, quadCount,
-                                       geometryPass, clusterBase};
+    const auto pushGeometry = [&](uint32_t clusterCount, uint32_t debugTint, uint32_t clusterBase = 0u,
+                                  std::array<int32_t, 3> smoothOrigin = {}) {
+      const GeometryPushConstants push{clusterCount,
+                                       debugView ? debugTint : DEBUG_TINT_OFF,
+                                       geometryPass,
+                                       clusterBase,
+                                       smoothOrigin,
+                                       0u,
+                                       terrainLayerBlocks,
+                                       terrainLayerFillerBlocks,
+                                       terrainLayerDeepBlocks};
       commandBuffer.pushConstants(*pipelineLayout, GEOMETRY_PUSH_STAGES, 0, sizeof(push), &push);
+    };
+    // The mesh path's pipeline for the current pass (bound again after a smooth draw).
+    const auto bindMeshPipeline = [&] {
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                                 wireframeEnabled                           ? *wireframePipeline
+                                 : geometryPass == GEOMETRY_PASS_CUTOUT ? *cutoutPipeline
+                                                                            : *graphicsPipeline);
     };
     // 32 clusters per task group, spread over x and y to stay under the 65535 group limit per dimension.
     const auto drawClusters = [&](uint32_t clusterCount, uint32_t debugTint, uint32_t clusterBase = 0u) {
       if (clusterCount == 0u) {
         return;
       }
-      pushGeometry(clusterCount, debugTint, 0u, 0u, clusterBase);
+      pushGeometry(clusterCount, debugTint, clusterBase);
       const uint32_t taskGroups = (clusterCount + 31u) / 32u;
       commandBuffer.drawMeshTasksEXT(std::min(taskGroups, 65535u), (taskGroups + 65534u) / 65535u, 1);
     };
-    // CPU-meshed chunks on the mesh path: only the slot runs that passed the CPU frustum cull.
-    if (!useVertexPulling) {
-      buildCpuVisibleSlotRuns();
-    }
+    // CPU-meshed chunks: only the slot runs that passed the CPU frustum cull.
+    buildCpuVisibleSlotRuns();
     const auto drawCpuClusters = [&] {
       for (const auto &[first, count] : cpuVisibleSlotRuns) {
         drawClusters(count * QUAD_CLUSTERS_PER_CHUNK, DEBUG_TINT_CPU, first * QUAD_CLUSTERS_PER_CHUNK);
       }
     };
-    if (useVertexPulling) {
+    // Smooth mode's CPU terrain: one indexed draw per visible chunk over its Surface Nets quads (the opaque surface in
+    // the opaque pass, the foliage surface in the cutout pass), with the shared {0,1,2, 0,2,3} + 4q index pattern
+    // (VERTEX_QUADS_PER_INSTANCE quads at a time).
+    const auto drawCpuSmooth = [&] {
+      const bool cutoutPass = geometryPass == GEOMETRY_PASS_CUTOUT;
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, wireframeEnabled ? *smoothWireframePipeline
+                                                                   : cutoutPass     ? *smoothCutoutPipeline
+                                                                                    : *smoothPipeline);
       commandBuffer.bindIndexBuffer(*quadIndexBuffer, 0, vk::IndexType::eUint16);
-    }
-    // Terrain draws, recorded once per pass: GPU-meshed clipmap, then CPU-meshed near chunks.
+      commandBuffer.bindVertexBuffers(0, {*cpuSmoothVertexBuffer}, {vk::DeviceSize{0}});
+      for (const auto &[columnKey, column] : cpuColumns) {
+        if (!column.visible) {
+          continue;
+        }
+        for (const CpuChunkAllocation &chunk : column.chunks) {
+          const uint32_t first = cutoutPass ? chunk.smoothOpaqueCount : 0u;
+          const uint32_t end = cutoutPass ? chunk.smoothCount : chunk.smoothOpaqueCount;
+          if (first == end || chunk.slot >= cpuSlotVisible.size() || cpuSlotVisible[chunk.slot] == 0u) {
+            continue;
+          }
+          pushGeometry(0u, DEBUG_TINT_CPU, 0u,
+                       {column.cx * CHUNK_SIZE, chunk.cy * CHUNK_SIZE, column.cz * CHUNK_SIZE});
+          const uint32_t quadCount = (end - first) / 4u;
+          for (uint32_t quad = 0; quad < quadCount; quad += VERTEX_QUADS_PER_INSTANCE) {
+            const uint32_t count = std::min(quadCount - quad, VERTEX_QUADS_PER_INSTANCE);
+            commandBuffer.drawIndexed(count * 6u, 1, 0,
+                                      static_cast<int32_t>(chunk.smoothOffset + first + quad * 4u), 0);
+          }
+        }
+      }
+      bindMeshPipeline();
+    };
+    // Smooth mode's GPU clipmap: one heightfield grid instance per live column in the frustum.
+    const uint32_t smoothLodInstances = smoothTerrain ? buildSmoothLodInstances() : 0u;
+    const auto drawLodSmooth = [&] {
+      if (smoothLodInstances == 0u) {
+        return;
+      }
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
+                                 wireframeEnabled ? *smoothLodWireframePipeline : *smoothLodPipeline);
+      commandBuffer.bindIndexBuffer(*lodGridIndexBuffer, 0, vk::IndexType::eUint16);
+      commandBuffer.bindVertexBuffers(0, {*smoothLodInstanceBuffers[frameIndex]}, {vk::DeviceSize{0}});
+      pushGeometry(0u, DEBUG_TINT_LOD);
+      commandBuffer.drawIndexed(LOD_GRID_INDEX_COUNT, smoothLodInstances, 0, 0, 0);
+      bindMeshPipeline();
+    };
+    // Terrain draws, recorded once per pass: CPU-meshed near chunks first, so the GPU clipmap's fragments behind them
+    // (whole far hillsides) fail the early depth test instead of being shaded and overwritten. Smooth mode draws no
+    // cubes: the clipmap as heightfields (opaque pass only: its trees are left out) and the CPU chunks' smooth
+    // surfaces.
     const auto drawTerrain = [&] {
-      commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0,
-                                       *descriptorSets[frameIndex], nullptr);
+      // CPU-meshed near chunks: same pipelines, their own buffers.
+      if (terrainView != TerrainView::LodOnly && cpuChunkSlots.highWater() != 0u) {
+        commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0,
+                                         *cpuDescriptorSets[frameIndex], nullptr);
+        if (smoothTerrain) {
+          drawCpuSmooth();
+        } else {
+          drawCpuClusters();
+        }
+      }
       // GPU-meshed clipmap (LOD terrain, with the hole the CPU square fills).
       if (terrainView != TerrainView::RealOnly) {
-        if (useVertexPulling) {
-          pushGeometry(0u, DEBUG_TINT_LOD);
-          commandBuffer.drawIndexedIndirect(*vertexDrawArgumentsBuffer, 0, 1, sizeof(vk::DrawIndexedIndirectCommand));
+        commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0,
+                                         *descriptorSets[frameIndex], nullptr);
+        if (smoothTerrain) {
+          if (geometryPass == GEOMETRY_PASS_OPAQUE) {
+            drawLodSmooth();
+          }
         } else {
           // finalizeWork wrote the group count from the work slot high water. Clusters past it (the folded grid
           // overshoots) are zero, so the bound is just the buffer.
@@ -3867,38 +4727,16 @@ private:
                                                  sizeof(vk::DrawMeshTasksIndirectCommandEXT));
         }
       }
-      // CPU-meshed near chunks: same pipelines, their own buffers.
-      if (terrainView != TerrainView::LodOnly && cpuChunkSlots.highWater() != 0u) {
-        commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0,
-                                         *cpuDescriptorSets[frameIndex], nullptr);
-        if (useVertexPulling) {
-          // One draw per visible chunk (hidden chunks keep their quads in the buffer).
-          for (const auto &[columnKey, column] : cpuColumns) {
-            if (!column.visible) {
-              continue;
-            }
-            for (const CpuChunkAllocation &chunk : column.chunks) {
-              for (uint32_t first = 0; first < chunk.opaqueQuadCount; first += VERTEX_QUADS_PER_INSTANCE) {
-                const uint32_t count = std::min(chunk.opaqueQuadCount - first, VERTEX_QUADS_PER_INSTANCE);
-                pushGeometry(0u, DEBUG_TINT_CPU, chunk.quadOffset + first, count);
-                commandBuffer.drawIndexed(count * 6u, 1, 0, 0, 0);
-              }
-            }
-          }
-        } else {
-          drawCpuClusters();
-        }
-      }
     };
     // Opaque blocks first (no discard: early depth testing), then the alpha-tested non-opaque ones against that depth.
     drawTerrain();
     writeGpuTimestamp(commandBuffer, TIMESTAMP_OPAQUE);
     if (!wireframeEnabled) {
-      commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
-                                 useVertexPulling ? *cutoutVertexPullingPipeline : *cutoutPipeline);
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *cutoutPipeline);
     }
     geometryPass = GEOMETRY_PASS_CUTOUT;
     drawTerrain();
+    recordItemEntities(commandBuffer);
     commandBuffer.endRendering();
     writeGpuTimestamp(commandBuffer, TIMESTAMP_CUTOUT);
 
@@ -3960,48 +4798,26 @@ private:
     // Translucent pass (ocean): blended over and depth-tested against every opaque draw.
     if (!wireframeEnabled) {
       geometryPass = GEOMETRY_PASS_TRANSLUCENT;
-      commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
-                                 useVertexPulling ? *waterVertexPullingPipeline : *waterPipeline);
+      commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *waterPipeline);
       commandBuffer.setCullMode(vk::CullModeFlagBits::eNone);
     }
     if (!wireframeEnabled && terrainView != TerrainView::RealOnly) {
       commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0,
                                        *gpuTranslucentDescriptorSets[frameIndex], nullptr);
-      if (useVertexPulling) {
-        // Every GPU quad again; vertMain keeps only liquids in this pass.
-        pushGeometry(0u, DEBUG_TINT_LOD);
-        commandBuffer.drawIndexedIndirect(*vertexDrawArgumentsBuffer, 0, 1, sizeof(vk::DrawIndexedIndirectCommand));
-      } else {
-        pushGeometry(workPoolCapacity * QUAD_CLUSTERS_PER_CHUNK, DEBUG_TINT_LOD);
-        commandBuffer.drawMeshTasksIndirectEXT(*workPoolBuffer, WORK_POOL_TASK_ARGS_OFFSET, 1,
-                                               sizeof(vk::DrawMeshTasksIndirectCommandEXT));
-      }
+      pushGeometry(workPoolCapacity * QUAD_CLUSTERS_PER_CHUNK, DEBUG_TINT_LOD);
+      commandBuffer.drawMeshTasksIndirectEXT(*workPoolBuffer, WORK_POOL_TASK_ARGS_OFFSET, 1,
+                                             sizeof(vk::DrawMeshTasksIndirectCommandEXT));
     }
     if (terrainView != TerrainView::LodOnly && cpuChunkSlots.highWater() != 0u && !wireframeEnabled) {
       commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0,
                                        *cpuTranslucentDescriptorSets[frameIndex], nullptr);
-      if (useVertexPulling) {
-        for (const auto &[columnKey, column] : cpuColumns) {
-          if (!column.visible) {
-            continue;
-          }
-          for (const CpuChunkAllocation &chunk : column.chunks) {
-            for (uint32_t first = chunk.opaqueQuadCount; first < chunk.quadCount; first += VERTEX_QUADS_PER_INSTANCE) {
-              const uint32_t count = std::min(chunk.quadCount - first, VERTEX_QUADS_PER_INSTANCE);
-              pushGeometry(0u, DEBUG_TINT_CPU, chunk.quadOffset + first, count);
-              commandBuffer.drawIndexed(count * 6u, 1, 0, 0, 0);
-            }
-          }
-        }
-      } else {
-        drawCpuClusters();
-      }
+      drawCpuClusters();
       geometryPass = GEOMETRY_PASS_OPAQUE;
     }
     recordOutline(commandBuffer);
     commandBuffer.endRendering();
     writeGpuTimestamp(commandBuffer, TIMESTAMP_WATER);
-    if (!useVertexPulling && hzbOcclusionEnabled && !frozenLodView) {
+    if (hzbOcclusionEnabled && !frozenLodView) {
       recordHzb(commandBuffer);
     }
     writeGpuTimestamp(commandBuffer, TIMESTAMP_HZB);
@@ -4049,8 +4865,16 @@ private:
                             colorOutputStage, fragmentStage, vk::ImageAspectFlagBits::eColor);
     recordOverlay(commandBuffer, imageIndex);
     writeGpuTimestamp(commandBuffer, TIMESTAMP_OVERLAY);
-    transition_image_layout(swapChainImages[imageIndex], vk::ImageLayout::eColorAttachmentOptimal,
-                            vk::ImageLayout::ePresentSrcKHR, colorWrite, {}, colorOutputStage,
+    if (screenshotCaptureThisFrame) {
+      recordScreenshotCopy(commandBuffer, imageIndex);
+    }
+    transition_image_layout(swapChainImages[imageIndex],
+                            screenshotCaptureThisFrame ? vk::ImageLayout::eTransferSrcOptimal
+                                                       : vk::ImageLayout::eColorAttachmentOptimal,
+                            vk::ImageLayout::ePresentSrcKHR,
+                            screenshotCaptureThisFrame ? vk::AccessFlags2{} : colorWrite, {},
+                            screenshotCaptureThisFrame ? vk::PipelineStageFlags2{vk::PipelineStageFlagBits2::eTransfer}
+                                                       : colorOutputStage,
                             vk::PipelineStageFlagBits2::eBottomOfPipe, vk::ImageAspectFlagBits::eColor);
     taaHistoryInitialized = true;
     taaHistoryValid = true;
@@ -4217,7 +5041,7 @@ private:
                                       .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                                       .dstAccessMask = vk::AccessFlagBits2::eShaderRead};
     commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &quadCountReady});
-    commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *finalizeVertexDrawPipeline);
+    commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *resetNewWorkPipeline);
     commandBuffer.dispatch(1, 1, 1);
 
     vk::MemoryBarrier2 meshReadyBarrier{
@@ -4333,6 +5157,8 @@ private:
     const glm::vec3 eye = player.eyePosition();
     const glm::mat4 view = camera.view(eye);
     updateBlockInteraction(eye, deltaTime); // before updateCpuWorld, which uploads the remeshed chunks this frame
+    updateItems(deltaTime);
+    lastFrameDeltaSeconds = deltaTime;
 
     const bool zoomed = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
     // LODs and the clipmap use the unwidened FOV, so the sprint FOV animation doesn't rebuild the clipmap every frame.
@@ -4370,7 +5196,7 @@ private:
                                   baseLodDistanceSquared,
                                   fov,
                                   aspectRatio,
-                                  useVertexPulling,
+                                  false, // the task shader culls the clipmap's clusters
                                   clipmapCpuCenter};
     if (lodFreezeRequested && !frozenLodView) {
       frozenLodView = clipmapView;
@@ -4427,8 +5253,7 @@ private:
     const float borderFogEnd =
         kClipmapRadius - kClipmapStaleCover.maxPositionDelta - static_cast<float>(CHUNK_SIZE) * 4.0f;
     ubo.viewRayScale = {1.0f / proj[0][0], 1.0f / proj[1][1], cameraUnderwater ? 1.0f : 0.0f, borderFogEnd};
-    // Only the mesh path builds the Hi-Z; after a vertex-path frame it no longer matches previousMvp.
-    if (useVertexPulling || !hzbOcclusionEnabled) {
+    if (!hzbOcclusionEnabled) {
       hzbValid = false;
     }
     ubo.hzbParams = {static_cast<float>(hzbSize.width), static_cast<float>(hzbSize.height),
@@ -4470,6 +5295,7 @@ private:
       if (fenceResult != vk::Result::eSuccess) {
         throw std::runtime_error("failed to wait for fence!");
       }
+      markCpuStage(CPU_FENCE);
       collectGpuTimestamps();
       if (quadCountReadbackPending[frameIndex]) {
         quadCountReadbackPending[frameIndex] = false;
@@ -4483,7 +5309,7 @@ private:
         // Retired slots leave holes the draw and compaction still walk; pack once they pass 1/4 of the live slots.
         const bool slotsSparse = slotHighWater > liveSlots + liveSlots / 4u + 1024u;
         const uint32_t deadQuads = appended > live ? appended - live : 0u;
-        const uint32_t deadLimit = useVertexPulling ? live / 4u : live;
+        const uint32_t deadLimit = live;
         const bool garbageHeavy = deadQuads > deadLimit && deadQuads > REBUILD_MIN_DEAD_QUADS;
         const bool nearlyFull = appended > MAX_QUAD_COUNT / 4u * 3u && live < MAX_QUAD_COUNT / 2u;
         if (quadCountReadbackEpoch[frameIndex] != quadCountEpoch) {
@@ -4511,6 +5337,7 @@ private:
           swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
       result = acquireResult;
       imageIndex = acquiredImageIndex;
+      markCpuStage(CPU_ACQUIRE);
 
       if (result == vk::Result::eErrorOutOfDateKHR) {
         recreateSwapChain();
@@ -4522,12 +5349,15 @@ private:
       }
     }
     updateUniformBuffer(frameIndex);
+    markCpuStage(CPU_UPDATE);
 
     // Reset only once work is sure to be submitted.
     device.resetFences(*inFlightFences[frameIndex]);
 
     commandBuffers[frameIndex].reset();
+    screenshotCaptureThisFrame = !screenshotPath.empty() && glfwGetTime() >= screenshotSeconds;
     recordCommandBuffer(imageIndex);
+    markCpuStage(CPU_RECORD);
 
     vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
     const vk::SubmitInfo submitInfo{.waitSemaphoreCount = 1,
@@ -4539,6 +5369,10 @@ private:
                                     .pSignalSemaphores = &*renderFinishedSemaphores[imageIndex]};
     {
       queue.submit(submitInfo, *inFlightFences[frameIndex]);
+      markCpuStage(CPU_SUBMIT);
+      if (screenshotCaptureThisFrame) {
+        writeScreenshot();
+      }
 
       const vk::PresentInfoKHR presentInfoKHR{.waitSemaphoreCount = 1,
                                               .pWaitSemaphores = &*renderFinishedSemaphores[imageIndex],
@@ -4546,6 +5380,7 @@ private:
                                               .pSwapchains = &*swapChain,
                                               .pImageIndices = &imageIndex};
       result = queue.presentKHR(presentInfoKHR);
+      markCpuStage(CPU_PRESENT);
     }
     // VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS: out-of-date is returned, not thrown.
     if ((result == vk::Result::eSuboptimalKHR) || (result == vk::Result::eErrorOutOfDateKHR) || framebufferResized) {
@@ -4667,6 +5502,71 @@ private:
     timestampQueryPool = vk::raii::QueryPool(
         device, vk::QueryPoolCreateInfo{.queryType = vk::QueryType::eTimestamp,
                                         .queryCount = GPU_TIMESTAMP_COUNT * MAX_FRAMES_IN_FLIGHT});
+    // ENGINE_SCREENSHOT=path[,seconds] saves the presented image as a PNG once `seconds` (default 8) have passed,
+    // then quits (testing without desktop captures).
+    if (const char *env = std::getenv("ENGINE_SCREENSHOT"); env != nullptr && env[0] != '\0') {
+      const std::string_view value = env;
+      const size_t comma = value.rfind(',');
+      screenshotPath = std::string(value.substr(0, comma));
+      if (comma != std::string_view::npos) {
+        screenshotSeconds = std::atof(env + comma + 1);
+      }
+    }
+    // ENGINE_GAMEMODE=creative|survival|adventure|spectator; ENGINE_SWITCHER=1 shows the F3+F4 switcher (testing).
+    if (const char *env = std::getenv("ENGINE_GAMEMODE"); env != nullptr) {
+      static constexpr std::array<std::string_view, Player::kGameModeCount> names{"creative", "survival", "adventure",
+                                                                                 "spectator"};
+      for (size_t i = 0; i < names.size(); ++i) {
+        if (names[i] == env) {
+          player.setGameMode(static_cast<Player::GameMode>(i));
+        }
+      }
+    }
+    if (const char *env = std::getenv("ENGINE_SWITCHER"); env != nullptr && env[0] == '1') {
+      gameModeSwitcherOpen = true;
+      gameModeSelection = Player::GameMode::Survival;
+    }
+    // ENGINE_FILL=1 fills the inventory with every creative block in varied counts (testing).
+    if (const char *env = std::getenv("ENGINE_FILL"); env != nullptr && env[0] == '1' && !creativeCatalog.empty()) {
+      for (int i = 0; i < inv::kMainSlots; ++i) {
+        inventory.items[static_cast<size_t>(i)] = ItemStack{
+            .block = creativeCatalog[static_cast<size_t>(i) % creativeCatalog.size()].block,
+            .count = static_cast<uint16_t>((i * 7) % 64 + 1)};
+      }
+      inventory.offhand() = ItemStack{.block = creativeCatalog.front().block, .count = 12};
+    }
+    // ENGINE_DROPS=n drops n stacks of the creative blocks a few blocks ahead of the spawn (testing item entities).
+    if (const char *env = std::getenv("ENGINE_DROPS"); env != nullptr && !creativeCatalog.empty()) {
+      const int count = std::max(std::atoi(env), 0);
+      const glm::dvec3 feet = player.feetPosition();
+      const glm::dvec3 ahead = glm::normalize(glm::dvec3(camera.front().x, 0.0, camera.front().z));
+      for (int i = 0; i < count; ++i) {
+        const double angle = i * 2.399963;
+        const glm::dvec3 spot = feet + ahead * 4.0 + glm::dvec3(std::cos(angle), 0.0, std::sin(angle)) * (0.4 + 0.15 * std::sqrt(i));
+        const uint16_t block = creativeCatalog[static_cast<size_t>(i) % creativeCatalog.size()].block;
+        items.spawn(spot + glm::dvec3(0.0, 2.0, 0.0), glm::dvec3(0.0, 2.0, 0.0), randomSpin(static_cast<uint32_t>(i + 1)),
+                    itemDensity(block), ItemStack{.block = block, .count = static_cast<uint16_t>(1 + (i * 13) % 64)},
+                    ItemEntityWorld::kThrowPickupDelay, static_cast<uint32_t>(i + 1));
+      }
+    }
+    // ENGINE_SCREEN=inventory[:tab] opens the inventory screen (creative tab index 0-13); ENGINE_CURSOR=x,y pins the
+    // cursor there in GUI pixels (testing).
+    if (const char *env = std::getenv("ENGINE_SCREEN"); env != nullptr && env[0] != '\0') {
+      openInventory();
+      if (const char *colon = std::strchr(env, ':'); colon != nullptr) {
+        screen->selectTab(std::atoi(colon + 1));
+      }
+    }
+    if (const char *env = std::getenv("ENGINE_CURSOR"); env != nullptr) {
+      double x = 0.0;
+      double y = 0.0;
+      if (std::sscanf(env, "%lf,%lf", &x, &y) == 2) {
+        cursorPinned = true;
+        if (screen) {
+          screen->mouseMove(x, y);
+        }
+      }
+    }
     // ENGINE_GPU_TIMING=1 starts with the timings on (same as pressing P).
     if (const char *env = std::getenv("ENGINE_GPU_TIMING"); env != nullptr && env[0] == '1') {
       gpuTimingEnabled = true;
@@ -4676,7 +5576,8 @@ private:
 
   /**
    * Apply the testing environment variables: ENGINE_LOOK="yaw,pitch" (degrees), ENGINE_FORCE_LOD=n,
-   * ENGINE_VIEW=n (terrain view, as X cycles: 3 = LOD debug colors), ENGINE_CONTOUR=1 (elevation view).
+   * ENGINE_VIEW=n (terrain view, as X cycles: 3 = LOD debug colors), ENGINE_CONTOUR=1 (elevation view),
+   * ENGINE_SMOOTH=1 (smooth terrain, as V).
    */
   void applyDebugEnvironment() {
     if (const char *env = std::getenv("ENGINE_LOOK"); env != nullptr) {
@@ -4693,6 +5594,9 @@ private:
     }
     if (const char *env = std::getenv("ENGINE_CONTOUR"); env != nullptr && env[0] == '1') {
       contourEnabled = true;
+    }
+    if (const char *env = std::getenv("ENGINE_SMOOTH"); env != nullptr && env[0] == '1') {
+      smoothTerrain = true;
     }
   }
 
@@ -4740,6 +5644,20 @@ private:
                               GPU_TIMESTAMP_NAMES[stamp], gpuTimeSumsMs[stamp] / gpuTimeSamples);
     }
     std::clog << line << '\n';
+    if (cpuFrameSamples != 0u) {
+      length = std::snprintf(line, sizeof(line), "CPU ms (avg of %u frames): frame %.3f (max %.3f) |", cpuFrameSamples,
+                             cpuFrameSumMs / cpuFrameSamples, cpuFrameMaxMs);
+      for (uint32_t stage = 0; stage < CPU_TIMING_COUNT && length > 0 && length < static_cast<int>(sizeof(line));
+           ++stage) {
+        length += std::snprintf(line + length, sizeof(line) - static_cast<size_t>(length), " %s %.3f",
+                                CPU_TIMING_NAMES[stage], cpuTimeSumsMs[stage] / cpuFrameSamples);
+      }
+      std::clog << line << '\n';
+    }
+    cpuTimeSumsMs = {};
+    cpuFrameSumMs = 0.0;
+    cpuFrameMaxMs = 0.0;
+    cpuFrameSamples = 0;
     gpuTimeSumsMs = {};
     gpuTimeSamples = 0;
     gpuTimeWindowStart = now;

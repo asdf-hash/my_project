@@ -3,7 +3,9 @@
 #include "cpu_light.hpp"
 #include "simd.hpp"
 
+#include <algorithm>
 #include <bit>
+#include <cmath>
 
 namespace cpuworld {
 namespace {
@@ -623,6 +625,411 @@ uint32_t emitNonOpaque(const PaddedMasks &masks, const ChunkLight &light, const 
   return count;
 }
 
+// ---- Smooth terrain (Surface Nets) ----------------------------------------------------------------------------
+// Every opaque face becomes one quad whose corners are block-grid lattice points moved onto a smooth surface: a
+// corner (shared by 8 cells) goes to the average of the points where the density field crosses zero along the edges
+// between those cells' centers. Cells that follow the heightmap take their density from the column's float surface
+// height, so unedited terrain follows the noise exactly (no terraces); cells that don't (edits, trees) are a plain
+// +-1. Non-opaque blocks (leaves, glass) form a second, binary surface drawn in the cutout pass. Everything is
+// computed per cell, so chunks sharing a corner place it identically.
+
+// Density magnitude cap: keeps the heightmap's linear crossings on gentle slopes while edits and cliffs (larger
+// jumps) cross halfway, like binary cells.
+constexpr float kMaxDensity = 1.0f;
+// Smallest density magnitude, so a cell's density sign always matches its opacity.
+constexpr float kMinDensity = 1.0f / 64.0f;
+
+// Per padded column (index (z + 1) * kPad + (x + 1)): the float surface height and the column top the voxels follow
+// where unedited (Column::height, or the border height where the neighbor isn't loaded).
+struct HeightPads {
+  std::array<float, kPad * kPad> raw;
+  std::array<int32_t, kPad * kPad> top;
+};
+
+/** Fill HeightPads from the owning columns (the center's padded border where a neighbor isn't loaded). */
+void buildHeightPads(const Neighborhood &nb, HeightPads &pads) {
+  const Column &center = nb.center();
+  for (int32_t pz = -1; pz <= N; ++pz) {
+    const int32_t dz = pz < 0 ? -1 : (pz >= N ? 1 : 0);
+    for (int32_t px = -1; px <= N; ++px) {
+      const int32_t dx = px < 0 ? -1 : (px >= N ? 1 : 0);
+      const size_t i = static_cast<size_t>((pz + 1) * kPad + (px + 1));
+      if (const Column *column = nb.columns[dz + 1][dx + 1]) {
+        const int32_t lx = px - dx * N;
+        const int32_t lz = pz - dz * N;
+        pads.raw[i] = column->rawHeights[static_cast<size_t>(Column::padIndex(lx, lz))];
+        pads.top[i] = column->height(lx, lz);
+      } else {
+        pads.raw[i] = center.rawHeights[static_cast<size_t>(Column::padIndex(px, pz))];
+        pads.top[i] = center.borderHeight(px, pz);
+      }
+    }
+  }
+}
+
+/**
+ * Density of padded cell `i` (column index as HeightPads) at chunk-local y (-1..32): positive inside opaque cells.
+ * Where the cell follows its column's heightmap, the surface sits at raw - 0.5 (cell centers are at y + 0.5), so
+ * crossings interpolate the float height; otherwise +-kMaxDensity.
+ *
+ * @param baseY World y of the chunk's cell 0.
+ */
+float cellDensity(const PaddedOpaque &opaque, const HeightPads &pads, size_t i, int32_t y, int32_t baseY) {
+  const bool solid = ((opaque[i] >> (y + 1)) & 1u) != 0u;
+  const int32_t worldY = baseY + y;
+  if (solid != (worldY < pads.top[i])) {
+    return solid ? kMaxDensity : -kMaxDensity;
+  }
+  const float d = std::clamp(pads.raw[i] - 1.0f - static_cast<float>(worldY), -kMaxDensity, kMaxDensity);
+  return solid ? std::max(d, kMinDensity) : std::min(d, -kMinDensity);
+}
+
+/** Signed byte of a unit-range component, in the low 8 bits. */
+uint32_t snormByte(float value) {
+  const int32_t scaled = static_cast<int32_t>(std::lround(std::clamp(value, -1.0f, 1.0f) * 127.0f));
+  return static_cast<uint32_t>(scaled) & 0xffu;
+}
+
+/** Packed signed-byte normal (x | y << 8 | z << 16) of -gradient, or `fallback` when the gradient vanishes. */
+uint32_t packNormal(float gx, float gy, float gz, uint32_t fallback) {
+  const float length = std::sqrt(gx * gx + gy * gy + gz * gz);
+  if (!(length > 1e-6f)) {
+    return fallback;
+  }
+  return snormByte(-gx / length) | (snormByte(-gy / length) << 8u) | (snormByte(-gz / length) << 16u);
+}
+
+// A placed corner: offset from its lattice point in 1/kSmoothFixedOne blocks, and its packed normal.
+struct SmoothCorner {
+  Int3 offset;
+  uint32_t normal;
+};
+
+/** Fixed-point offset of a position relative to its lattice point (-0.5 .. 0.5 blocks per axis). */
+Int3 toFixedOffset(float x, float y, float z) {
+  const auto fixed = [](float v) {
+    return std::clamp(static_cast<int32_t>(std::lround(v * kSmoothFixedOne)), -kSmoothFixedOne / 2,
+                      kSmoothFixedOne / 2);
+  };
+  return {fixed(x), fixed(y), fixed(z)};
+}
+
+/**
+ * Place the opaque surface's corner at chunk-local lattice point (lx, ly, lz) (each 0..32) from the densities of its
+ * 8 cells.
+ *
+ * @param faceNormal Packed normal used when the densities give no gradient.
+ */
+SmoothCorner opaqueCorner(const PaddedOpaque &opaque, const HeightPads &pads, int32_t baseY, int32_t lx, int32_t ly,
+                          int32_t lz, uint32_t faceNormal) {
+  float d[2][2][2]; // [i][j][k]: cell (lx - 1 + i, ly - 1 + j, lz - 1 + k)
+  for (int32_t k = 0; k < 2; ++k) {
+    for (int32_t i = 0; i < 2; ++i) {
+      const size_t column = static_cast<size_t>((lz + k) * kPad + (lx + i));
+      d[i][0][k] = cellDensity(opaque, pads, column, ly - 1, baseY);
+      d[i][1][k] = cellDensity(opaque, pads, column, ly, baseY);
+    }
+  }
+  float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+  int32_t crossings = 0;
+  /** Add the zero crossing between two cell centers (relative to the lattice point), if the sign changes. */
+  const auto edge = [&](float d0, float d1, float x0, float y0, float z0, float x1, float y1, float z1) {
+    if ((d0 > 0.0f) == (d1 > 0.0f)) {
+      return;
+    }
+    const float t = d0 / (d0 - d1);
+    sx += x0 + (x1 - x0) * t;
+    sy += y0 + (y1 - y0) * t;
+    sz += z0 + (z1 - z0) * t;
+    ++crossings;
+  };
+  for (int32_t a = 0; a < 2; ++a) {
+    for (int32_t b = 0; b < 2; ++b) {
+      const float fa = static_cast<float>(a) - 0.5f;
+      const float fb = static_cast<float>(b) - 0.5f;
+      edge(d[0][a][b], d[1][a][b], -0.5f, fa, fb, 0.5f, fa, fb); // along x
+      edge(d[a][0][b], d[a][1][b], fa, -0.5f, fb, fa, 0.5f, fb); // along y
+      edge(d[a][b][0], d[a][b][1], fa, fb, -0.5f, fa, fb, 0.5f); // along z
+    }
+  }
+  float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+  for (int32_t i = 0; i < 2; ++i) {
+    for (int32_t j = 0; j < 2; ++j) {
+      for (int32_t k = 0; k < 2; ++k) {
+        gx += d[i][j][k] * static_cast<float>(2 * i - 1);
+        gy += d[i][j][k] * static_cast<float>(2 * j - 1);
+        gz += d[i][j][k] * static_cast<float>(2 * k - 1);
+      }
+    }
+  }
+  SmoothCorner corner{{0, 0, 0}, packNormal(gx, gy, gz, faceNormal)};
+  if (crossings != 0) {
+    const float inverse = 1.0f / static_cast<float>(crossings);
+    corner.offset = toFixedOffset(sx * inverse, sy * inverse, sz * inverse);
+  }
+  return corner;
+}
+
+// Binary Surface Nets corner for one configuration of the 8 cells around a lattice corner (bit i | j << 1 | k << 2
+// set when cell (corner - 1 + i, corner - 1 + j, corner - 1 + k) is inside): the foliage surface.
+struct CornerShape {
+  Int3 offset;     // from the lattice point, in 1/kSmoothFixedOne blocks
+  uint32_t normal; // packed signed bytes, pointing away from the inside cells; 0 when the gradient vanishes
+};
+
+/** Place the corner of one configuration: the average midpoint of its inside / outside edges. */
+CornerShape cornerShape(uint32_t config) {
+  const auto inside = [&](int32_t i, int32_t j, int32_t k) { return ((config >> (i | (j << 1) | (k << 2))) & 1u) != 0u; };
+  float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+  for (int32_t i = 0; i < 2; ++i)
+    for (int32_t j = 0; j < 2; ++j)
+      for (int32_t k = 0; k < 2; ++k)
+        if (inside(i, j, k)) {
+          gx += static_cast<float>(2 * i - 1);
+          gy += static_cast<float>(2 * j - 1);
+          gz += static_cast<float>(2 * k - 1);
+        }
+  float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+  int32_t crossings = 0;
+  for (int32_t a = 0; a < 2; ++a) {
+    for (int32_t b = 0; b < 2; ++b) {
+      const float fa = static_cast<float>(a) - 0.5f;
+      const float fb = static_cast<float>(b) - 0.5f;
+      if (inside(0, a, b) != inside(1, a, b)) { // edge along x
+        sy += fa, sz += fb, ++crossings;
+      }
+      if (inside(a, 0, b) != inside(a, 1, b)) { // edge along y
+        sx += fa, sz += fb, ++crossings;
+      }
+      if (inside(a, b, 0) != inside(a, b, 1)) { // edge along z
+        sx += fa, sy += fb, ++crossings;
+      }
+    }
+  }
+  CornerShape shape{{0, 0, 0}, packNormal(gx, gy, gz, 0u)};
+  if (crossings != 0) {
+    const float inverse = 1.0f / static_cast<float>(crossings);
+    shape.offset = toFixedOffset(sx * inverse, sy * inverse, sz * inverse);
+  }
+  return shape;
+}
+
+const std::array<CornerShape, 256> kCornerShapes = [] {
+  std::array<CornerShape, 256> shapes{};
+  for (uint32_t config = 0; config < 256u; ++config) {
+    shapes[config] = cornerShape(config);
+  }
+  return shapes;
+}();
+
+constexpr int32_t kCornerU[4] = {-1, 1, 1, -1}; // corner k's side along u (AO's corner order)
+constexpr int32_t kCornerV[4] = {-1, -1, 1, 1}; // corner k's side along v
+
+/** Corner k of the face of cell c in direction `normal`, as a lattice point. */
+Int3 faceCorner(Int3 c, uint32_t normal, uint32_t k) {
+  const Int3 dir = kNormals[normal], u = kU[normal], v = kV[normal];
+  // Doubled coordinates: cell center (2c + 1), out to the face (dir), then to the corner.
+  return {(2 * c.x + 1 + dir.x + kCornerU[k] * u.x + kCornerV[k] * v.x) / 2,
+          (2 * c.y + 1 + dir.y + kCornerU[k] * u.y + kCornerV[k] * v.y) / 2,
+          (2 * c.z + 1 + dir.z + kCornerU[k] * u.z + kCornerV[k] * v.z) / 2};
+}
+
+/**
+ * The 8 cells around chunk-local lattice point (lx, ly, lz) (each 0..32) as a CornerShape configuration, from padded
+ * column masks (bit y + 1 = cell y, as PaddedOpaque).
+ */
+uint32_t cornerConfig(const PaddedOpaque &masks, int32_t lx, int32_t ly, int32_t lz) {
+  // Column (lx - 1 + i, lz - 1 + k) sits at padded index (lz + k) * kPad + (lx + i); its cells ly - 1, ly are bits
+  // ly, ly + 1.
+  const size_t base = static_cast<size_t>(lz * kPad + lx);
+  const auto pair = [&](size_t index) { return static_cast<uint32_t>((masks[index] >> ly) & 3u); };
+  const uint32_t c00 = pair(base), c10 = pair(base + 1), c01 = pair(base + kPad), c11 = pair(base + kPad + 1);
+  // Bit layout i | j << 1 | k << 2: each pair's two bits are j = 0, 1.
+  const auto spread = [](uint32_t bits) { return (bits & 1u) | ((bits & 2u) << 1u); };
+  return spread(c00) | (spread(c10) << 1u) | (spread(c01) << 4u) | (spread(c11) << 5u);
+}
+
+/**
+ * Build padded masks (PaddedOpaque layout) of foliage cells: non-opaque blocks other than air and ocean. Only chunks
+ * that hold any (VoxelChunk::nonOpaqueCount) are read.
+ *
+ * @return whether any foliage cell was found.
+ */
+bool buildFoliageMasks(const Neighborhood &nb, int32_t chunkY, PaddedOpaque &foliage) {
+  bool any = false;
+  for (int32_t pz = -1; pz <= N; ++pz) {
+    const int32_t dz = pz < 0 ? -1 : (pz >= N ? 1 : 0);
+    for (int32_t px = -1; px <= N; ++px) {
+      const int32_t dx = px < 0 ? -1 : (px >= N ? 1 : 0);
+      const size_t index = static_cast<size_t>((pz + 1) * kPad + (px + 1));
+      foliage[index] = 0;
+      const Column *column = nb.columns[dz + 1][dx + 1];
+      if (column == nullptr) {
+        continue;
+      }
+      const int32_t lx = px - dx * N;
+      const int32_t lz = pz - dz * N;
+      /** Whether a block id is foliage. */
+      const auto isFoliage = [&](uint16_t id) { return id != kAir && id != column->oceanId && !blocks::isOpaque(id); };
+      uint64_t bits = 0;
+      const VoxelChunk *below = column->chunk(chunkY - 1);
+      if (below != nullptr && below->nonOpaqueCount != 0 && isFoliage(below->ids[VoxelChunk::index(lx, N - 1, lz)])) {
+        bits |= 1u;
+      }
+      const VoxelChunk *self = column->chunk(chunkY);
+      if (self != nullptr && self->nonOpaqueCount != 0) {
+        const uint16_t *ids = &self->ids[VoxelChunk::index(lx, 0, lz)];
+        for (int32_t y = 0; y < N; ++y) {
+          bits |= static_cast<uint64_t>(isFoliage(ids[y])) << (y + 1);
+        }
+      }
+      const VoxelChunk *above = column->chunk(chunkY + 1);
+      if (above != nullptr && above->nonOpaqueCount != 0 && isFoliage(above->ids[VoxelChunk::index(lx, 0, lz)])) {
+        bits |= 1ull << 33u;
+      }
+      foliage[index] = bits;
+      any = any || bits != 0u;
+    }
+  }
+  return any;
+}
+
+/**
+ * Append one smooth quad (4 vertices) in the front-facing order of the shared index pattern, split along the shorter
+ * diagonal (the quad is not planar).
+ *
+ * @param fixedPositions Corner k's chunk-local fixed-point position (AO's corner order).
+ * @param words Corner k's normalLight word.
+ */
+void appendSmoothQuad(const std::array<Int3, 4> &fixedPositions, const std::array<uint32_t, 4> &words,
+                      uint16_t material, uint32_t normal, std::vector<SmoothVertex> &out) {
+  const auto distance2 = [&](uint32_t a, uint32_t b) {
+    const int64_t dx = fixedPositions[a].x - fixedPositions[b].x;
+    const int64_t dy = fixedPositions[a].y - fixedPositions[b].y;
+    const int64_t dz = fixedPositions[a].z - fixedPositions[b].z;
+    return dx * dx + dy * dy + dz * dz;
+  };
+  // The index pattern splits along output corners 0-2; rotating by one splits along 1-3.
+  std::array<uint32_t, 4> order = normal == 0u || normal == 5u // flippedWinding in quad_decode.hlsl
+                                      ? std::array<uint32_t, 4>{0, 3, 2, 1}
+                                      : std::array<uint32_t, 4>{0, 1, 2, 3};
+  if (distance2(1, 3) < distance2(0, 2)) {
+    std::rotate(order.begin(), order.begin() + 1, order.end());
+  }
+  for (const uint32_t k : order) {
+    out.push_back({static_cast<uint16_t>(fixedPositions[k].x), static_cast<uint16_t>(fixedPositions[k].y),
+                   static_cast<uint16_t>(fixedPositions[k].z), material, words[k]});
+  }
+}
+
+/** Chunk-local fixed-point position of lattice point `lattice` moved by `offset`. */
+Int3 fixedPosition(Int3 lattice, Int3 offset) {
+  return {(lattice.x + 1) * kSmoothFixedOne + offset.x, (lattice.y + 1) * kSmoothFixedOne + offset.y,
+          (lattice.z + 1) * kSmoothFixedOne + offset.z};
+}
+
+// Opaque corners already placed this chunk, by lattice point ((lz * 33 + lx) * 33 + ly): faces sharing a corner
+// compute it once. An entry is valid when its stamp is the current chunk's.
+struct CornerCache {
+  static constexpr int32_t kSide = N + 1;
+  std::array<uint32_t, kSide * kSide * kSide> stamp{};
+  std::array<SmoothCorner, kSide * kSide * kSide> corner;
+  uint32_t current = 0;
+
+  /** Start a chunk: invalidate every entry. */
+  void begin() {
+    if (++current == 0u) { // wrapped: clear the stale stamps once
+      stamp.fill(0u);
+      current = 1u;
+    }
+  }
+};
+
+/**
+ * Emit the smooth quads of the chunk: first the opaque faces (the faces computePlanes finds) on the density surface,
+ * then the foliage faces (foliage next to air or ocean) on the binary foliage surface. 4 vertices per quad, no AO.
+ *
+ * @param voxels The chunk's voxels (block ids of the faces).
+ * @param foliage Padded foliage masks, or null when the neighborhood has none.
+ * @param out Receives the vertices.
+ * @return vertices of the opaque surface (the rest are foliage).
+ */
+uint32_t emitSmooth(const PaddedMasks &masks, const PaddedOpaque &opaque, const HeightPads &pads,
+                    const PaddedOpaque *foliage, const ChunkLight &light, const VoxelChunk &voxels, int32_t chunkY,
+                    std::vector<SmoothVertex> &out) {
+  const int32_t baseY = chunkY * N;
+  thread_local CornerCache cache;
+  cache.begin();
+  std::array<Int3, 4> positions;
+  std::array<uint32_t, 4> words;
+  for (uint32_t normal = 0; normal < 6u; ++normal) {
+    const Int3 dir = kNormals[normal];
+    const uint32_t faceNormal = snormByte(static_cast<float>(dir.x)) | (snormByte(static_cast<float>(dir.y)) << 8u) |
+                                (snormByte(static_cast<float>(dir.z)) << 16u);
+    for (int32_t z = 0; z < N; ++z) {
+      for (int32_t x = 0; x < N; ++x) {
+        const size_t i = static_cast<size_t>((z + 1) * kPad + (x + 1));
+        const size_t neighbor = static_cast<size_t>((z + dir.z + 1) * kPad + (x + dir.x + 1));
+        uint32_t faces = masks.shifted[1][i] & ~masks.shifted[1 + dir.y][neighbor];
+        while (faces != 0u) {
+          const int32_t y = std::countr_zero(faces);
+          faces &= faces - 1u;
+          const uint16_t id = voxels.ids[VoxelChunk::index(x, y, z)];
+          const uint32_t sky = cornerLight(light, masks, {x + dir.x, y + dir.y, z + dir.z}, normal);
+          for (uint32_t k = 0; k < 4; ++k) {
+            const Int3 lattice = faceCorner({x, y, z}, normal, k);
+            const size_t key =
+                static_cast<size_t>((lattice.z * CornerCache::kSide + lattice.x) * CornerCache::kSide + lattice.y);
+            if (cache.stamp[key] != cache.current) {
+              // A vanishing gradient falls back to the normal of the face that placed the corner first.
+              cache.corner[key] = opaqueCorner(opaque, pads, baseY, lattice.x, lattice.y, lattice.z, faceNormal);
+              cache.stamp[key] = cache.current;
+            }
+            const SmoothCorner &corner = cache.corner[key];
+            positions[k] = fixedPosition(lattice, corner.offset);
+            words[k] = corner.normal | (cornerLevel(sky, k) << 26u);
+          }
+          appendSmoothQuad(positions, words, static_cast<uint16_t>((id & 0x3ffu) | (normal << 10u)), normal, out);
+        }
+      }
+    }
+  }
+  const uint32_t opaqueVertices = static_cast<uint32_t>(out.size());
+  if (foliage == nullptr) {
+    return opaqueVertices;
+  }
+
+  for (uint32_t normal = 0; normal < 6u; ++normal) {
+    const Int3 dir = kNormals[normal];
+    const uint32_t faceNormal = snormByte(static_cast<float>(dir.x)) | (snormByte(static_cast<float>(dir.y)) << 8u) |
+                                (snormByte(static_cast<float>(dir.z)) << 16u);
+    for (int32_t z = 0; z < N; ++z) {
+      for (int32_t x = 0; x < N; ++x) {
+        const size_t i = static_cast<size_t>((z + 1) * kPad + (x + 1));
+        const size_t neighbor = static_cast<size_t>((z + dir.z + 1) * kPad + (x + dir.x + 1));
+        const uint32_t self = static_cast<uint32_t>((*foliage)[i] >> 1u);
+        // Bit y = the cell at y + dir.y in the neighbor column (bits 0..33 hold cells -1..32).
+        const uint32_t covered = static_cast<uint32_t>(((*foliage)[neighbor] | opaque[neighbor]) >> (1 + dir.y));
+        uint32_t faces = self & ~covered;
+        while (faces != 0u) {
+          const int32_t y = std::countr_zero(faces);
+          faces &= faces - 1u;
+          const uint16_t id = voxels.ids[VoxelChunk::index(x, y, z)];
+          const uint32_t sky = cornerLight(light, masks, {x + dir.x, y + dir.y, z + dir.z}, normal);
+          for (uint32_t k = 0; k < 4; ++k) {
+            const Int3 lattice = faceCorner({x, y, z}, normal, k);
+            const CornerShape &shape = kCornerShapes[cornerConfig(*foliage, lattice.x, lattice.y, lattice.z)];
+            positions[k] = fixedPosition(lattice, shape.offset);
+            words[k] = (shape.normal != 0u ? shape.normal : faceNormal) | (cornerLevel(sky, k) << 26u);
+          }
+          appendSmoothQuad(positions, words, static_cast<uint16_t>((id & 0x3ffu) | (normal << 10u)), normal, out);
+        }
+      }
+    }
+  }
+  return opaqueVertices;
+}
+
 /**
  * Mesh a chunk (see meshChunk) into `quads`, a reused per-thread scratch, so the result can be copied out with one
  * exact allocation. Opaque and cutout quads come first, then ocean quads for the translucent clusters.
@@ -631,12 +1038,16 @@ uint32_t emitNonOpaque(const PaddedMasks &masks, const ChunkLight &light, const 
  * @param chunkY Chunk y, in chunks.
  * @param out Receives clusters and chunk offset (not quads).
  * @param quads Receives the packed quads.
+ * @param smooth Receives the Surface Nets vertices of the opaque faces.
  */
-void meshChunkInto(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out, std::vector<uint64_t> &quads) {
+void meshChunkInto(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out, std::vector<uint64_t> &quads,
+                   std::vector<SmoothVertex> &smooth) {
   const Column &center = nb.center();
   const VoxelChunk *voxels = center.chunk(chunkY);
   out.cy = chunkY;
   quads.clear();
+  smooth.clear();
+  out.smoothOpaqueVertices = 0;
   out.chunkOffset = packChunkOffset(center.cx, chunkY, center.cz);
   out.clusters = {};
   out.translucentClusters = {};
@@ -698,6 +1109,13 @@ void meshChunkInto(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out, std::
     }
   }
 
+  thread_local HeightPads pads;
+  buildHeightPads(nb, pads);
+  thread_local PaddedOpaque foliage;
+  const bool hasFoliage = buildFoliageMasks(nb, chunkY, foliage);
+  out.smoothOpaqueVertices =
+      emitSmooth(masks, paddedOpaque, pads, hasFoliage ? &foliage : nullptr, light, *voxels, chunkY, smooth);
+
   // Ocean faces into the translucent clusters, after every opaque quad.
   bool hasOcean = false;
   for (const uint32_t bits : voxels->ocean) {
@@ -739,8 +1157,10 @@ void meshChunkInto(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out, std::
 
 void meshChunk(const Neighborhood &nb, int32_t chunkY, ChunkMesh &out) {
   thread_local std::vector<uint64_t> scratch;
-  meshChunkInto(nb, chunkY, out, scratch);
+  thread_local std::vector<SmoothVertex> smoothScratch;
+  meshChunkInto(nb, chunkY, out, scratch, smoothScratch);
   out.quads.assign(scratch.begin(), scratch.end());
+  out.smoothVertices.assign(smoothScratch.begin(), smoothScratch.end());
 }
 
 } // namespace cpuworld

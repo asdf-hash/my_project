@@ -58,7 +58,7 @@ rule("slang")
         depend.on_changed(function ()
             progress.show(opt.progress, "${color.build.object}compiling.slang %s", sourcefile)
             os.mkdir(outdir)
-            os.vrunv("slangc", {sourcefile, "-target", "spirv", "-fvk-use-entrypoint-name", "-I", incdir, "-o", outfile})
+            os.vrunv("slangc", {sourcefile, "-target", "spirv", "-O3", "-fvk-use-entrypoint-name", "-I", incdir, "-o", outfile})
         end, {
             files = deps,
             dependfile = target:dependfile(outfile),
@@ -83,7 +83,8 @@ target("cpu_world")
 target("engine")
     set_kind("binary")
     add_deps("cpu_world")
-    add_files("src/main.cpp", "src/renderer.cpp", "src/camera.cpp", "src/block_registry.cpp", "src/player.cpp",
+    add_files("src/main.cpp", "src/renderer.cpp", "src/camera.cpp", "src/block_registry.cpp", "src/player.cpp", "src/gui.cpp",
+              "src/inventory.cpp", "src/screens.cpp", "src/item_entity.cpp", "src/collision.cpp",
               "src/stb_image_impl.cpp")
     -- vulkan.hpp/glm/glfw parsed once, not on every renderer.cpp edit (~5 s).
     set_pcxxheader("src/pch.hpp")
@@ -134,3 +135,11 @@ target("terrain_tests")
     set_default(false)
     add_deps("cpu_world")
     add_files("tests/terrain_tests.cpp", "src/block_registry.cpp")
+
+-- Inventory clicks, GUI batching, item entities. `xmake build inventory_tests && xmake run inventory_tests`
+target("inventory_tests")
+    set_kind("binary")
+    set_default(false)
+    add_deps("cpu_world")
+    add_files("tests/inventory_tests.cpp", "src/inventory.cpp", "src/gui.cpp", "src/screens.cpp",
+              "src/item_entity.cpp", "src/collision.cpp")

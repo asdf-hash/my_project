@@ -1,5 +1,5 @@
-// Terrain geometry and shading: mesh path (meshMain, culled by taskMain in task.slang), vertex path (vertMain), and
-// the opaque / cutout / water fragment shaders.
+// Terrain geometry and shading: mesh path (meshMain, culled by taskMain in task.slang), smooth terrain
+// (smoothVertMain / smoothFragMain), and the opaque / cutout / water fragment shaders.
 
 // Per (block, face) data from blocks.txt, indexed blockId * 6 + normalIndex. Matches GpuBlockFace in renderer.cpp.
 struct BlockFace {
@@ -11,8 +11,8 @@ struct BlockFace {
   float4 tint;    // every LOD
   float4 farTint; // far away, see farTintStart
 };
-// far_tint fades in by camera distance over [ubo.farTintStart, 4 x it), around LOD 3 where a tree becomes one leaf
-// block (vegetation_shared.hlsl). By distance rather than LOD, so no seam.
+// far_tint fades in by camera distance over [ubo.farTintStart, 4 x it), around LOD 3 where canopies become leaf-topped
+// ground (vegetation_shared.hlsl). By distance rather than LOD, so no seam.
 static const uint BLOCK_FACE_RANDOM_ROTATION = 1u << 0u;
 static const uint BLOCK_FACE_HAS_LOD_TEXTURE = 1u << 1u;
 static const uint BLOCK_FACE_FLUID = 1u << 2u;
@@ -23,9 +23,6 @@ static const uint BLOCK_FACE_FLUID = 1u << 2u;
 StructuredBuffer<uint2> QuadBuffer;
 [[vk::binding(3, 0)]]
 StructuredBuffer<uint64_t> ChunkOffsets;
-[[vk::binding(4, 0)]]
-StructuredBuffer<uint> QuadCount;
-
 [[vk::binding(5, 0)]]
 StructuredBuffer<BlockFace> BlockFaces;
 
@@ -246,56 +243,6 @@ void meshMain(out vertices MeshVertex verts[128], out indices uint3 triangles[64
   }
 }
 
-// ---- Vertex path -----------------------------------------------------------------------------------------------
-// drawIndexedIndirect over a static uint16 index buffer of VERTEX_QUADS_PER_INSTANCE quads ({0,1,2, 0,2,3} + 4q),
-// instanced over QuadBuffer (args from finalizeVertexDraw). Indexed so the post-transform cache shares the diagonal:
-// 4 invocations per quad, not 6. No GPU culling; ClipmapView::frustumCull only meshes chunks in the frustum.
-// Must match VERTEX_QUADS_PER_INSTANCE in renderer.cpp and chunk_compute.slang.
-static const uint VERTEX_QUADS_PER_INSTANCE = 16384u;
-
-/**
- * One corner of one quad; culled quads return a NaN position so the primitive is discarded.
- *
- * @param vertexID quad within the instance * 4 + corner.
- * @param instanceID Block of VERTEX_QUADS_PER_INSTANCE quads.
- */
-[shader("vertex")]
-MeshVertex vertMain(uint vertexID: SV_VertexID, uint instanceID: SV_InstanceID) {
-  const uint drawQuad = instanceID * VERTEX_QUADS_PER_INSTANCE + (vertexID >> 2u);
-  const uint quadIndex = drawParams.quadBase + drawQuad;
-  MeshVertex dead = (MeshVertex)0;
-  dead.pos = float4(asfloat(0x7fc00000u).xxxx); // NaN position: the primitive is discarded before setup.
-  if (quadIndex >= min(QuadCount[0], MAX_QUAD_COUNT) ||
-      (drawParams.quadCount != 0u && drawQuad >= drawParams.quadCount)) {
-    return dead; // Tail of the last instance.
-  }
-
-  const DecodedQuad quad = decodeQuad(quadIndex);
-  if (quad.normalIndex >= 6u) {
-    return dead; // retired by retireWork; reclaimed at the next full rebuild
-  }
-  // Back faces still cost their invocations, but skip the transforms and attribute exports.
-  if (!quad.frontFacing && drawParams.pass != GEOMETRY_PASS_TRANSLUCENT) {
-    return dead;
-  }
-  // The GPU clipmap's vertex draw covers all its quads in both passes; each keeps its own (liquids are translucent).
-  const bool liquid = (BlockFaces[(quad.material & 0x3ffu) * 6u + quad.normalIndex].flags & BLOCK_FACE_FLUID) != 0u;
-  if (liquid != (drawParams.pass == GEOMETRY_PASS_TRANSLUCENT) || !quadInPass(quad.material)) {
-    return dead;
-  }
-  // The index buffer has a fixed winding, so flipped faces mirror corners 1 <-> 3 instead:
-  // {0,1,2},{0,2,3} becomes {0,3,2},{0,2,1}, which is exactly the mesh path's flipped triangles.
-  uint corner = vertexID & 3u;
-  if (flippedWinding(quad.normalIndex) && (corner & 1u) != 0u) {
-    corner ^= 2u;
-  }
-  // Every corner invocation projects all four to dilate the outline (see quadClipCorners).
-  float3 world[4];
-  float4 clip[4];
-  quadClipCorners(quad, world, clip);
-  return makeVertex(quad, corner, world[corner], clip[corner]);
-}
-
 // Same layout as MeshVertex.
 struct FragmentInput {
   float4 pos : SV_Position;
@@ -354,6 +301,95 @@ float vanillaLightmap(float level) {
 /** View depth (clip w) from a reverse-Z depth (1 = near, 0 = far): w = n f / (n (1 - d) + f d). */
 float viewDepthFromDepth(float depth) {
   return ubo.nearPlane * ubo.farPlane / (ubo.nearPlane * (1.0f - depth) + ubo.farPlane * depth);
+}
+
+/**
+ * Debug views over a texture color: the source tint (X) and the elevation view (H, a height color ramp with
+ * alternating 4-block bands and a dark line every 16 blocks).
+ *
+ * @param heightY World height the elevation view reads.
+ */
+void applyDebugViews(inout float3 rgb, BlockFace face, uint chunkLod, float heightY) {
+  // Debug view (X): keep the texture's detail but shift it toward the chunk source's color.
+  if (drawParams.debugTint != DEBUG_TINT_OFF) {
+    const float3 tint = drawParams.debugTint == DEBUG_TINT_CPU
+                            ? float3(0.1f, 1.0f, 0.1f)
+                            : float3(1.0f, float(chunkLod) / float(MAX_LOD_LEVELS - 1u), 0.05f);
+    const float detail = dot(rgb, float3(0.299f, 0.587f, 0.114f));
+    rgb = tint * (0.35f + 0.9f * detail);
+  }
+  if (ubo.contourMode != 0u && (face.flags & BLOCK_FACE_FLUID) == 0u) {
+    const float y = heightY;
+    const float t = saturate((y + 64.0f) / 704.0f); // -64 .. 640
+    const float3 ramp[6] = { float3(0.1f, 0.2f, 0.7f), float3(0.15f, 0.65f, 0.2f), float3(0.85f, 0.85f, 0.15f),
+                             float3(0.9f, 0.45f, 0.1f), float3(0.65f, 0.15f, 0.1f), float3(0.97f, 0.97f, 0.97f) };
+    const float scaled = t * 5.0f;
+    const uint index = min(uint(scaled), 4u);
+    float3 elevation = lerp(ramp[index], ramp[index + 1u], scaled - float(index));
+    elevation *= (uint(floor(y / 4.0f)) & 1u) != 0u ? 0.82f : 1.0f;
+    // Lines: within ~1.5 pixels (or 0.12 blocks on top faces' edges) of a multiple of 16.
+    const float lineCoord = y / 16.0f;
+    const float lineWidth = max(fwidth(lineCoord) * 1.5f, 0.12f / 16.0f);
+    const float distanceToLine = abs(frac(lineCoord + 0.5f) - 0.5f);
+    if (distanceToLine < lineWidth) {
+      elevation *= 0.25f;
+    }
+    const float detail = dot(rgb, float3(0.299f, 0.587f, 0.114f));
+    rgb = elevation * (0.75f + 0.5f * detail);
+  }
+}
+
+/**
+ * Light a shaded texel and finish it: far tint, air / water fog, the water pass's fog behind liquid faces, and motion.
+ *
+ * @param color Texture color (linear) with tint and debug views applied; alpha is kept.
+ * @param lightFactor Skylight brightness x AO x face shade, applied in display (sRGB) space as vanilla does.
+ * @param pos SV_Position of the fragment.
+ * @param previousClip Last frame's clip position (TAA motion).
+ * @param viewDepth Clip w.
+ * @param waterPass Add water fog behind liquid faces.
+ */
+[ForceInline]
+SceneFragmentOutput composeFragment(float4 color, BlockFace face, float lightFactor, float4 pos, float4 previousClip,
+                                    float viewDepth, bool waterPass) {
+  const float2 currentUv = pos.xy / ubo.renderSize;
+  const float2 previousNdc = previousClip.xy / previousClip.w;
+  const float2 previousUv = float2(previousNdc.x * 0.5f + 0.5f, 0.5f - previousNdc.y * 0.5f);
+  // Underwater: short linear water fog (must match the clear colors in renderer.cpp). In air: a weak linear haze
+  // reaching AIR_FOG_HAZE at ubo.viewRayScale.w, plus a smoothstep border fog over the last AIR_FOG_BORDER_WIDTH that
+  // hides the clipmap's edge.
+  const bool underwater = ubo.viewRayScale.z > 0.5f;
+  const float2 ndc = currentUv * 2.0f - 1.0f;
+  const float cameraDistance = viewDepth * length(float3(ndc * ubo.viewRayScale.xy, 1.0f));
+  const float AIR_FOG_HAZE = 0.3f;
+  const float AIR_FOG_BORDER_WIDTH = 0.15f; // of the border fog's end distance
+  const float borderFogEnd = ubo.viewRayScale.w;
+  const float haze = AIR_FOG_HAZE * saturate(cameraDistance / borderFogEnd);
+  const float border = smoothstep(borderFogEnd * (1.0f - AIR_FOG_BORDER_WIDTH), borderFogEnd, cameraDistance);
+  const float fogAmount = underwater ? saturate(cameraDistance / WATER_FOG_DISTANCE)
+                                     : 1.0f - (1.0f - haze) * (1.0f - border);
+  const float3 skyColor = underwater ? WATER_FOG_COLOR : float3(0.55f, 0.72f, 0.9f);
+  SceneFragmentOutput output;
+  // Light, AO and face shade multiply the on-screen (sRGB-encoded) color, as in vanilla; color here is linear (sRGB
+  // texture, sRGB target), so encode, multiply, decode.
+  float3 litColor = srgbToLinear(linearToSrgb(color.rgb) * lightFactor);
+  litColor *= lerp(float3(1.0f, 1.0f, 1.0f), face.farTint.rgb,
+                   saturate((cameraDistance - ubo.farTintStart) / (3.0f * ubo.farTintStart)));
+  // From above water: fog the view ray between this liquid face and the terrain behind it. Only drawn water surfaces
+  // add it, so dry pits below sea level stay clear.
+  if (waterPass && !underwater && (face.flags & BLOCK_FACE_FLUID) != 0u) {
+    const float sceneW = viewDepthFromDepth(SceneDepth.Load(int3(int2(pos.xy), 0)));
+    // View-depth difference to distance along the view ray: distances scale with w along a ray.
+    const float submerged = max(sceneW - viewDepth, 0.0f) * cameraDistance / max(viewDepth, 1e-3f);
+    const float waterFog = saturate(submerged / WATER_FOG_DISTANCE);
+    // Composite: the texture (alpha) over fogged terrain (fog fraction of the fog color), as straight alpha.
+    const float3 premultiplied = color.a * litColor + (1.0f - color.a) * waterFog * WATER_FOG_COLOR;
+    color.a = 1.0f - (1.0f - color.a) * (1.0f - waterFog);
+    litColor = premultiplied / max(color.a, 1e-4f);
+  }
+  output.color = float4(lerp(litColor, skyColor, fogAmount), color.a);
+  output.motion = float4(previousUv - currentUv, previousClip.z / previousClip.w, pos.z);
+  return output;
 }
 
 /**
@@ -427,36 +463,10 @@ SceneFragmentOutput shadeFragment(FragmentInput input, bool waterPass, bool cuto
   if (useLodTexture) {
     color.rgb *= face.lodTint.rgb;
   }
-  // Debug view (X): keep the texture's detail but shift it toward the chunk source's color.
-  if (drawParams.debugTint != DEBUG_TINT_OFF) {
-    const float3 tint = drawParams.debugTint == DEBUG_TINT_CPU
-                            ? float3(0.1f, 1.0f, 0.1f)
-                            : float3(1.0f, float(chunkLod) / float(MAX_LOD_LEVELS - 1u), 0.05f);
-    const float detail = dot(color.rgb, float3(0.299f, 0.587f, 0.114f));
-    color.rgb = tint * (0.35f + 0.9f * detail);
-  }
-
-  // Elevation view (H): height color ramp, alternating 4-block bands, a dark line every 16 blocks. Height is sampled
-  // half a block inside the face, so a top face counts as its block's level.
-  if (ubo.contourMode != 0u && (face.flags & BLOCK_FACE_FLUID) == 0u) {
+  {
     const float faceNormalY = faceAxis == 1u ? (faceSign == 0u ? 1.0f : -1.0f) : 0.0f;
-    const float y = input.worldY - 0.5f * faceNormalY;
-    const float t = saturate((y + 64.0f) / 704.0f); // -64 .. 640
-    const float3 ramp[6] = { float3(0.1f, 0.2f, 0.7f), float3(0.15f, 0.65f, 0.2f), float3(0.85f, 0.85f, 0.15f),
-                             float3(0.9f, 0.45f, 0.1f), float3(0.65f, 0.15f, 0.1f), float3(0.97f, 0.97f, 0.97f) };
-    const float scaled = t * 5.0f;
-    const uint index = min(uint(scaled), 4u);
-    float3 elevation = lerp(ramp[index], ramp[index + 1u], scaled - float(index));
-    elevation *= (uint(floor(y / 4.0f)) & 1u) != 0u ? 0.82f : 1.0f;
-    // Lines: within ~1.5 pixels (or 0.12 blocks on top faces' edges) of a multiple of 16.
-    const float lineCoord = y / 16.0f;
-    const float lineWidth = max(fwidth(lineCoord) * 1.5f, 0.12f / 16.0f);
-    const float distanceToLine = abs(frac(lineCoord + 0.5f) - 0.5f);
-    if (distanceToLine < lineWidth) {
-      elevation *= 0.25f;
-    }
-    const float detail = dot(color.rgb, float3(0.299f, 0.587f, 0.114f));
-    color.rgb = elevation * (0.75f + 0.5f * detail);
+    // Height sampled half a block inside the face, so a top face counts as its block's level.
+    applyDebugViews(color.rgb, face, chunkLod, input.worldY - 0.5f * faceNormalY);
   }
 
   // AO corners span the whole merged quad (see quadSize in decodePackedQuad).
@@ -477,44 +487,8 @@ SceneFragmentOutput shadeFragment(FragmentInput input, bool waterPass, bool cuto
   const float skyBrightness = vanillaLightmap(skyLevel);
   // Face shade: top 1.0, north / south 0.8, east / west 0.6, bottom 0.5.
   const float shading = faceAxis == 0u ? 0.6f : (faceAxis == 1u ? (faceSign == 0u ? 1.0f : 0.5f) : 0.8f);
-  const float2 currentUv = input.pos.xy / ubo.renderSize;
-  const float2 previousNdc = input.previousClip.xy / input.previousClip.w;
-  const float2 previousUv = float2(previousNdc.x * 0.5f + 0.5f, 0.5f - previousNdc.y * 0.5f);
-  // Underwater: short linear water fog (must match the clear colors in renderer.cpp). In air: a weak linear haze
-  // reaching AIR_FOG_HAZE at ubo.viewRayScale.w, plus a smoothstep border fog over the last AIR_FOG_BORDER_WIDTH that
-  // hides the clipmap's edge.
-  const bool underwater = ubo.viewRayScale.z > 0.5f;
-  const float2 ndc = currentUv * 2.0f - 1.0f;
-  const float cameraDistance = input.viewDepth * length(float3(ndc * ubo.viewRayScale.xy, 1.0f));
-  const float AIR_FOG_HAZE = 0.3f;
-  const float AIR_FOG_BORDER_WIDTH = 0.15f; // of the border fog's end distance
-  const float borderFogEnd = ubo.viewRayScale.w;
-  const float haze = AIR_FOG_HAZE * saturate(cameraDistance / borderFogEnd);
-  const float border = smoothstep(borderFogEnd * (1.0f - AIR_FOG_BORDER_WIDTH), borderFogEnd, cameraDistance);
-  const float fogAmount = underwater ? saturate(cameraDistance / WATER_FOG_DISTANCE)
-                                     : 1.0f - (1.0f - haze) * (1.0f - border);
-  const float3 skyColor = underwater ? WATER_FOG_COLOR : float3(0.55f, 0.72f, 0.9f);
-  SceneFragmentOutput output;
-  // Light, AO and face shade multiply the on-screen (sRGB-encoded) color, as in vanilla; color here is linear (sRGB
-  // texture, sRGB target), so encode, multiply, decode.
-  float3 litColor = srgbToLinear(linearToSrgb(color.rgb) * (skyBrightness * aoFactor * shading));
-  litColor *= lerp(float3(1.0f, 1.0f, 1.0f), face.farTint.rgb,
-                   saturate((cameraDistance - ubo.farTintStart) / (3.0f * ubo.farTintStart)));
-  // From above water: fog the view ray between this liquid face and the terrain behind it. Only drawn water surfaces
-  // add it, so dry pits below sea level stay clear.
-  if (waterPass && !underwater && (face.flags & BLOCK_FACE_FLUID) != 0u) {
-    const float sceneW = viewDepthFromDepth(SceneDepth.Load(int3(int2(input.pos.xy), 0)));
-    // View-depth difference to distance along the view ray: distances scale with w along a ray.
-    const float submerged = max(sceneW - input.viewDepth, 0.0f) * cameraDistance / max(input.viewDepth, 1e-3f);
-    const float waterFog = saturate(submerged / WATER_FOG_DISTANCE);
-    // Composite: the texture (alpha) over fogged terrain (fog fraction of the fog color), as straight alpha.
-    const float3 premultiplied = color.a * litColor + (1.0f - color.a) * waterFog * WATER_FOG_COLOR;
-    color.a = 1.0f - (1.0f - color.a) * (1.0f - waterFog);
-    litColor = premultiplied / max(color.a, 1e-4f);
-  }
-  output.color = float4(lerp(litColor, skyColor, fogAmount), color.a);
-  output.motion = float4(previousUv - currentUv, input.previousClip.z / input.previousClip.w, input.pos.z);
-  return output;
+  return composeFragment(color, face, skyBrightness * aoFactor * shading, input.pos, input.previousClip,
+                         input.viewDepth, waterPass);
 }
 
 /** Opaque pass: no discard, so early depth testing rejects hidden fragments before shading. */
@@ -529,3 +503,245 @@ SceneFragmentOutput fragCutout(FragmentInput input) { return shadeFragment(input
 /** Translucent (water) pass: adds water fog behind liquid faces. */
 [shader("fragment")]
 SceneFragmentOutput fragWater(FragmentInput input) { return shadeFragment(input, true, false); }
+
+// ---- Smooth terrain ---------------------------------------------------------------------------------------------
+// The CPU-meshed chunks' opaque faces as Surface Nets quads (cpuworld::SmoothVertex, emitSmooth in cpu_mesher.cpp),
+// drawn from a vertex buffer in smooth mode (V). Textures are projected triplanar since faces are no longer
+// axis-aligned.
+
+struct SmoothVertexInput {
+  // x, y, z: chunk-local position in 1/256 blocks, biased by +256; w: block id | face direction << 10.
+  [[vk::location(0)]] uint4 positionMaterial : POSITION;
+  // Normal as signed bytes x, y, z (bits 0-23) | skylight 0..15 (26-29).
+  [[vk::location(1)]] uint normalLight : NORMAL;
+};
+
+struct SmoothVertex {
+  float4 pos : SV_Position;
+  float4 previousClip : TEXCOORD3;
+  float3 world : TEXCOORD0;
+  float3 normal : TEXCOORD1;
+  float skyLevel : TEXCOORD5;  // 0..15
+  float viewDepth : TEXCOORD4; // clip w
+  // Near terrain: block id | face direction << 10. LOD terrain: unused (the block comes from height and slope).
+  nointerpolation uint material : TEXCOORD6;
+  float dither : TEXCOORD7;            // LOD terrain: layer dither, -1..1
+  nointerpolation uint lod : TEXCOORD8; // LOD terrain: tile LOD (0 for near terrain)
+};
+
+static const int SMOOTH_FIXED_ONE = 256; // cpuworld::kSmoothFixedOne
+
+/** Signed byte in bits [shift, shift + 8) of `word`, as -1..1. */
+float unpackSnorm8(uint word, uint shift) {
+  return max(float(int(word << (24u - shift)) >> 24) / 127.0f, -1.0f);
+}
+
+[shader("vertex")]
+SmoothVertex smoothVertMain(SmoothVertexInput input) {
+  // Integer world position in fixed point first, so chunks sharing a corner produce the identical float.
+  const int3 fixed = drawParams.smoothOrigin * SMOOTH_FIXED_ONE + int3(input.positionMaterial.xyz) - SMOOTH_FIXED_ONE;
+  const float3 world = float3(fixed >> 8) + float3(fixed & 255) / float(SMOOTH_FIXED_ONE);
+  SmoothVertex output;
+  output.pos = mul(ubo.mvp, float4(world, 1.0f));
+  output.previousClip = mul(ubo.previousMvp, float4(world, 1.0f));
+  output.world = world;
+  output.normal = float3(unpackSnorm8(input.normalLight, 0u), unpackSnorm8(input.normalLight, 8u),
+                         unpackSnorm8(input.normalLight, 16u));
+  output.skyLevel = float((input.normalLight >> 26u) & 0xfu);
+  output.viewDepth = output.pos.w;
+  output.material = input.positionMaterial.w;
+  output.dither = 0.0f;
+  output.lod = 0u;
+  return output;
+}
+
+/**
+ * One triplanar projection of a block face texture, with the mesh path's per-block random rotation.
+ *
+ * @param uv Projected world coordinates (blocks); the integer part picks the texture cell.
+ * @param uvDx, uvDy Screen derivatives of uv.
+ * @param depthCell Integer coordinate along the projection axis, so stacked blocks rotate independently.
+ * @param normalIndex Face direction whose texture is used, 0..5.
+ */
+float4 sampleProjection(BlockFace face, float2 uv, float2 uvDx, float2 uvDy, int depthCell, uint normalIndex,
+                        uint chunkLod) {
+  const bool useLodTexture = chunkLod > 0u && (face.flags & BLOCK_FACE_HAS_LOD_TEXTURE) != 0u;
+  const uint frameCount = max((face.animation >> (useLodTexture ? 8u : 0u)) & 0xffu, 1u);
+  const float frameSeconds = float(face.animation >> 16u) * 0.001f;
+  const uint frame = uint(ubo.cameraPosition.w / frameSeconds) % frameCount;
+  const uint textureIndex = (useLodTexture ? face.lodTexture : face.texture) + frame;
+  const float2 cell = floor(uv);
+  uint rotation = 0u;
+  if ((face.flags & BLOCK_FACE_RANDOM_ROTATION) != 0u) {
+    uint h = uint(int(cell.x)) * 0x8da6b343u ^ uint(int(cell.y)) * 0xd8163841u ^ uint(depthCell) * 0xcb1ab31fu ^
+             normalIndex * 0x165667b1u;
+    h ^= h >> 15u;
+    h *= 0x2c1b3c6du;
+    h ^= h >> 12u;
+    h *= 0x297a2d39u;
+    h ^= h >> 15u;
+    rotation = h & 3u;
+  }
+  float2 textureUv = uv - cell;
+  if (rotation != 0u) {
+    textureUv = rotateUv(textureUv, rotation);
+    uvDx = rotateUvGradient(uvDx, rotation);
+    uvDy = rotateUvGradient(uvDy, rotation);
+  }
+  textureUv.y = 1.0f - textureUv.y;
+  uvDx.y = -uvDx.y;
+  uvDy.y = -uvDy.y;
+  const float gradientScale = exp2(-0.5f); // mip sharpening, as in shadeFragment
+  float4 texel = textures[NonUniformResourceIndex(textureIndex)].SampleGrad(sampler, textureUv, uvDx * gradientScale,
+                                                                            uvDy * gradientScale);
+  texel.rgb *= face.tint.rgb;
+  if (useLodTexture) {
+    texel.rgb *= face.lodTint.rgb;
+  }
+  return texel;
+}
+
+/**
+ * Shade a smooth surface: triplanar textures of block `blockType` (its top texture on gentle slopes, so they read as
+ * ground), interpolated skylight, face shade blended by the normal.
+ *
+ * @param cutout Alpha-test (discard below 0.5): the foliage surface.
+ */
+[ForceInline]
+SceneFragmentOutput shadeSmooth(SmoothVertex input, uint blockType, bool cutout) {
+  const float3 n = normalize(input.normal);
+  // Sharp blend: mostly one projection, mixing only near 45 degrees.
+  float3 weights = pow(abs(n), 4.0f);
+  weights /= weights.x + weights.y + weights.z;
+  const bool groundLike = n.y > 0.5f;
+  const uint xFace = groundLike ? 2u : (n.x >= 0.0f ? 0u : 1u);
+  const uint yFace = n.y >= 0.0f ? 2u : 3u;
+  const uint zFace = groundLike ? 2u : (n.z >= 0.0f ? 4u : 5u);
+  // Projections (u, v) matching the mesh path's faces: v up on sides, -z on top, +z on the bottom.
+  const float2 uvX = float2(input.world.z, input.world.y);
+  const float2 uvY = float2(input.world.x, n.y >= 0.0f ? -input.world.z : input.world.z);
+  const float2 uvZ = float2(input.world.x, input.world.y);
+  // Derivatives in uniform control flow, before the weighted branches below.
+  const float2 uvXDx = ddx(uvX), uvXDy = ddy(uvX);
+  const float2 uvYDx = ddx(uvY), uvYDy = ddy(uvY);
+  const float2 uvZDx = ddx(uvZ), uvZDy = ddy(uvZ);
+  // Cell along each projection axis, taken half a block inside the surface.
+  const int3 inside = int3(floor(input.world - 0.5f * n));
+  float4 color = float4(0.0f, 0.0f, 0.0f, 0.0f);
+  BlockFace dominant = BlockFaces[blockType * 6u + yFace];
+  float dominantWeight = -1.0f;
+  [unroll]
+  for (uint axis = 0u; axis < 3u; ++axis) {
+    const float weight = weights[axis];
+    const uint faceIndex = axis == 0u ? xFace : (axis == 1u ? yFace : zFace);
+    const BlockFace face = BlockFaces[blockType * 6u + faceIndex];
+    if (weight > dominantWeight) {
+      dominant = face;
+      dominantWeight = weight;
+    }
+    if (weight > 0.001f) {
+      const float4 texel =
+          axis == 0u ? sampleProjection(face, uvX, uvXDx, uvXDy, inside.x, faceIndex, input.lod)
+                     : (axis == 1u ? sampleProjection(face, uvY, uvYDx, uvYDy, inside.y, faceIndex, input.lod)
+                                   : sampleProjection(face, uvZ, uvZDx, uvZDy, inside.z, faceIndex, input.lod));
+      color += texel * weight;
+    }
+  }
+  if (cutout && color.a < 0.5f) {
+    discard;
+  }
+  color.a = 1.0f;
+  applyDebugViews(color.rgb, dominant, input.lod, input.world.y - 0.5f * n.y);
+
+  const float skyBrightness = vanillaLightmap(input.skyLevel);
+  // The block faces' shade (top 1.0, north / south 0.8, east / west 0.6, bottom 0.5), blended by the normal.
+  const float3 n2 = n * n;
+  const float shading = n2.x * 0.6f + n2.z * 0.8f + n2.y * (n.y >= 0.0f ? 1.0f : 0.5f);
+  return composeFragment(color, dominant, skyBrightness * shading, input.pos, input.previousClip, input.viewDepth,
+                         false);
+}
+
+/** Opaque smooth near terrain. */
+[shader("fragment")]
+[earlydepthstencil]
+SceneFragmentOutput smoothFragMain(SmoothVertex input) { return shadeSmooth(input, input.material & 0x3ffu, false); }
+
+/** Smooth foliage (leaves, glass): alpha-tested. */
+[shader("fragment")]
+SceneFragmentOutput smoothFragCutout(SmoothVertex input) { return shadeSmooth(input, input.material & 0x3ffu, true); }
+
+// ---- Smooth LOD terrain -----------------------------------------------------------------------------------------
+// The GPU clipmap's columns as heightfields: per tile a grid over its 33 x 33 column corners (SmoothHeights, from
+// generateHeights) plus a skirt ring hanging below the edges, which hides cracks against coarser or finer
+// neighbors. Heights follow the CPU's smooth convention: a column's float surface h sits at h - 0.5, half a block
+// into the column (the CPU places it at the cell center).
+
+[[vk::binding(4, 0)]]
+StructuredBuffer<float2> SmoothHeights;
+
+static const uint LOD_GRID_SIDE = 35u;          // renderer.cpp LOD_GRID_SIDE: 33 corners + the skirt ring
+static const uint SMOOTH_HEIGHT_STRIDE = 34u;   // padded column grid (chunk_compute.slang HEIGHT_STRIDE)
+// Layer tops and their dither (chunk_compute.slang TRANSITION_HEIGHTS / TRANSITION_DITHER).
+static const int SMOOTH_TRANSITION_HEIGHTS[3] = { 2, 320, 600 };
+static const float SMOOTH_TRANSITION_DITHER[3] = { 0.0f, 40.0f, 40.0f };
+
+/** SmoothHeights entry of padded grid point (l, m) (0..33 each: corner l - 1) of column slot `slot`. */
+float2 smoothHeightAt(uint slot, uint l, uint m) {
+  return SmoothHeights[slot * SMOOTH_HEIGHT_STRIDE * SMOOTH_HEIGHT_STRIDE + m * SMOOTH_HEIGHT_STRIDE + l];
+}
+
+/**
+ * One grid vertex of one tile.
+ *
+ * @param tile Instance: column slot, tile origin x / z (blocks), scale (blocks per column).
+ */
+[shader("vertex")]
+SmoothVertex smoothLodVertMain(uint vertexID: SV_VertexID, [[vk::location(0)]] int4 tile: TILE) {
+  const uint slot = uint(tile.x);
+  const int scale = tile.w;
+  const uint i = vertexID % LOD_GRID_SIDE;
+  const uint j = vertexID / LOD_GRID_SIDE;
+  const bool skirt = i == 0u || j == 0u || i == LOD_GRID_SIDE - 1u || j == LOD_GRID_SIDE - 1u;
+  // Corner 0..32 along each axis; its padded grid point is corner + 1.
+  const uint cx = clamp(i, 1u, LOD_GRID_SIDE - 2u) - 1u;
+  const uint cz = clamp(j, 1u, LOD_GRID_SIDE - 2u) - 1u;
+  const float2 sample = smoothHeightAt(slot, cx + 1u, cz + 1u);
+  // Normal from central differences (one-sided at the far edge, which has no padded point beyond).
+  const uint left = cx, right = min(cx + 2u, SMOOTH_HEIGHT_STRIDE - 1u);
+  const uint back = cz, front = min(cz + 2u, SMOOTH_HEIGHT_STRIDE - 1u);
+  const float dx = (smoothHeightAt(slot, right, cz + 1u).x - smoothHeightAt(slot, left, cz + 1u).x) /
+                   (float(right - left) * float(scale));
+  const float dz = (smoothHeightAt(slot, cx + 1u, front).x - smoothHeightAt(slot, cx + 1u, back).x) /
+                   (float(front - back) * float(scale));
+  // Skirts drop far enough to cover the worst crack against a neighbor LOD on steep ground.
+  const float skirtDepth = skirt ? 4.0f + 4.0f * float(scale) : 0.0f;
+  const float3 world = float3(float(tile.y + int(cx) * scale) + 0.5f, sample.x - 0.5f - skirtDepth,
+                              float(tile.z + int(cz) * scale) + 0.5f);
+  SmoothVertex output;
+  output.pos = mul(ubo.mvp, float4(world, 1.0f));
+  output.previousClip = mul(ubo.previousMvp, float4(world, 1.0f));
+  output.world = world;
+  output.normal = normalize(float3(-dx, 1.0f, -dz));
+  output.skyLevel = 15.0f;
+  output.viewDepth = output.pos.w;
+  output.material = 0u;
+  output.dither = sample.y;
+  output.lod = firstbitlow(uint(scale));
+  return output;
+}
+
+/** LOD terrain: the layer's top block, its filler on steep ground and its deep block on cliffs (by the normal). */
+[shader("fragment")]
+[earlydepthstencil]
+SceneFragmentOutput smoothLodFragMain(SmoothVertex input) {
+  uint layer = 0u;
+  [unroll]
+  for (uint t = 0u; t < 3u; ++t) {
+    layer += uint(input.world.y + 0.5f >=
+                  float(SMOOTH_TRANSITION_HEIGHTS[t]) + round(input.dither * SMOOTH_TRANSITION_DITHER[t]));
+  }
+  const float up = normalize(input.normal).y;
+  const uint blockType = up > 0.8f ? drawParams.layerBlocks[layer]
+                                   : (up > 0.6f ? drawParams.layerFillerBlocks[layer] : drawParams.layerDeepBlocks[layer]);
+  return shadeSmooth(input, blockType, false);
+}

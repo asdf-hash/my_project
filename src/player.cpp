@@ -112,6 +112,8 @@ void Player::damage(float amount) {
 void Player::respawn() {
   stepLift = 0.0f;
   std::clog << "You died\n";
+  ++deaths;
+  lastDeathPosition = position;
   currentMode = Mode::Walking; // only survival and adventure die
   position = previousPosition = spawnPoint;
   motion = glm::dvec3(0.0);

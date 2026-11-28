@@ -199,6 +199,13 @@ public:
   /** One past the highest column slot in use. */
   uint32_t columnSlotCount() const { return columnSlots_.highWater(); }
 
+  /** Call `visit(columnSlot, coords)` for every live column. */
+  template <typename Visit> void forEachColumn(Visit &&visit) const {
+    for (const auto &[key, entry] : columns_) {
+      visit(entry.columnSlot, slotCoords_[entry.columnSlot]);
+    }
+  }
+
 private:
   struct ColumnKey {
     int32_t x, z, lod;

@@ -4,8 +4,6 @@ static const uint CHUNK_SIZE = 32u;
 static const uint HEIGHT_STRIDE = 34u;
 static const uint HEIGHTS_PER_CHUNK = HEIGHT_STRIDE * HEIGHT_STRIDE;
 static const uint MAX_QUAD_COUNT = 1u << 24u;
-// Must match VERTEX_QUADS_PER_INSTANCE in slang.slang and renderer.cpp.
-static const uint VERTEX_QUADS_PER_INSTANCE = 16384u;
 // world::kMinTerrainHeight / kMaxTerrainHeight.
 static const int MIN_TERRAIN_HEIGHT = -400;
 static const int MAX_TERRAIN_HEIGHT = 1100;
@@ -88,8 +86,8 @@ groupshared int heightTile[TILE_SIZE * TILE_SIZE];
 // Trees over each column of the group (index lane), in this LOD's cells (see computeTreeColumn): log cells
 // [treeLogLo, treeLogHi), leaf cells treeLeafBase + i for each bit i of treeLeafMask.
 groupshared int treeLogLo[64];
-// LOD 0-3: the tree slots of the regions the tile covers (stageTreeSlots; treeSlotHeight 0 = no tree). Ground: LOD 0
-// the trunk column's height, LOD 1-2 its coarse column's height in cells.
+// LOD 0-3: the tree slots of the regions the tile covers (stageTreeSlots; treeSlotHeight 0 = no tree). Ground, in
+// blocks: LOD 0 the trunk column's height, LOD 1-3 a full-octave sample at the trunk.
 groupshared int treeSlotTrunkX[64];
 groupshared int treeSlotTrunkZ[64];
 groupshared int treeSlotGround[64];
@@ -129,9 +127,11 @@ struct QuadCluster {
 };
 [[vk::binding(6, 0)]]
 RWStructuredBuffer<QuadCluster> Clusters;
-// VkDrawIndexedIndirectCommand for vertMain, written by finalizeVertexDraw after each remesh.
+// Smooth terrain mode (slang.slang smoothLodVertMain): per column slot, the same 34x34 padded grid as HeightBuffer,
+// each entry the float surface height (blocks) and the layer dither at that column's corner (worldX, worldZ of
+// columnCellHeight). Written by generateHeights.
 [[vk::binding(7, 0)]]
-RWStructuredBuffer<uint> VertexDrawArguments;
+RWStructuredBuffer<float2> SmoothHeights;
 // Per column (parallel to ChunkCoords): LOD range of the tiles across each edge. Edge e (-X, +X, -Z, +Z) at bits
 // e*8: min LOD | max LOD << 4. Written by buildVisibleClipmap (ClipmapResult::neighborLods).
 [[vk::binding(8, 0)]]
@@ -561,9 +561,10 @@ int columnTopBlocks(int worldX, int worldZ, int scale, float bias) {
  *
  * @param localX Padded column-local x (0 and HEIGHT_STRIDE - 1 are borders).
  * @param localZ Padded column-local z.
+ * @param surface Receives the float surface height at the cell's corner, in blocks (unclamped by neighbor LODs).
  * @return height in the tile's cells, clamped to the envelope floor.
  */
-int columnCellHeight(uint columnIndex, uint localX, uint localZ) {
+int columnCellHeight(uint columnIndex, uint localX, uint localZ, out float surface) {
   const int4 chunkCoord = ChunkCoords[columnIndex];
   const int scale = chunkCoord.w;
   const int worldX = chunkCoord.x * int(CHUNK_SIZE) + (int(localX) - 1) * scale;
@@ -596,8 +597,10 @@ int columnCellHeight(uint columnIndex, uint localX, uint localZ) {
       }
     }
     cells = floorDivide(lowestTop, scale); // at or below the neighbor's top, in this tile's cells
+    surface = sampleTerrainHeight(worldX, worldZ, scale);
   } else {
-    cells = int(floor(sampleTerrainHeight(worldX, worldZ, scale) / float(scale)));
+    surface = sampleTerrainHeight(worldX, worldZ, scale);
+    cells = int(floor(surface / float(scale)));
   }
   return max(cells, minimumHeight);
 }
@@ -687,8 +690,27 @@ void stageTreeSlots(uint lane, uint tileX, uint tileZ, uint columnIndex, int4 ch
 }
 
 /**
- * Tree cells over one column of the group at this LOD: exact blocks at LOD 0, covering canopies at LOD 1-2, one
- * leaf cell per shown tree at LOD 3+ (LOD 4+ re-derive candidates instead of using the staged slots).
+ * Merge a tree's downsampled leaves into a coarse column, lifted so the terrain never swallows them; logs fill the
+ * trunk's column from the terrain top to its lowest leaf cell.
+ *
+ * @param trunkHere Whether the trunk stands in this column.
+ * @param height The column's stored height, in cells.
+ */
+void mergeCoarseTree(inout TreeColumn column, TreeCoarseLeaves leaves, bool trunkHere, int height) {
+  if (leaves.mask == 0u) {
+    return;
+  }
+  const int lowest = leaves.base + int(firstbitlow(leaves.mask));
+  const int base = leaves.base + max(0, height - lowest);
+  const int leafLow = base + int(firstbitlow(leaves.mask));
+  const bool logs = trunkHere && leafLow > height;
+  mergeTreeColumn(column, logs ? height : 0, logs ? leafLow : 0, base, leaves.mask);
+}
+
+/**
+ * Tree cells over one column of the group at this LOD: exact blocks at LOD 0, each tree's leaves downsampled at
+ * LOD 1-4 (treeCoarseLeaves), one leaf cell per shown tree at LOD 5+. LOD 4+ re-derive candidates instead of using
+ * the staged slots.
  *
  * @param height The column's stored height, in cells.
  * @return the column's tree cells (empty past TREE_MAX_LOD).
@@ -701,8 +723,8 @@ TreeColumn computeTreeColumn(int2 tileOrigin, uint x, uint z, int4 chunkCoord, i
   }
   const int columnX = chunkCoord.x * int(CHUNK_SIZE) + int(x) * scale; // the column's low corner, world blocks
   const int columnZ = chunkCoord.y * int(CHUNK_SIZE) + int(z) * scale;
-  if (scale > (1 << TREE_CELL_SHIFT)) {
-    // LOD 4+: the column is filled when it holds an accepted trunk whose LOD roll passes. Candidates come from the
+  if (scale > (1 << TREE_DOWNSAMPLE_MAX_LOD)) {
+    // LOD 5+: the column is filled when it holds an accepted trunk whose LOD roll passes. Candidates come from the
     // regions it covers (position, then roll, then density); slope and band from one full-octave sample at its
     // centre, taken lazily.
     const int regionLowX = columnX >> TREE_REGION_SHIFT;
@@ -741,6 +763,40 @@ TreeColumn computeTreeColumn(int2 tileOrigin, uint x, uint z, int4 chunkCoord, i
     }
     return column;
   }
+  if (scale > (1 << TREE_CELL_SHIFT)) {
+    // LOD 4: the column lies in one region, and canopies never leave theirs, so only its candidates can reach it.
+    // Ground, band and slope from one full-octave sample at the column centre, taken lazily.
+    const int2 region = int2(columnX >> TREE_REGION_SHIFT, columnZ >> TREE_REGION_SHIFT);
+    int ground = 0;
+    int steepness = -1; // not sampled yet
+    for (uint slot = 0u; slot < uint(TREE_SLOTS); ++slot) {
+      const TreeInstance candidate = treeCandidateUnfiltered(region, slot);
+      // Cheap rejects first: the canopy misses the column, or the roll beats even a full 5x5 layer.
+      if (candidate.trunkX + TREE_RADIUS < columnX || candidate.trunkX - TREE_RADIUS >= columnX + scale ||
+          candidate.trunkZ + TREE_RADIUS < columnZ || candidate.trunkZ - TREE_RADIUS >= columnZ + scale ||
+          treeLodRoll(candidate.trunkX, candidate.trunkZ) * uint(scale * scale) >= 25u * 65536u) {
+        continue;
+      }
+      TreeInstance tree = treeCandidate(region, slot);
+      if (tree.trunkHeight == 0) {
+        continue;
+      }
+      if (steepness < 0) {
+        float2 grad;
+        ground = int(floor(sampleTerrainHeightGrad(columnX + scale / 2, columnZ + scale / 2, 1, grad)));
+        if (ground < TREE_MIN_GROUND || ground > TREE_MAX_GROUND) {
+          return column;
+        }
+        steepness = treeSteepness(grad.x, grad.y);
+      }
+      if (!treeSlopeOk(steepness, treeSlopeRoll(tree.shape))) {
+        continue;
+      }
+      tree.ground = ground;
+      mergeCoarseTree(column, treeCoarseLeaves(tree, columnX, columnZ, scale), false, height);
+    }
+    return column;
+  }
   const int regionsPerSide = treeTileRegionsPerSide(scale);
   const uint slotCount = uint(regionsPerSide * regionsPerSide * TREE_SLOTS);
   if (scale == 1) {
@@ -771,36 +827,21 @@ TreeColumn computeTreeColumn(int2 tileOrigin, uint x, uint z, int4 chunkCoord, i
     }
     return column;
   }
-  if (scale == (1 << TREE_CELL_SHIFT)) {
-    // LOD 3: one leaf cell on the column's top when it holds an accepted trunk whose LOD roll passes.
-    for (uint slot = 0u; slot < slotCount; ++slot) {
-      const int trunkX = treeSlotTrunkX[slot];
-      const int trunkZ = treeSlotTrunkZ[slot];
-      if (treeSlotHeight[slot] != 0 && trunkX >= columnX && trunkX < columnX + scale && trunkZ >= columnZ &&
-          trunkZ < columnZ + scale && treeShowsAtScale(trunkX, trunkZ, scale)) {
-        column.leafBase = height;
-        column.leafMask = 1u;
-        return column;
-      }
-    }
-    return column;
-  }
-  // LOD 1-2: every tree whose canopy covers at least half of the column, or whose trunk stands in it, at its real
-  // height; logs in the trunk's column from the terrain top up to its canopy.
+  // LOD 1-3: the staged trees, downsampled.
   for (uint slot = 0u; slot < slotCount; ++slot) {
-    const int trunkHeight = treeSlotHeight[slot];
-    if (trunkHeight == 0) {
+    if (treeSlotHeight[slot] == 0) {
       continue;
     }
-    const int trunkX = treeSlotTrunkX[slot];
-    const int trunkZ = treeSlotTrunkZ[slot];
-    const bool trunkHere = trunkX >= columnX && trunkX < columnX + scale && trunkZ >= columnZ && trunkZ < columnZ + scale;
-    if (!trunkHere && !treeCanopyShows(treeCanopyOverlap(trunkX, trunkZ, columnX, columnZ, scale), scale)) {
-      continue;
-    }
-    const int2 leaves = treeLeafCells(treeSlotGround[slot], trunkHeight, treeSlotShape[slot], scale, height);
-    const bool logs = trunkHere && leaves.x > height;
-    mergeTreeColumn(column, logs ? height : 0, logs ? leaves.x : 0, leaves.x, (1u << uint(leaves.y)) - 1u);
+    TreeInstance tree;
+    tree.trunkX = treeSlotTrunkX[slot];
+    tree.trunkZ = treeSlotTrunkZ[slot];
+    tree.ground = treeSlotGround[slot];
+    tree.trunkHeight = treeSlotHeight[slot];
+    tree.shape = treeSlotShape[slot];
+    // Logs only at LOD 1: from LOD 2 a one-block trunk would be a scale-wide pillar.
+    const bool trunkHere = scale == 2 && tree.trunkX >= columnX && tree.trunkX < columnX + scale &&
+                           tree.trunkZ >= columnZ && tree.trunkZ < columnZ + scale;
+    mergeCoarseTree(column, treeCoarseLeaves(tree, columnX, columnZ, scale), trunkHere, height);
   }
   return column;
 }
@@ -952,8 +993,14 @@ void generateHeights(uint3 groupThreadID: SV_GroupThreadID, uint3 groupID: SV_Gr
   }
   GroupMemoryBarrierWithGroupSync();
   if (active) {
-    const int stored = columnCellHeight(columnIndex, localX, localZ);
+    float surface;
+    const int stored = columnCellHeight(columnIndex, localX, localZ, surface);
     HeightBuffer[heightIndex(columnIndex, localX, localZ)] = stored;
+    const int4 chunkCoord = ChunkCoords[columnIndex];
+    const int worldX = chunkCoord.x * int(CHUNK_SIZE) + (int(localX) - 1) * chunkCoord.w;
+    const int worldZ = chunkCoord.y * int(CHUNK_SIZE) + (int(localZ) - 1) * chunkCoord.w;
+    SmoothHeights[heightIndex(columnIndex, localX, localZ)] =
+        float2(surface, transitionDither(worldX, worldZ, chunkCoord.w));
     InterlockedMin(heightGroupLow, stored);
     InterlockedMax(heightGroupHigh, stored);
   }
@@ -1568,15 +1615,9 @@ void copyCompactedQuads(uint3 dispatchThreadID: SV_DispatchThreadID) {
   }
 }
 
-/** Write vertMain's indexed indirect draw for the current quad count, and reset the new-work counter. */
+/** Reset the new-work counter once this remesh's meshColumns is done; the next allocateWork appends from 0. */
 [numthreads(1, 1, 1)]
 [shader("compute")]
-void finalizeVertexDraw() {
-  const uint quadCount = min(QuadCount[0], MAX_QUAD_COUNT);
-  VertexDrawArguments[0] = VERTEX_QUADS_PER_INSTANCE * 6u; // indexCount
-  VertexDrawArguments[1] = (quadCount + VERTEX_QUADS_PER_INSTANCE - 1u) / VERTEX_QUADS_PER_INSTANCE; // instanceCount
-  VertexDrawArguments[2] = 0u; // firstIndex
-  VertexDrawArguments[3] = 0u; // vertexOffset
-  VertexDrawArguments[4] = 0u; // firstInstance
-  WorkPool[WORK_POOL_NEW_WORK] = 0; // this remesh's meshColumns is done; the next allocateWork appends from 0
+void resetNewWork() {
+  WorkPool[WORK_POOL_NEW_WORK] = 0;
 }

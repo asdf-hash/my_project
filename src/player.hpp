@@ -80,6 +80,11 @@ public:
    */
   void update(GLFWwindow *window, float deltaTime, const Camera &camera, const cpuworld::CpuWorld &world);
 
+  /** Times the player died (the renderer drops the inventory when it changes). */
+  std::uint32_t deathCount() const { return deaths; }
+  /** Feet position at the last death. */
+  const glm::dvec3 &deathPosition() const { return lastDeathPosition; }
+
   /** Eye position for rendering, interpolated between ticks. */
   glm::vec3 eyePosition() const;
   /** Field-of-view multiplier (sprinting widens it, as in Minecraft). */
@@ -172,6 +177,8 @@ private:
 
   Mode currentMode = Mode::Walking;
   GameMode currentGameMode = GameMode::Creative;
+  std::uint32_t deaths = 0;
+  glm::dvec3 lastDeathPosition{0.0};
   GameMode lastGameMode = GameMode::Survival; // so the first F3+F4 starts on survival, like Minecraft
   glm::dvec3 position{0.5, 100.0, 0.5}; // feet, center of the box's bottom face
   glm::dvec3 previousPosition = position;

@@ -15,11 +15,22 @@
 #   hardness = <number>            Minecraft's destroy time (default 0: breaks instantly in survival)
 #   requires_tool = true           needs a tool to drop in Minecraft; breaking by hand is 3.3x slower
 #   random_rotation = <faces...>   rotate these faces' textures by a per-face hash to break up tiling
+#   display_name = <text>          name in tooltips and creative search (default: the block name title-cased)
+#   category = <tab>               creative tab: building_blocks (default), colored_blocks, natural_blocks,
+#                                  functional_blocks, redstone_blocks, tools, combat, food, ingredients, spawn_eggs
+#   creative = false               hide from the creative tabs (fluids)
+#   drops = <block> | none         what survival breaking drops (default: the block itself)
+#   density = <kg/m^3>             dropped-item physics (default 1500); below water's 1000 floats
 #   lod_<faces> = <texture>        texture used instead on coarse LOD chunks
 #   lod_tint = <r> <g> <b>         color multiplier applied with the lod_ texture
-#   far_tint = <r> <g> <b>         color multiplier faded in with distance around LOD 3 (where a tree is one leaf block)
+#   far_tint = <r> <g> <b>         color multiplier faded in with distance around LOD 3 (where tree canopies become
+#                                  leaf-topped ground)
 
 [grass]
+density = 1300
+display_name = Grass Block
+category = natural_blocks
+drops = dirt
 hardness = 0.6
 side = grass_side.png
 top = grass_top.png
@@ -30,25 +41,36 @@ lod_side = dirt.png
 lod_tint = 0.658 0.8305 0.64
 
 [dirt]
+density = 1300
+category = natural_blocks
 hardness = 0.5
 all = dirt.png
 
 [stone]
+density = 2600
 hardness = 1.5
 requires_tool = true
 all = stone.png
 
 [sand]
+density = 1600
+category = natural_blocks
 hardness = 0.5
 all = sand.png
 
 [snow]
+density = 400
+display_name = Snow Block
+category = natural_blocks
 hardness = 0.2
 requires_tool = true
 all = snow.png
 
 # The ocean: one of several liquids sharing fluid_still.png, told apart by tint (and their own IDs).
 [ocean]
+display_name = Water
+creative = false
+drops = none
 hardness = 100
 all = fluid_still.png
 opaque = false
@@ -59,12 +81,18 @@ frame_time = 0.1
 
 # Trees (placement: shaders/vegetation_shared.hlsl). Placeholder textures; replace freely.
 [log]
+density = 700
+display_name = Oak Log
+category = natural_blocks
 hardness = 2
 side = log_side.png
 top = log_top.png
 bottom = log_top.png
 
 [leaves]
+density = 300
+display_name = Oak Leaves
+category = natural_blocks
 hardness = 0.2
 all = leaves.png
 far_tint = 1.7 1.7 1.7
